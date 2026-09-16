@@ -13,15 +13,16 @@ Key Architecture:
 
 import os
 import sys
+import gc
 import warnings
 
 # Suppress harmless MDAnalysis DCDReader deprecation warnings
-warnings.filterwarnings("ignore", category=DeprecationWarning, module="MDAnalysis")
+warnings.filterwarnings("ignore", message=r".*DCDReader currently makes independent timesteps.*")
 
 # =============================================================================
 # THREAD MANAGEMENT & HARDWARE CONTROLS
 # =============================================================================
-USE_GPU = False  # TODO: important for smart thread allocation
+USE_GPU = True  # TODO: important for smart thread allocation
 
 # Thread controls: 0 = Smart Auto-Allocation, >0 = Explicit User Override
 MDA_THREADS = 0  # Threads per MDAnalysis reader instance (OpenMP)
@@ -71,7 +72,6 @@ from openmm import app, unit
 # =============================================================================
 # CONFIGURATION INPUTS
 # =============================================================================
-EXPERIMENTAL_FEATURES = True
 
 PARAM_FILES = [
     "../../common/ff/par_all36m_prot.prm",
@@ -80,14 +80,14 @@ PARAM_FILES = [
 PSF_FILE = "../../common/amyl_wb.psf"
 DCD_FILES = ["../amyl_wb_eq2.dcd"]
 
-# resname TIP3 and around 3 protein
+# resname TIP3 and around 4.25 protein
 SELECTION1 = os.getenv("NAMD_ENERGY_SELECTION1", "protein")
-SELECTION2 = os.getenv("NAMD_ENERGY_SELECTION2", "")
+SELECTION2 = os.getenv("NAMD_ENERGY_SELECTION2", "water and around 4.25 protein")
 
 UPDATE_SELECTION1 = False
-UPDATE_SELECTION2 = False
+UPDATE_SELECTION2 = True
 
-OUT_FILE_PREFIX = os.getenv("NAMD_ENERGY_OUT_PREFIX", "protein_self.energy2")
+OUT_FILE_PREFIX = os.getenv("NAMD_ENERGY_OUT_PREFIX", "prot_water_hydration.energy2")
 LABEL = os.getenv("NAMD_ENERGY_LABEL", "Sim1")
 OUT_ENERGIES = os.getenv("NAMD_ENERGY_OUT_ENERGIES", "-all").split()
 
@@ -122,7 +122,8 @@ MIN_CHUNK_FRAMES = 2000  # Fallback to disk streaming if chunks cannot meet this
 RAM_DISK_PATH = "/tmp"
 RAM_SAFETY_MARGIN_GB = 1.0  # Base free RAM margin required
 RAM_EXTRA_MARGIN_GB = 0.1  # Extra buffer headroom
-QUEUE_BUFFER_SIZE = 20
+
+QUEUE_BUFFER_SIZE = 400 if USE_GPU else 100
 
 
 
@@ -247,19 +248,18 @@ if "total" in raw_requested or "pote" in raw_requested:
 if "nonb" in raw_requested: raw_requested.update(["vdw", "elec"])
 if "conf" in raw_requested: raw_requested.update(["bond", "angl", "dihe", "impr"])
 
-cross_supported = {"vdw", "elec", "nonb", "pote", "total", "all"}
-self_static_supported = cross_supported.union({"bond", "angl", "dihe", "impr", "conf"})
-self_dyn_supported = self_static_supported if EXPERIMENTAL_FEATURES else cross_supported
-actual_supported = self_dyn_supported if (is_self_interaction and UPDATE_SELECTION1) else (
-    self_static_supported if is_self_interaction else cross_supported)
+cross_erg_supported = {"vdw", "elec", "nonb", "pote", "total", "all"}
+self_erg_supported = cross_erg_supported.union({"bond", "angl", "dihe", "impr", "conf"})
+actual_erg_supported = self_erg_supported if is_self_interaction else cross_erg_supported
 
-unsupported = raw_requested - actual_supported
-if unsupported: log_error(f"Unsupported energies requested: {unsupported}")
+unsupported_erg = raw_requested - actual_erg_supported
+if unsupported_erg:
+    log_error(f"Unsupported energies requested: {unsupported_erg}")
 
 final_components = [e for e in ["vdw", "elec", "bond", "angl", "dihe", "impr"] if e in raw_requested]
 
 # =============================================================================
-# 2. OPENMM SYSTEM INITIALIZATION
+# OPENMM SYSTEM INITIALIZATION
 # =============================================================================
 log_info("Parsing Topology and Forcefield...")
 psf = app.CharmmPsfFile(PSF_FILE)
@@ -301,12 +301,14 @@ if not is_self_interaction:
 else:
     static_sel2_idx = static_sel1_idx
 
-print("-------------------------------------")
+print("------------------------------------------------------")
 log_info(f"TOTAL ATOM COUNT: {total_atom_count}")
-log_info(f"SELECTION-1: \"{SELECTION1}\" (atom count at frame 0: {len(static_sel1_idx)})")
+log_info(f"SELECTION-1  : \"{SELECTION1}\" (atom count at frame 0: {len(static_sel1_idx)})")
+log_info(f"UPDATE SEL-1 : {'ON' if UPDATE_SELECTION1 else 'OFF'}")
 if not is_self_interaction:
-    log_info(f"SELECTION-2: \"{SELECTION2}\" (atom count at frame 0: {len(static_sel2_idx)})")
-print("-------------------------------------")
+    log_info(f"SELECTION-2  : \"{SELECTION2}\" (atom count at frame 0: {len(static_sel2_idx)})")
+    log_info(f"UPDATE SEL-2 : {'ON' if UPDATE_SELECTION2 else 'OFF'}")
+print("------------------------------------------------------")
 
 # --- FEATURE 8: NBFIX Detection and Cloning ---
 nbfix_force = None
@@ -347,7 +349,9 @@ else:
 # Electrostatic Definition
 is_elec_requested = "elec" in raw_requested
 elec_base_main = f"({138.935456 / DIELECTRIC} * (charge1 * charge2 / r))"
+pme_recip_force = None
 ewald_beta = None
+
 if PERIODIC and PME_ENABLED:
     ewald_beta = math.sqrt(-math.log(PME_TOLERANCE)) / (CUTOFF / 10.0)
 
@@ -371,8 +375,10 @@ else:
     elec_base = f"({elec_base_main} * {S_elec})"
     log_info(f"Using standard Coulombic Electrostatics with Shift/Switch factor: {S_elec}")
 
-if IS_DYNAMIC:
-    log_info("Dynamic Selections enabled. Configuring Differential Parameter Masking.")
+# Optimize Memory: Force masking for Dynamic OR Static Self-Interactions to avoid OOM crashes
+USE_MASK = IS_DYNAMIC or is_self_interaction
+if USE_MASK:
+    log_info("Using Parameter Masking (Dynamic Mode or Static Self-Interaction).")
     mask_expr = "(is_sel11*is_sel12)" if is_self_interaction else "((is_sel11*is_sel22)+(is_sel21*is_sel12))"
 
     vdw_expr = f"mask*{vdw_base}; mask={mask_expr}"
@@ -419,14 +425,21 @@ if nbfix_force:
 vdw_force.setForceGroup(1)
 elec_force.setForceGroup(2)
 
-# Only needed for dynamic cases
-param_cache_vdw = []  # list of tuples (type_val, ) OR (sigma, epsilon)
-if IS_DYNAMIC or PME_ENABLED:
-    param_cache_elec = np.empty(base_system.getNumParticles(), dtype=np.float32)   # list of particle charges (float)
-else:
-    param_cache_elec = []
 
-for i in range(base_system.getNumParticles()):
+#------------------------------------------------------------------------
+# Setting atom parameters
+#------------------------------------------------------------------------
+N_ATOMS = base_system.getNumParticles()
+
+# Parameter Caches, only needed for DYNAMIC selections
+dynamic_vdw_cache: list[tuple[float, float]] = []      # (sigma, epsilon) or (type, ) values of all atoms in vdw non-NBFix mode
+dynamic_elec_q_cache_np: np.ndarray = None             # charges of all atoms, numpy type for fast math
+
+is_dynamic_elec_q_cache_needed = IS_DYNAMIC or (PME_ENABLED and is_self_interaction and is_elec_requested)
+if is_dynamic_elec_q_cache_needed:
+    dynamic_elec_q_cache_np = np.zeros(N_ATOMS, dtype=np.float64)
+
+for i in range(N_ATOMS):
     c, s, e = nb_base.getParticleParameters(i)
     c_val = c.value_in_unit(unit.elementary_charge)
 
@@ -438,33 +451,54 @@ for i in range(base_system.getNumParticles()):
         e_val = e.value_in_unit(unit.kilojoules_per_mole)
         vdw_params = (s_val, e_val)
 
-    if IS_DYNAMIC or (PME_ENABLED and is_self_interaction and is_elec_requested):
-        param_cache_elec[i] = c_val
-
     if IS_DYNAMIC:
-        param_cache_vdw.append(vdw_params)
-        if PERIODIC and PME_ENABLED:
-            pme_recip_force.addParticle(0.0, 1.0, 0.0)
+        dynamic_vdw_cache.append(vdw_params)
+
+    if is_dynamic_elec_q_cache_needed:
+        dynamic_elec_q_cache_np[i] = c_val
+
+    if USE_MASK:
+        if IS_DYNAMIC:
+            val1, val2 = 0.0, 0.0
+        else:
+            # Static Self-Interaction initializes valid masks permanently right here
+            val1 = 1.0 if i in static_sel1_idx else 0.0
+            val2 = 1.0 if (not is_self_interaction and i in static_sel2_idx) else 0.0
 
         if is_self_interaction:
-            vdw_force.addParticle([*vdw_params, 0.0])
-            elec_force.addParticle([c_val, 0.0])
+            vdw_force.addParticle((*vdw_params, val1))
+            elec_force.addParticle((c_val, val1))
         else:
-            vdw_force.addParticle([*vdw_params, 0.0, 0.0])
-            elec_force.addParticle([c_val, 0.0, 0.0])
+            vdw_force.addParticle((*vdw_params, val1, val2))
+            elec_force.addParticle((c_val, val1, val2))
     else:
         vdw_force.addParticle(vdw_params)
-        elec_force.addParticle([c_val])
-        if PERIODIC and PME_ENABLED:
+        elec_force.addParticle((c_val, ))
+
+    # PME Force configuration
+    if PERIODIC and PME_ENABLED:
+        if IS_DYNAMIC:
+            # Initialize with frame 0 combined mask for A+B state
             if is_self_interaction:
                 q_pme = c_val if i in static_sel1_idx else 0.0
+            else:
+                q_pme = c_val if (i in static_sel1_idx or i in static_sel2_idx) else 0.0
+
+            # Failsafe: Prevent compiler from stripping Coulomb kernel if Frame 0 selection is completely empty
+            if q_pme == 0.0 and i == 0: q_pme = 1e-10
+            pme_recip_force.addParticle(q_pme, 1.0, 0.0)
+        else:
+            if is_self_interaction:
+                q_pme = c_val if i in static_sel1_idx else 0.0
+                if q_pme == 0.0 and i == 0: q_pme = 1e-10
                 pme_recip_force.addParticle(q_pme, 1.0, 0.0)
             else:
-                pme_recip_force.addParticle(0.0, 1.0, 0.0)  # Map to GPU lambda offsets
+                pme_recip_force.addParticle(0.0, 1.0, 0.0)
                 if i in static_sel1_idx:
                     pme_recip_force.addParticleParameterOffset("lambda_1", i, c_val, 0.0, 0.0)
                 elif i in static_sel2_idx:
                     pme_recip_force.addParticleParameterOffset("lambda_2", i, c_val, 0.0, 0.0)
+
 
 # --- FEATURE 7: Exclusions & PME Exception Re-injection ---
 vdw_14_force = mm.CustomBondForce(f"4*epsilon*((sigma/r)^12 - (sigma/r)^6)")
@@ -520,13 +554,13 @@ if PERIODIC and PME_ENABLED:
     pair_system.addForce(pme_recip_force)
 log_info(f"Re-injected Exceptions: VDW={vdw_14_count}, ELEC(PME Corrections)={elec_ex_count}")
 
-if IS_DYNAMIC:
-    all_atoms = set(range(base_system.getNumParticles()))
-    vdw_force.addInteractionGroup(all_atoms, all_atoms)
-    elec_force.addInteractionGroup(all_atoms, all_atoms)
-else:
+if not USE_MASK:
+    # Bipartite Static Cross-Interactions use InteractionGroups safely to drop water-water math natively
+    log_warn("Static cross-interaction mode: Using interaction groups that may use high memory but are extremely fast")
     vdw_force.addInteractionGroup(static_sel1_idx, static_sel2_idx)
     elec_force.addInteractionGroup(static_sel1_idx, static_sel2_idx)
+else:
+    log_info("Bypassing addInteractionGroup allocation (Algebraic masking enabled)")
 
 for custom_f in [vdw_force, elec_force]:
     custom_f.setNonbondedMethod(
@@ -651,7 +685,22 @@ if USE_GPU:
     if platform is None:
         log_warn("GPU requested but CUDA, HIP, and OpenCL are unavailable. Falling back to CPU.")
 
+
+# =============================================================================
+# OPENMM CONTEXT CREATION  (Memory intensive)
+# =============================================================================
 # TODO: crashing here due to very high memory usage
+
+# --- MEMORY OPTIMIZATION: PRE-CONTEXT FLUSH ---
+log_info("Flushing parsed topology databases to free RAM for Context allocation...\n")
+del base_system
+del psf
+del params
+
+u_init.trajectory.close()
+del u_init
+gc.collect()    # force python gc
+
 log_info("Creating OpenMM Context...")
 if platform is None:
     platform = mm.Platform.getPlatformByName('CPU')
@@ -673,28 +722,39 @@ active_fetches = [(1 << group_map[c], comp_idx[c]) for c in final_components]
 # 3. BACKGROUND PRODUCER PIPELINE
 # =============================================================================
 def parallel_reader_worker(q_main, psf, dcd, start, stop, global_offset, step):
-    u = mda.Universe(psf, dcd)
-    sel1 = u.select_atoms(SELECTION1, updating=UPDATE_SELECTION1)
-    sel2 = sel1 if is_self_interaction else u.select_atoms(SELECTION2, updating=UPDATE_SELECTION2)
+    u, sel1, sel2 = None, None, None
+    try:
+        u = mda.Universe(psf, dcd)
+        sel1 = u.select_atoms(SELECTION1, updating=UPDATE_SELECTION1)
+        sel2 = sel1 if is_self_interaction else u.select_atoms(SELECTION2, updating=UPDATE_SELECTION2)
 
-    for i in range(start, stop, step):
-        if SHUTDOWN_REQUESTED: break
+        for i in range(start, stop, step):
+            if SHUTDOWN_REQUESTED: break
 
-        ts = u.trajectory[i]
-        abs_f = global_offset + ts.frame
+            ts = u.trajectory[i]
+            abs_f = global_offset + ts.frame
 
-        coords = u.atoms.positions / 10.0
-        box = ts.triclinic_dimensions / 10.0 if PERIODIC else None
+            coords = u.atoms.positions / 10.0
+            box = ts.triclinic_dimensions / 10.0 if PERIODIC else None
 
-        arr1 = sel1.indices.copy()
-        arr2 = None if is_self_interaction else sel2.indices.copy()
+            arr1 = sel1.indices.copy()
+            arr2 = None if is_self_interaction else sel2.indices.copy()
 
-        while not SHUTDOWN_REQUESTED:
+            while not SHUTDOWN_REQUESTED:
+                try:
+                    q_main.put((abs_f, coords, box, arr1, arr2), timeout=1.0)
+                    break
+                except queue.Full:
+                    continue
+    finally:
+        # Guarantee closure of internal C-level file descriptors
+        if u is not None:
             try:
-                q_main.put((abs_f, coords, box, arr1, arr2), timeout=1.0)
-                break
-            except queue.Full:
-                continue
+                u.trajectory.close()
+            except:
+                pass
+            del u, sel1, sel2
+        gc.collect()
 
 
 def catdcd_chunk_loader(dcd_file, total_frames, chunk_frames, q_chunks):
@@ -774,11 +834,19 @@ def master_producer(q_main):
     try:
         global_frame_offset = 0
         for dcd_file in DCD_FILES:
-            if SHUTDOWN_REQUESTED: break
+            if SHUTDOWN_REQUESTED:
+                break
 
+            base_name = os.path.splitext(os.path.basename(dcd_file))[0]
+
+            # Find num frames from mda.Universe
             u_temp = mda.Universe(PSF_FILE, dcd_file)
             total_frames = u_temp.trajectory.n_frames
-            base_name = os.path.splitext(os.path.basename(dcd_file))[0]
+            try:
+                u_temp.trajectory.close()
+            finally:
+                del u_temp
+                gc.collect()    # force GC
 
             # Logic for determining Loader Strategy
             if not RAM_LOADING_ENABLED:
@@ -879,16 +947,22 @@ io_thread = threading.Thread(target=master_producer, args=(frame_queue,))
 io_thread.start()
 
 # ----- COMPUTE START ------------
-prev_set1: set = set()
-prev_set2: set = set()
+# selection index trackers in dynamic mode
+prev_idx_se11_set: set = set()
+prev_idx_sel2_set: set = set()
 
+frames_processed = 0
 t_compute_start = time.time()
 log_info(f"Compute Engine [{platform_name}] is consuming frames...")
 
+# --- MANUAL GC SETUP ---
+MANUAL_GC_ENABLED = True
+MANUAL_GC_INTERVAL_FRAMES = 1000        # num frames
+next_manual_gc_frames = MANUAL_GC_INTERVAL_FRAMES
+
 # --- PROGRESS TRACKER SETUP ---
-REPORT_INTERVAL_FRAMES = 100       # num frames
-frames_processed = 0
-next_report_frames = REPORT_INTERVAL_FRAMES
+PROGRESS_REPORT_INTERVAL_FRAMES = 100       # num frames
+next_progress_report_frames = PROGRESS_REPORT_INTERVAL_FRAMES
 t_last_report = time.time()
 
 while not SHUTDOWN_REQUESTED:
@@ -915,39 +989,42 @@ while not SHUTDOWN_REQUESTED:
         idx_set1_set: set = set(arr_sel1)
         idx_set2_set: set = idx_set1_set if is_self_interaction else (set(arr_sel2) - idx_set1_set)
 
-        union1: set = idx_set1_set ^ prev_set1
-        union2: set = idx_set2_set ^ prev_set2
+        union_idx_sel1: set = idx_set1_set ^ prev_idx_se11_set
+        union_idx_sel2: set = idx_set2_set ^ prev_idx_sel2_set
 
-        for i in union1:
+        for i in union_idx_sel1:
             val = 1.0 if i in idx_set1_set else 0.0
+            q = float(dynamic_elec_q_cache_np[i])
             if is_self_interaction:
-                vdw_force.setParticleParameters(i, [*param_cache_vdw[i], val])
-                elec_force.setParticleParameters(i, [param_cache_elec[i], val])
+                vdw_force.setParticleParameters(i, dynamic_vdw_cache[i] + (val, ))
+                elec_force.setParticleParameters(i, (q, val))
                 if PERIODIC and PME_ENABLED:
-                    pme_recip_force.setParticleParameters(i, param_cache_elec[i] * val, 1.0,0.0)
+                    pme_recip_force.setParticleParameters(i, q * val, 1.0,0.0)
             else:
                 s2_val = 1.0 if i in idx_set2_set else 0.0
-                vdw_force.setParticleParameters(i, [*param_cache_vdw[i], val, s2_val])
-                elec_force.setParticleParameters(i, [param_cache_elec[i], val, s2_val])
+                vdw_force.setParticleParameters(i, dynamic_vdw_cache[i] + (val, s2_val))
+                elec_force.setParticleParameters(i, (q, val, s2_val))
                 if PERIODIC and PME_ENABLED:
-                    pme_recip_force.setParticleParameters(i, param_cache_elec[i] * max(val, s2_val), 1.0, 0.0)
+                    pme_recip_force.setParticleParameters(i, q * max(val, s2_val), 1.0, 0.0)
 
         if not is_self_interaction:
-            for i in union2.difference(union1):
+            for i in union_idx_sel2.difference(union_idx_sel1):
+                q = float(dynamic_elec_q_cache_np[i])
                 s2_val = 1.0 if i in idx_set2_set else 0.0
                 s1_val = 1.0 if i in idx_set1_set else 0.0
-                vdw_force.setParticleParameters(i, [*param_cache_vdw[i], s1_val, s2_val])
-                elec_force.setParticleParameters(i, [param_cache_elec[i], s1_val, s2_val])
+
+                vdw_force.setParticleParameters(i, dynamic_vdw_cache[i] + (s1_val, s2_val))
+                elec_force.setParticleParameters(i, (q, s1_val, s2_val))
                 if PERIODIC and PME_ENABLED:
-                    pme_recip_force.setParticleParameters(i, param_cache_elec[i] * max(s1_val, s2_val),1.0, 0.0)
+                    pme_recip_force.setParticleParameters(i, q * max(s1_val, s2_val),1.0, 0.0)
 
         vdw_force.updateParametersInContext(context)
         elec_force.updateParametersInContext(context)
         if PERIODIC and PME_ENABLED:
             pme_recip_force.updateParametersInContext(context)
 
-        prev_set1 = idx_set1_set
-        prev_set2 = idx_set2_set
+        prev_idx_se11_set = idx_set1_set
+        prev_idx_sel2_set = idx_set2_set
 
     # Query Energies
     erg_raw = [0.0] * len(group_map)  # 6
@@ -961,30 +1038,19 @@ while not SHUTDOWN_REQUESTED:
             state_recip = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
             e_recip = state_recip.getPotentialEnergy().value_in_unit(to_kcal)
 
-            sel1_q_sq_sum = np.sum(param_cache_elec[arr_sel1] ** 2)
-            # if IS_DYNAMIC:
-            #     # we have built the param cache, so use it
-            #     sel1_q_sq_sum = np.sum(param_cache_elec[arr_sel1] ** 2)
-            # else:
-            #     sel1_q_sq_sum = 0
-            #     for i in arr_sel1:
-            #         sel1_q_sq_sum += nb_base.getParticleParameters(i)[0].value_in_unit(unit.elementary_charge) ** 2
+            if is_dynamic_elec_q_cache_needed:  # if we have cache
+                sel1_q_sq_sum = np.sum(dynamic_elec_q_cache_np[arr_sel1] ** 2)
+            else:
+                sel1_q_sq_sum = 0
+                for i in arr_sel1:
+                    sel1_q_sq_sum += nb_base.getParticleParameters(i)[0].value_in_unit(unit.elementary_charge) ** 2
+
             pme_self = - (138.935456 / DIELECTRIC) * (ewald_beta / math.sqrt(math.pi)) * sel1_q_sq_sum
             erg_raw[comp_idx["elec"]] += (e_recip + pme_self)
             if OUT_FORCE:
                 f_pme_cross_raw = state_recip.getForces(asNumpy=True).value_in_unit(to_kcal_A)
         else:
-            if not IS_DYNAMIC:
-                context.setParameter("lambda_1", 1.0)
-                context.setParameter("lambda_2", 1.0)
-                st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
-                context.setParameter("lambda_1", 1.0)
-                context.setParameter("lambda_2", 0.0)
-                st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
-                context.setParameter("lambda_1", 0.0)
-                context.setParameter("lambda_2", 1.0)
-                st_B = context.getState(getEnergy=True, groups=(1 << 7))
-            else:
+            if IS_DYNAMIC:
                 st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
                 only_sel1 = idx_set1_set - idx_set2_set
                 only_sel2 = idx_set2_set - idx_set1_set
@@ -997,7 +1063,7 @@ while not SHUTDOWN_REQUESTED:
 
                 # Pass B:
                 for i in only_sel2:
-                    pme_recip_force.setParticleParameters(i, param_cache_elec[i], 1.0, 0.0)
+                    pme_recip_force.setParticleParameters(i, dynamic_elec_q_cache_np[i], 1.0, 0.0)
                 for i in only_sel1:
                     pme_recip_force.setParticleParameters(i, 0.0, 1.0, 0.0)
                 pme_recip_force.updateParametersInContext(context)
@@ -1005,8 +1071,18 @@ while not SHUTDOWN_REQUESTED:
 
                 # Restore XOR AB state for next frame:
                 for i in only_sel1:
-                    pme_recip_force.setParticleParameters(i, param_cache_elec[i], 1.0, 0.0)
+                    pme_recip_force.setParticleParameters(i, dynamic_elec_q_cache_np[i], 1.0, 0.0)
                 pme_recip_force.updateParametersInContext(context)
+            else:
+                context.setParameter("lambda_1", 1.0)
+                context.setParameter("lambda_2", 1.0)
+                st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+                context.setParameter("lambda_1", 1.0)
+                context.setParameter("lambda_2", 0.0)
+                st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+                context.setParameter("lambda_1", 0.0)
+                context.setParameter("lambda_2", 1.0)
+                st_B = context.getState(getEnergy=True, groups=(1 << 7))
 
             e_AB = st_AB.getPotentialEnergy().value_in_unit(to_kcal)
             e_A = st_A.getPotentialEnergy().value_in_unit(to_kcal)
@@ -1048,13 +1124,21 @@ while not SHUTDOWN_REQUESTED:
                         force_mags,
                         force_components))
 
-    # --- PROGRESS TRACKER EXECUTION ---
+
+    # ------------------ Finalize ------------------------
     frames_processed += 1
-    if frames_processed == next_report_frames:
+
+    # SWIG PROXY FLUSH (DYNAMIC MEMORY STABILIZATION)
+    if MANUAL_GC_ENABLED and IS_DYNAMIC and frames_processed == next_manual_gc_frames:
+        gc.collect()
+        next_manual_gc_frames += MANUAL_GC_INTERVAL_FRAMES
+
+    # PROGRESS TRACKER EXECUTION
+    if frames_processed == next_progress_report_frames:
         t_now = time.time()
-        fps_current = REPORT_INTERVAL_FRAMES / max(0.001, t_now - t_last_report)
+        fps_current = PROGRESS_REPORT_INTERVAL_FRAMES / max(0.001, t_now - t_last_report)
         log_info(f"Progress: Processed {frames_processed} frames... (Speed: {fps_current:.1f} fps)")
-        next_report_frames += REPORT_INTERVAL_FRAMES
+        next_progress_report_frames += PROGRESS_REPORT_INTERVAL_FRAMES
         t_last_report = t_now
 
 t_compute_total = time.time() - t_compute_start
