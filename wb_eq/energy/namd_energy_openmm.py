@@ -2,6 +2,10 @@
 """
 calc_namd_energy_master.py - Production OpenMM/MDAnalysis Pair Interaction Pipeline
 
+TODO:
+1. output data buffer periodically dump to file
+2. Ram cache mode thread contention while reading, especially when update selection is ON
+
 Key Architecture:
 1. Smart Thread Allocation (OpenMM vs. OpenMP MDAnalysis Reader partition).
 2. Hardware Bootloader: CUDA -> AMD HIP -> OpenCL -> CPU.
@@ -25,12 +29,12 @@ warnings.filterwarnings("ignore", message=r".*DCDReader currently makes independ
 USE_GPU = True  # TODO: important for smart thread allocation
 
 # Thread controls: 0 = Smart Auto-Allocation, >0 = Explicit User Override
-MDA_THREADS = 0  # Threads per MDAnalysis reader instance (OpenMP)
-OPENMM_CPU_THREADS = 0  # Compute threads for OpenMM (applies only if running on CPU)
-NUM_READER_THREADS = 4  # Concurrent reader threads for RAM chunks
+MDA_THREADS = 0             # Threads per MDAnalysis reader instance (OpenMP)
+OPENMM_CPU_THREADS = 0      # Compute threads for OpenMM (applies only if running on CPU)
+NUM_RAM_READER_THREADS = 1  # Concurrent reader threads for RAM chunks
 
 sys_cores = os.cpu_count() or 4
-actual_reader_threads = min(NUM_READER_THREADS, sys_cores)
+actual_ram_reader_threads = min(NUM_RAM_READER_THREADS, sys_cores)
 
 # Smart Thread Allocation Logic
 if OPENMM_CPU_THREADS > 0:
@@ -48,7 +52,7 @@ if MDA_THREADS > 0:
     mda_alloc_mode = "User Override"
 else:
     remaining_cores = max(1, sys_cores - assigned_openmm_threads)
-    assigned_mda_threads = max(1, remaining_cores // actual_reader_threads)
+    assigned_mda_threads = max(1, remaining_cores // actual_ram_reader_threads)
     mda_alloc_mode = "Smart Auto"
 
 # Set OpenMP thread limit prior to loading C-extensions
@@ -82,12 +86,12 @@ DCD_FILES = ["../amyl_wb_eq2.dcd"]
 
 # resname TIP3 and around 4.25 protein
 SELECTION1 = os.getenv("NAMD_ENERGY_SELECTION1", "protein")
-SELECTION2 = os.getenv("NAMD_ENERGY_SELECTION2", "water and around 4.25 protein")
+SELECTION2 = os.getenv("NAMD_ENERGY_SELECTION2", "water")
 
 UPDATE_SELECTION1 = False
-UPDATE_SELECTION2 = True
+UPDATE_SELECTION2 = False
 
-OUT_FILE_PREFIX = os.getenv("NAMD_ENERGY_OUT_PREFIX", "prot_water_hydration.energy2")
+OUT_FILE_PREFIX = os.getenv("NAMD_ENERGY_OUT_PREFIX", "prot_water.energy3")
 LABEL = os.getenv("NAMD_ENERGY_LABEL", "Sim1")
 OUT_ENERGIES = os.getenv("NAMD_ENERGY_OUT_ENERGIES", "-all").split()
 
@@ -100,7 +104,7 @@ PERIODIC = True
 PME_ENABLED = True  # Set to True if the NAMD simulation used PME
 PME_TOLERANCE = 1e-6  # NAMD default PME error tolerance (unitless factor)
 
-FRAME_SKIP = 49
+FRAME_SKIP = 0
 TIMESTEP_FIRST = 0
 FRAME_FREQ = 100
 
@@ -128,7 +132,14 @@ QUEUE_BUFFER_SIZE = 400 if USE_GPU else 100
 
 
 
-## Experimental Features -------------------------------------
+#-----------------------------------------------------------------------------
+## Other Flags ---------------------
+PROGRESS_REPORT_INTERVAL_FRAMES = 10       # num frames
+
+MANUAL_GC_ENABLED = True
+MANUAL_GC_INTERVAL_FRAMES = 5000           # num frames
+
+## Experimental Features -----------
 ## experimental flag to tun off erfc(ewald_beta * r) factor in short range direct electrostatics
 # if true: multiplies short range raw coulomb energy with erfc(ewald_beta * r) (very fast decaying factor)
 # else: uses raw coulomb energy expression for short range electrostatics with sharp discontinuity at the cutoff
@@ -150,7 +161,7 @@ SHUTDOWN_REQUESTED = False
 ACTIVE_RAM_FILES = set()
 RAM_FILES_LOCK = threading.Lock()
 
-t_app_start = time.time()
+t_app_start = time.perf_counter()
 t_ram_load_total = 0.0
 t_compute_total = 0.0
 t_io_wait_total = 0.0
@@ -783,7 +794,7 @@ def catdcd_chunk_loader(dcd_file, total_frames, chunk_frames, q_chunks):
         cmd = ["catdcd", "-o", temp_name, "-first", str(current_start), "-last", str(current_last), dcd_file]
 
         log_info(f"[Loader 2] Extracting frames {current_start}-{current_last} via catdcd to RAM...")
-        t0 = time.time()
+        t0 = time.perf_counter()
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         while proc.poll() is None:
@@ -797,7 +808,7 @@ def catdcd_chunk_loader(dcd_file, total_frames, chunk_frames, q_chunks):
             break
 
         if proc.returncode == 0:
-            t_ram_load_total += (time.time() - t0)
+            t_ram_load_total += (time.perf_counter() - t0)
             register_ram_file(temp_name)
             q_chunks.put((temp_name, this_chunk_frames))
         else:
@@ -815,8 +826,8 @@ def disk_stream(q_main, dcd_file, total_frames, global_frame_offset):
 
 def start_ramdisk_read(q_main, temp_dcd, num_frames, global_frame_offset):
     threads = []
-    c_size = math.ceil(num_frames / actual_reader_threads)
-    for i in range(actual_reader_threads):
+    c_size = math.ceil(num_frames / actual_ram_reader_threads)
+    for i in range(actual_ram_reader_threads):
         start = i * c_size
         stop = min((i + 1) * c_size, num_frames)
         if start >= stop: continue
@@ -866,9 +877,9 @@ def master_producer(q_main):
                 if file_fits:
                     log_info(f"[Loader 1] File {os.path.basename(dcd_file)} fits in RAM. Copying blindly...")
                     temp_dcd = os.path.join(RAM_DISK_PATH, f"{base_name}_copy_{uuid.uuid4().hex[:8]}.dcd")
-                    t0 = time.time()
+                    t0 = time.perf_counter()
                     shutil.copy2(dcd_file, temp_dcd)
-                    t_ram_load_total += (time.time() - t0)
+                    t_ram_load_total += (time.perf_counter() - t0)
 
                     register_ram_file(temp_dcd)
                     start_ramdisk_read(q_main, temp_dcd, total_frames, global_frame_offset)
@@ -938,7 +949,7 @@ def master_producer(q_main):
 # =============================================================================
 # 4. COMPUTE CONSUMER LOOP
 # =============================================================================
-frame_queue = queue.Queue(maxsize=QUEUE_BUFFER_SIZE)
+frame_queue: queue.Queue = queue.Queue(maxsize=QUEUE_BUFFER_SIZE)
 data_buffer = []
 to_kcal = unit.kilocalorie_per_mole
 to_kcal_A = unit.kilocalorie_per_mole / unit.angstrom
@@ -952,26 +963,23 @@ prev_idx_se11_set: set = set()
 prev_idx_sel2_set: set = set()
 
 frames_processed = 0
-t_compute_start = time.time()
+t_compute_start = time.perf_counter()
 log_info(f"Compute Engine [{platform_name}] is consuming frames...")
 
 # --- MANUAL GC SETUP ---
-MANUAL_GC_ENABLED = True
-MANUAL_GC_INTERVAL_FRAMES = 1000        # num frames
 next_manual_gc_frames = MANUAL_GC_INTERVAL_FRAMES
 
 # --- PROGRESS TRACKER SETUP ---
-PROGRESS_REPORT_INTERVAL_FRAMES = 100       # num frames
 next_progress_report_frames = PROGRESS_REPORT_INTERVAL_FRAMES
-t_last_report = time.time()
+t_last_progress_report = time.perf_counter()
 
 while not SHUTDOWN_REQUESTED:
-    t0_wait = time.time()
+    t0_wait = time.perf_counter()
     try:
         payload = frame_queue.get(timeout=1.0)
-        t_io_wait_total += (time.time() - t0_wait)
+        t_io_wait_total += (time.perf_counter() - t0_wait)
     except queue.Empty:
-        t_io_wait_total += (time.time() - t0_wait)
+        t_io_wait_total += (time.perf_counter() - t0_wait)
         continue
 
     if payload is None: break
@@ -1135,13 +1143,13 @@ while not SHUTDOWN_REQUESTED:
 
     # PROGRESS TRACKER EXECUTION
     if frames_processed == next_progress_report_frames:
-        t_now = time.time()
-        fps_current = PROGRESS_REPORT_INTERVAL_FRAMES / max(0.001, t_now - t_last_report)
-        log_info(f"Progress: Processed {frames_processed} frames... (Speed: {fps_current:.1f} fps)")
+        t_now = time.perf_counter()
+        fps_current = PROGRESS_REPORT_INTERVAL_FRAMES / max(0.001, t_now - t_last_progress_report)
+        log_info(f"Progress: Processed {frames_processed} frames  |  Speed: {fps_current:.1f} fps  |  Queued Frames: {frame_queue.qsize()}")
         next_progress_report_frames += PROGRESS_REPORT_INTERVAL_FRAMES
-        t_last_report = t_now
+        t_last_progress_report = t_now
 
-t_compute_total = time.time() - t_compute_start
+t_compute_total = time.perf_counter() - t_compute_start
 io_thread.join()
 
 # =============================================================================
@@ -1254,7 +1262,7 @@ with open(output_file, 'w') as f_out:
 # =============================================================================
 # 6. EXECUTION REPORT
 # =============================================================================
-t_total = time.time() - t_app_start
+t_total = time.perf_counter() - t_app_start
 compute_active_time = max(0.0, t_compute_total - t_io_wait_total)
 fps = len(data_buffer) / max(0.001, t_compute_total)
 status_str = "\033[91mABORTED (Early Exit)\033[0m" if SHUTDOWN_REQUESTED else "\033[92mSUCCESS\033[0m"
