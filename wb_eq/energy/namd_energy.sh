@@ -31,29 +31,29 @@ export selection_water_bulk="water and not (within 5.0 of protein)"
 
 export NAMD_ENERGY_PROCESSES=6
 
-# # Run 1: Protein Self
-# export NAMD_ENERGY_LABEL="Protein Self-Interaction Energy"
-# export NAMD_ENERGY_SELECTION1="protein"
-# export NAMD_ENERGY_SELECTION2=""
-# export NAMD_ENERGY_OUT_PREFIX="prot_self"
-# export NAMD_ENERGY_OUT_ENERGIES="-conf -nonb -kine -pote"
-# run_namd_energy_static
+# Run 1: Protein Self
+export NAMD_ENERGY_LABEL="Protein Self-Interaction Energy"
+export NAMD_ENERGY_SELECTION1="protein"
+export NAMD_ENERGY_SELECTION2=""
+export NAMD_ENERGY_OUT_PREFIX="prot_self"
+export NAMD_ENERGY_OUT_ENERGIES="-conf -nonb -kine -pote"
+run_namd_energy_static
 
-# # Run 2: Water Self
-# export NAMD_ENERGY_LABEL="Water Self-Interaction Energy"
-# export NAMD_ENERGY_SELECTION1="water"
-# export NAMD_ENERGY_SELECTION2=""
-# export NAMD_ENERGY_OUT_PREFIX="water_self"
-# export NAMD_ENERGY_OUT_ENERGIES="-nonb -kine -pote"
-# run_namd_energy_static
-#
-# # Run 3: Protein-Water
-# export NAMD_ENERGY_LABEL="Protein-Water Cross-Interaction Energy"
-# export NAMD_ENERGY_SELECTION1="protein"
-# export NAMD_ENERGY_SELECTION2="water"
-# export NAMD_ENERGY_OUT_PREFIX="prot_water"
-# export NAMD_ENERGY_OUT_ENERGIES="-nonb -pote"
-# run_namd_energy_static
+# Run 2: Water Self
+export NAMD_ENERGY_LABEL="Water Self-Interaction Energy"
+export NAMD_ENERGY_SELECTION1="water"
+export NAMD_ENERGY_SELECTION2=""
+export NAMD_ENERGY_OUT_PREFIX="water_self"
+export NAMD_ENERGY_OUT_ENERGIES="-nonb -kine -pote"
+run_namd_energy_static
+
+# Run 3: Protein-Water
+export NAMD_ENERGY_LABEL="Protein-Water Cross-Interaction Energy"
+export NAMD_ENERGY_SELECTION1="protein"
+export NAMD_ENERGY_SELECTION2="water"
+export NAMD_ENERGY_OUT_PREFIX="prot_water"
+export NAMD_ENERGY_OUT_ENERGIES="-nonb -pote"
+run_namd_energy_static
 
 #-----------------------------------------------------------------
 
@@ -81,12 +81,12 @@ export NAMD_ENERGY_SELECTION2="$selection_water_hydration"
 export NAMD_ENERGY_OUT_PREFIX="prot_water_hydration"
 export NAMD_ENERGY_OUT_ENERGIES="-all"
 run_namd_energy_dynamic
-#
-#
-# # Run: Protein-Bulk Water
-# export NAMD_ENERGY_LABEL="Protein Bulk Water Cross-Interaction Energy"
-# export NAMD_ENERGY_SELECTION1="protein"
-# export NAMD_ENERGY_SELECTION2="$selection_water_bulk"
-# export NAMD_ENERGY_OUT_PREFIX="prot_water_bulk"
-# export NAMD_ENERGY_OUT_ENERGIES="-nonb -pote"
-# run_namd_energy_dynamic
+
+
+# Run: Protein-Bulk Water
+export NAMD_ENERGY_LABEL="Protein Bulk Water Cross-Interaction Energy"
+export NAMD_ENERGY_SELECTION1="protein"
+export NAMD_ENERGY_SELECTION2="$selection_water_bulk"
+export NAMD_ENERGY_OUT_PREFIX="prot_water_bulk"
+export NAMD_ENERGY_OUT_ENERGIES="-nonb -pote"
+run_namd_energy_dynamic

@@ -3,7 +3,7 @@
 calc_namd_energy_master.py - Production OpenMM/MDAnalysis Pair Interaction Pipeline
 
 TODO:
-1. output data buffer periodically dump to file
+1. IndexStreamBuffer: output data buffer periodically dump to file
 2. Ram cache mode thread contention while reading, especially when update selection is ON
 
 Key Architecture:
@@ -169,8 +169,12 @@ def boolify(value: str, default_val: bool = False, err_msg: str = "") -> bool:
     return default_val
 
 
-# Main vars
+def get_cur_datetime_formatted() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
+# -----------------------------------
+# Main vars
+# -----------------------------------
 SHUTDOWN_REQUESTED = False
 ACTIVE_RAM_FILES = set()
 RAM_FILES_LOCK = threading.Lock()
@@ -225,9 +229,10 @@ except AttributeError:
 # =============================================================================
 # 1. VALIDATION AND PRECONDITIONS
 # =============================================================================
-log_info(f"--- Starting Pair Interaction Analysis ({LABEL}) ---")
-log_info(
-    f"Thread Setup: OpenMM CPU={assigned_openmm_threads} ({openmm_alloc_mode}) | MDA OpenMP={assigned_mda_threads}/reader ({mda_alloc_mode})")
+print("\n" + "=" * 50)
+log_info(f"Starting Pair Interaction Analysis ({LABEL})")
+print("=" * 50)
+log_info(f"Thread Setup: OpenMM CPU={assigned_openmm_threads} ({openmm_alloc_mode}) | MDA OpenMP={assigned_mda_threads}/reader ({mda_alloc_mode})")
 
 if not SELECTION1.strip():
     log_error("SELECTION1 cannot be empty. Please define a valid atom selection.")
@@ -241,13 +246,13 @@ UPDATE_SELECTION2: bool = boolify(UPDATE_SELECTION2,
 if SELECTION2.strip():
     if SELECTION1 == SELECTION2:
         log_error("SELECTION2 must be different from SELECTION1. Leave blank for self-interaction.")
-    is_self_interaction = False
+    is_self_interaction: bool = False
 else:
-    is_self_interaction = True
-    UPDATE_SELECTION2 = False
+    is_self_interaction: bool = True
+    UPDATE_SELECTION2: bool = False
     OUT_FORCE = False
 
-IS_DYNAMIC = UPDATE_SELECTION1 or (not is_self_interaction and UPDATE_SELECTION2)
+IS_DYNAMIC: bool = UPDATE_SELECTION1 or (not is_self_interaction and UPDATE_SELECTION2)
 
 if SWITCHDIST >= CUTOFF:
     log_error(
@@ -275,9 +280,12 @@ if "all" in raw_erg_requested:
     if is_self_interaction: raw_erg_requested.update(["bond", "angl", "dihe", "impr", "conf"])
 if "total" in raw_erg_requested or "pote" in raw_erg_requested:
     raw_erg_requested.update(["vdw", "elec", "nonb"])
-    if is_self_interaction: raw_erg_requested.update(["bond", "angl", "dihe", "impr", "conf"])
-if "nonb" in raw_erg_requested: raw_erg_requested.update(["vdw", "elec"])
-if "conf" in raw_erg_requested: raw_erg_requested.update(["bond", "angl", "dihe", "impr"])
+    if is_self_interaction:
+        raw_erg_requested.update(["bond", "angl", "dihe", "impr", "conf"])
+if "nonb" in raw_erg_requested:
+    raw_erg_requested.update(["vdw", "elec"])
+if "conf" in raw_erg_requested:
+    raw_erg_requested.update(["bond", "angl", "dihe", "impr"])
 
 cross_erg_supported = {"vdw", "elec", "nonb", "pote", "total", "all"}
 self_erg_supported = cross_erg_supported.union({"bond", "angl", "dihe", "impr", "conf"})
@@ -380,7 +388,7 @@ else:
     vdw_base = f"(4*epsilon*((sigma/r)^12 - (sigma/r)^6) * {S_vdw}); sigma=0.5*(sigma1+sigma2); epsilon=sqrt(abs(epsilon1*epsilon2))"
 
 # Electrostatic Definition
-is_elec_requested = "elec" in raw_erg_requested
+is_elec_raw_requested = "elec" in raw_erg_requested
 elec_base_main = f"({138.935456 / DIELECTRIC} * (charge1 * charge2 / r))"
 pme_recip_force = None
 ewald_beta = None
@@ -481,11 +489,16 @@ elec_force.setForceGroup(2)
 N_ATOMS = base_system.getNumParticles()
 
 # Parameter Caches, only needed for DYNAMIC selections
-dynamic_vdw_cache: list[
-    tuple[float, float]] = []  # (sigma, epsilon) or (type, ) values of all atoms in vdw non-NBFix mode
 dynamic_elec_q_cache_np: np.ndarray = None  # charges of all atoms, numpy type for fast math
+dynamic_vdw_type_cache: np.ndarray = None       # vdw type values of each particle
+dynamic_vdw_sig_eps_cache: np.ndarray = None    # vdw sigma and epsilon of each particle. 2D array [[s1,e1], [s2,e2]...]
+if IS_DYNAMIC:
+    if nbfix_force:
+        dynamic_vdw_type_cache = np.zeros(N_ATOMS, dtype=np.float64)
+    else:
+        dynamic_vdw_sig_eps_cache = np.zeros((N_ATOMS, 2), dtype=np.float64)
 
-is_dynamic_elec_q_cache_needed = IS_DYNAMIC or (PME_ENABLED and is_self_interaction and is_elec_requested)
+is_dynamic_elec_q_cache_needed = IS_DYNAMIC or (PME_ENABLED and is_self_interaction and is_elec_raw_requested)
 if is_dynamic_elec_q_cache_needed:
     dynamic_elec_q_cache_np = np.zeros(N_ATOMS, dtype=np.float64)
 
@@ -496,13 +509,15 @@ for i in range(N_ATOMS):
     if nbfix_force:
         type_val = nbfix_force.getParticleParameters(i)[0]
         vdw_params = (type_val,)
+        if IS_DYNAMIC:
+            dynamic_vdw_type_cache[i] = type_val
     else:
         s_val = s.value_in_unit(unit.nanometers)
         e_val = e.value_in_unit(unit.kilojoules_per_mole)
         vdw_params = (s_val, e_val)
-
-    if IS_DYNAMIC:
-        dynamic_vdw_cache.append(vdw_params)
+        if IS_DYNAMIC:
+            dynamic_vdw_sig_eps_cache[i, 0] = s_val
+            dynamic_vdw_sig_eps_cache[i, 1] = e_val
 
     if is_dynamic_elec_q_cache_needed:
         dynamic_elec_q_cache_np[i] = c_val
@@ -739,7 +754,6 @@ if USE_GPU:
 # =============================================================================
 # OPENMM CONTEXT CREATION  (Memory intensive)
 # =============================================================================
-# TODO: crashing here due to very high memory usage
 
 # --- MEMORY OPTIMIZATION: PRE-CONTEXT FLUSH ---
 log_info("Flushing parsed topology databases to free RAM for Context allocation...\n")
@@ -1045,14 +1059,16 @@ while not SHUTDOWN_REQUESTED:
         for i in union_idx_sel1:
             val = 1.0 if i in idx_set1_set else 0.0
             q = float(dynamic_elec_q_cache_np[i])
+            vdw_tup = (dynamic_vdw_type_cache[i], val) if nbfix_force else (dynamic_vdw_sig_eps_cache[i, 0], dynamic_vdw_sig_eps_cache[i, 1], val)
+
             if is_self_interaction:
-                vdw_force.setParticleParameters(i, dynamic_vdw_cache[i] + (val,))
+                vdw_force.setParticleParameters(i, vdw_tup)
                 elec_force.setParticleParameters(i, (q, val))
                 if PERIODIC and PME_ENABLED:
                     pme_recip_force.setParticleParameters(i, q * val, 1.0, 0.0)
             else:
                 s2_val = 1.0 if i in idx_set2_set else 0.0
-                vdw_force.setParticleParameters(i, dynamic_vdw_cache[i] + (val, s2_val))
+                vdw_force.setParticleParameters(i, vdw_tup + (s2_val, ))
                 elec_force.setParticleParameters(i, (q, val, s2_val))
                 if PERIODIC and PME_ENABLED:
                     pme_recip_force.setParticleParameters(i, q * max(val, s2_val), 1.0, 0.0)
@@ -1063,7 +1079,8 @@ while not SHUTDOWN_REQUESTED:
                 s2_val = 1.0 if i in idx_set2_set else 0.0
                 s1_val = 1.0 if i in idx_set1_set else 0.0
 
-                vdw_force.setParticleParameters(i, dynamic_vdw_cache[i] + (s1_val, s2_val))
+                vdw_tup = (dynamic_vdw_type_cache[i], s1_val, s2_val) if nbfix_force else (dynamic_vdw_sig_eps_cache[i, 0], dynamic_vdw_sig_eps_cache[i, 1], s1_val, s2_val)
+                vdw_force.setParticleParameters(i, vdw_tup)
                 elec_force.setParticleParameters(i, (q, s1_val, s2_val))
                 if PERIODIC and PME_ENABLED:
                     pme_recip_force.setParticleParameters(i, q * max(s1_val, s2_val), 1.0, 0.0)
@@ -1083,7 +1100,7 @@ while not SHUTDOWN_REQUESTED:
 
     # --- PME Reciprocal Space 3-Pass Subtraction ---
     f_pme_cross_raw = None
-    if PERIODIC and PME_ENABLED and is_elec_requested:
+    if PERIODIC and PME_ENABLED and is_elec_raw_requested:
         if is_self_interaction:
             state_recip = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
             e_recip = state_recip.getPotentialEnergy().value_in_unit(to_kcal)
@@ -1198,46 +1215,51 @@ io_thread.join()
 # =============================================================================
 # 5. POST-LOOP FORMATTING AND OUTPUT
 # =============================================================================
-cur_datetime_format = "%Y-%m-%d %H:%M:%S"
-data_buffer.sort(key=lambda x: x[0])
 
-kbt_val = 1.0 / (0.0019872 * TEMPERATURE)
-comments = [
-    f"================ {LABEL} ================",
-    f"PARAM File(s): {PARAM_FILES}",
-    f"PSF File     : {PSF_FILE}",
-    f"DCD File(s)  : {DCD_FILES}",
-    f"TOTAL Atom Count: {total_atom_count}",
-    "## Selections ---------------",
-    f"SELECTION 1  : \"{SELECTION1}\"  (atom count at frame 0: {len(static_sel1_idx)})",
-    f"SELECTION 2  : \"{SELECTION2}\"  (atom count at frame 0: {len(static_sel2_idx) if not is_self_interaction else 0})",
-    f"Update SEL-1 : {'ON' if UPDATE_SELECTION1 else 'OFF'}",
-    f"Update SEL-2 : {'ON' if UPDATE_SELECTION2 else 'OFF'}",
-    "## Output -------------------",
-    f"OUTPUT Energies : {' '.join(OUT_ENERGIES)}",
-    f"OUTPUT Force    : {'ON' if OUT_FORCE else 'OFF'}  (TOTAL_FORCE as VECTOR_SUM: {'ON' if TOTAL_FORCE_VECTOR_SUM else 'OFF'})",
-    f"TIMESTEP First  : {TIMESTEP_FIRST} \t\t (only for book-keeping)",
-    f"FRAME Frequency : {FRAME_FREQ} steps \t (only for book-keeping)",
-    f"FRAME Skip      : {FRAME_SKIP} frames",
-    "## Simulation Params---------",
-    f"Cutoff      : {CUTOFF} Å",
-    f"Switchdist  : {SWITCHDIST} Å",
-    f"Dielectric  : {DIELECTRIC}",
-    f"PERIODIC BC : {'ON' if PERIODIC else 'OFF'}",
-    f"PME         : {'ON' if PME_ENABLED else 'OFF'} (tolerance factor: {PME_TOLERANCE:.2E})",
-    "-----------------------------------------------------------------",
-    "TOTAL_FORCE is the VECTOR SUM of ELECT_FORCE and VDW_FORCE vectors" if TOTAL_FORCE_VECTOR_SUM else "WARNING: TOTAL_FORCE is the magnitude sum of ELECT_FORCE and VDW_FORCE magnitudes 9PHYSICALLY INACCURATE0",
-    f"Units => ENERGY: 1 kcal/mol     = 6.95e-21 J/molecule = {kbt_val:.2e} KBT",
-    "       => FORCE : 1 kcal/(mol Å) = 69.5 pN",
-    f"Created by Python OpenMM. {time.strftime(cur_datetime_format)}",
-    "========================================================================="
-]
+def create_comments_str() -> str:
+    kbt_val = 1.0 / (0.0019872 * TEMPERATURE)
 
-output_file = f"{OUT_FILE_PREFIX}.energy3.csv"      # todo: test
-with open(output_file, 'w') as f_out:
-    for c in comments: f_out.write(f"{COMMENT_TOKEN} {c}\n")
+    comments = [
+        f"================ {LABEL} ================",
+        f"PARAM File(s): {PARAM_FILES}",
+        f"PSF File     : {PSF_FILE}",
+        f"DCD File(s)  : {DCD_FILES}",
+        f"TOTAL Atom Count: {total_atom_count}",
+        "## Selections ---------------",
+        f"SELECTION 1  : \"{SELECTION1}\"  (atom count at frame 0: {len(static_sel1_idx)})",
+        f"SELECTION 2  : \"{SELECTION2}\"  (atom count at frame 0: {len(static_sel2_idx) if not is_self_interaction else 0})",
+        f"Update SEL-1 : {'ON' if UPDATE_SELECTION1 else 'OFF'}",
+        f"Update SEL-2 : {'ON' if UPDATE_SELECTION2 else 'OFF'}",
+        "## Output -------------------",
+        f"OUTPUT Energies : {' '.join(OUT_ENERGIES)}",
+        f"OUTPUT Force    : {'ON' if OUT_FORCE else 'OFF'}  (TOTAL_FORCE as VECTOR_SUM: {'ON' if TOTAL_FORCE_VECTOR_SUM else 'OFF'})",
+        f"TIMESTEP First  : {TIMESTEP_FIRST} \t\t (only for book-keeping)",
+        f"FRAME Frequency : {FRAME_FREQ} steps \t (only for book-keeping)",
+        f"FRAME Skip      : {FRAME_SKIP} frames",
+        "## Simulation Params---------",
+        f"Cutoff      : {CUTOFF} Å",
+        f"Switchdist  : {SWITCHDIST} Å",
+        f"Dielectric  : {DIELECTRIC}",
+        f"PERIODIC BC : {'ON' if PERIODIC else 'OFF'}",
+        f"PME         : {'ON' if PME_ENABLED else 'OFF'} (tolerance factor: {PME_TOLERANCE:.2E})",
+        "-----------------------------------------------------------------",
+        "TOTAL_FORCE is the VECTOR SUM of ELECT_FORCE and VDW_FORCE vectors" if TOTAL_FORCE_VECTOR_SUM else "WARNING: TOTAL_FORCE is the magnitude sum of ELECT_FORCE and VDW_FORCE magnitudes 9PHYSICALLY INACCURATE0",
+        f"Units => ENERGY: 1 kcal/mol     = 6.95e-21 J/molecule = {kbt_val:.2e} KBT",
+        "       => FORCE : 1 kcal/(mol Å) = 69.5 pN",
+        f"Created by Python OpenMM. {get_cur_datetime_formatted()}",
+        "========================================================================="
+    ]
 
+    out_str = ""
+    for c in comments:
+        out_str += f"{COMMENT_TOKEN} {c}\n"
+
+    return out_str
+
+
+def create_output_erg_header_line() -> str:
     # Target Column Format: FRAME TS BOND ANGL DIHE IMPR CONF ELECT VDW NONBOND POTENTIAL TOTAL ELECT_FORCE VDW_FORCE TOTAL_FORCE
+
     headers = ["FRAME", "TS"]
     if UPDATE_SELECTION1: headers.append("SEL1_ATOM_COUNT")
     if not is_self_interaction and UPDATE_SELECTION2: headers.append("SEL2_ATOM_COUNT")
@@ -1263,62 +1285,75 @@ with open(output_file, 'w') as f_out:
                 headers.append("TOTAL_FORCE")
         else:
             headers.extend(["ELECT_FORCE", "VDW_FORCE", "TOTAL_FORCE"])
+    return OUT_DELIMITER.join(headers) + "\n"
 
-    f_out.write(OUT_DELIMITER.join(headers) + "\n")
 
+def create_output_erg_line(erg_row) -> str:
+    abs_f_idx, n1, n2, erg_raw, f_mags, f_comps = erg_row
+    ts_val = TIMESTEP_FIRST + (abs_f_idx * FRAME_FREQ)
+
+    # energies
+    e_vdw, e_elec, e_bond, e_angl, e_dihe, e_impr = erg_raw
+    nonb_eng = e_vdw + e_elec
+    conf_eng = e_bond + e_angl + e_dihe + e_impr
+    pote_eng = nonb_eng + conf_eng
+
+    out_row = [str(abs_f_idx), str(ts_val)]
+    if UPDATE_SELECTION1: out_row.append(str(n1))
+    if not is_self_interaction and UPDATE_SELECTION2: out_row.append(str(n2))
+
+    if "bond" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(e_bond))
+    if "angl" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(e_angl))
+    if "dihe" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(e_dihe))
+    if "impr" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(e_impr))
+    if "conf" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(conf_eng))
+    if "elec" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(e_elec))
+    if "vdw" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(e_vdw))
+    if "nonb" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(nonb_eng))
+    if "pote" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(pote_eng))
+    if "total" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(pote_eng))
+
+    if OUT_FORCE and f_mags is not None:
+        if OUT_FORCE_COMPONENTS and f_comps is not None:
+            f_ele_mag, f_vdw_mag, f_tot_mag = f_mags
+
+            f_ele_comp, f_vdw_comp = f_comps
+            f_tot_comp = f_ele_comp + f_vdw_comp
+            for i in chain(f_ele_comp, [f_ele_mag], f_vdw_comp, [f_vdw_mag], f_tot_comp, [f_tot_mag]):
+                out_row.append(OUT_ENERGY_FORMAT.format(i))
+        else:
+            for i in f_mags:
+                out_row.append(OUT_ENERGY_FORMAT.format(i))
+
+    return OUT_DELIMITER.join(out_row) + "\n"
+
+# -----------------------------------------------
+# Writing output to file
+# -----------------------------------------------
+data_buffer.sort(key=lambda x: x[0])
+
+output_file = f"{OUT_FILE_PREFIX}.energy4.csv"      # TODO: TEST
+with open(output_file, 'w') as f_out:
+    f_out.write(create_comments_str()) # Comments
+    f_out.write(create_output_erg_header_line())  # energy header
+    # energies for each frame
     for row in data_buffer:
-        abs_f_idx, n1, n2, erg_raw, f_mags, f_comps = row
-        ts_val = TIMESTEP_FIRST + (abs_f_idx * FRAME_FREQ)
-
-        # energies
-        e_vdw, e_elec, e_bond, e_angl, e_dihe, e_impr = erg_raw
-        nonb_eng = e_vdw + e_elec
-        conf_eng = e_bond + e_angl + e_dihe + e_impr
-        pote_eng = nonb_eng + conf_eng
-
-        out_row = [str(abs_f_idx), str(ts_val)]
-        if UPDATE_SELECTION1: out_row.append(str(n1))
-        if not is_self_interaction and UPDATE_SELECTION2: out_row.append(str(n2))
-
-        if "bond" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(e_bond))
-        if "angl" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(e_angl))
-        if "dihe" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(e_dihe))
-        if "impr" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(e_impr))
-        if "conf" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(conf_eng))
-        if "elec" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(e_elec))
-        if "vdw" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(e_vdw))
-        if "nonb" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(nonb_eng))
-        if "pote" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(pote_eng))
-        if "total" in raw_erg_requested: out_row.append(OUT_ENERGY_FORMAT.format(pote_eng))
-
-        if OUT_FORCE and f_mags is not None:
-            if OUT_FORCE_COMPONENTS and f_comps is not None:
-                f_ele_mag, f_vdw_mag, f_tot_mag = f_mags
-
-                f_ele_comp, f_vdw_comp = f_comps
-                f_tot_comp = f_ele_comp + f_vdw_comp
-                for i in chain(f_ele_comp, [f_ele_mag], f_vdw_comp, [f_vdw_mag], f_tot_comp, [f_tot_mag]):
-                    out_row.append(OUT_ENERGY_FORMAT.format(i))
-            else:
-                for i in f_mags:
-                    out_row.append(OUT_ENERGY_FORMAT.format(i))
-
-        f_out.write(OUT_DELIMITER.join(out_row) + "\n")
+        f_out.write(create_output_erg_line(row))
 
 # =============================================================================
 # 6. EXECUTION REPORT
 # =============================================================================
 t_total = time.perf_counter() - t_app_start
 compute_active_time = max(0.0, t_compute_total - t_io_wait_total)
-fps = len(data_buffer) / max(0.001, t_compute_total)
+fps = frames_processed / max(0.001, t_compute_total)
 status_str = "\033[91mABORTED (Early Exit)\033[0m" if SHUTDOWN_REQUESTED else "\033[92mSUCCESS\033[0m"
 
-print(f"\n{time.strftime(cur_datetime_format)}")
+print(f"\n{get_cur_datetime_formatted()}")
 print("=" * 60)
 print(f"               EXECUTION SUMMARY")
 print("=" * 60)
 print(f" Status               : {status_str}")
-print(f" Frames Processed     : {len(data_buffer)}")
+print(f" Frames Processed     : {frames_processed}")
 print(f" Processing Speed     : {fps:.1f} frames/sec")
 print(f" Compute Engine       : {platform_name}")
 print(f" Final Output File    : {output_file}")
