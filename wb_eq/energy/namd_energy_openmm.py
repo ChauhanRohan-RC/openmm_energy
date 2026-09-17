@@ -1,39 +1,200 @@
 #!/usr/bin/env python3
-"""
-calc_namd_energy_master.py - Production OpenMM/MDAnalysis Pair Interaction Pipeline
 
-TODO:
+# ========================================================================
+# OpenMM and MDAnalysis implementation of NAMD PairInteraction Energy
+# ------------------------------------------------------------------------
+# OPTIMIZED FOR GPU's
+# ----------------------
+# => calculate pairinteraction energies from NAMD simulation trajectories with CHARMM force fields
+# => STATIC and DYNAMIC selections, self and cross-interactions
+# => PME for long range electrostatics (NAMD pairinteraction does not have this)
+#    Electrostatic energies with PME will be highly negative compared to NAMD pairinteraction
+# => Trajectory Disk Streaming/RAM loading/RAM chunking modes
+# => Smart multithreading allocation
+# ------------------------------------------------------------------------
+
+"""
+TODO TEST:
 1. IndexStreamBuffer: output data buffer periodically dump to file
 2. Ram cache mode thread contention while reading, especially when update selection is ON
-
-Key Architecture:
-1. Smart Thread Allocation (OpenMM vs. OpenMP MDAnalysis Reader partition).
-2. Hardware Bootloader: CUDA -> AMD HIP -> OpenCL -> CPU.
-3. Dual RAM Loaders with Pre-Flight Anti-Deadlock Check and Dynamic Chunk Sizing.
-4. Static Fast-Path Branch vs. Dynamic Differential Parameter Masking.
-5. NAMD X-PLOR Shifting, NBFIX Generalized Cloning, & Dynamic Bond Dispatcher.
-6. Bulletproof OS Signal Handling (SIGINT, SIGTERM, SIGHUP) & RAM Cleanup.
 """
+
+## USAGE --------------------------------------------------
+# 0: First run normal simulation to obtain .dcd trajectories
+# 1. Copy script to working dir
+# 2. INPUT: Set input strcuture (.psf) and trajectories (.dcd)
+# 3. INPUT: Set selection 1, Selection 2 (Optional), out_energies (Optional), out_file_prefix
+#----------------------------------------------------------------------------
+# -> ALTERNATIVELY, SET ENVIRONMENT VARIABLES (used when variables are not set in script)
+#----------------------------------------------------------------------------
+#	-> NAMD_ENERGY_SELECTION1	        =	selection1
+#	-> NAMD_ENERGY_SELECTION2	        =	selection2 		  (optional)
+#	-> NAMD_ENERGY_UPDATE_SELECTION1	=	update_selection1
+#	-> NAMD_ENERGY_UPDATE_SELECTION2	=	update_selection2
+#	-> NAMD_ENERGY_OUT_ENERGIES	        = 	out_energies	  (optional)
+#	-> NAMD_ENERGY_OUT_PREFIX	        =	out_file_prefix
+#	-> NAMD_ENERGY_TIMESTEP_END         =	timestep_end      (optional)
+#	-> NAMD_ENERGY_LABEL                =	label			  (optional)
+#   -> NAMD_ENERGY_PROCESSES            =   namd_processes    (optional)
+#----------------------------------------------------------------------------
+# 4. set other input and output params [search for TODO]
+# 5. run with "./namd_energy_openmm.py"
+# 	OR
+# 6. use namd_energy_openmm.sh launcher.
+#	-> First, unset selection1, selection2, out_energies, out_file_prefix in this script
+#	-> Set environment variables in namd_energy_openmm.sh
+#		=> ./namd_energy_openmm.sh
 
 import os
 import sys
-import warnings
 
-# Suppress harmless MDAnalysis DCDReader deprecation warnings
-warnings.filterwarnings("ignore", message=r".*DCDReader currently makes independent timesteps.*")
+# Helper function to find dcd files in a folder. min_num and max_num are both inclusive
+def find_files(dir_path, prefix, suffix, min_num=None, max_num=None, sort_natural=True, return_abs_path=False):
+    import re; from pathlib import Path
+    dir_path_obj = Path(dir_path)
+    if not dir_path_obj.is_dir(): raise FileNotFoundError(f"Directory '{dir_path}' not found.")
+    pattern = re.compile(rf"^{re.escape(prefix)}(\d+){re.escape(suffix)}$")
+    result_list = []
+    for f in dir_path_obj.iterdir():
+        if f.is_file():
+            match = pattern.search(f.name)
+            if match:
+                num = int(match.group(1))
+                if (min_num is None or num >= min_num) and (max_num is None or num <= max_num):
+                    result_list.append(str(f.resolve()) if return_abs_path else str(f.name))
+
+    if sort_natural:
+        def natural_sort_key(s): return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
+        result_list.sort(key=natural_sort_key)
+    return result_list
+
+
 
 # =============================================================================
-# THREAD MANAGEMENT & HARDWARE CONTROLS
+# INPUT
 # =============================================================================
 USE_GPU = True  # TODO: important for smart thread allocation
 
-# Thread controls: 0 = Smart Auto-Allocation, >0 = Explicit User Override
-MDA_THREADS = 0  # Threads per MDAnalysis reader instance (OpenMP)
-OPENMM_CPU_THREADS = 0  # Compute threads for OpenMM (applies only if running on CPU)
-NUM_RAM_READER_THREADS = 1  # Concurrent reader threads for RAM chunks
+PARAM_FILES = [
+    "../../common/ff/par_all36m_prot.prm",
+    "../../common/ff/toppar_water_ions.prot.str"
+]
+PSF_FILE = "../../common/amyl_wb.psf"       # TODO : input structure file
+DCD_FILES = find_files("..", "amyl_wb_eq", ".dcd", 2, 2)          # TODO : trajectory dcd files
 
+## Selections (MDAnalysis selection syntax)
+# -> hydration shell: water and around 4.25 protein
+SELECTION1: str = os.getenv("NAMD_ENERGY_SELECTION1", "")   # TODO: or set ENV VAR: NAMD_ENERGY_SELECTION1
+SELECTION2: str = os.getenv("NAMD_ENERGY_SELECTION2", "")   # TODO: or set ENV VAR: NAMD_ENERGY_SELECTION2
+
+# Dynamic Selections (update every frame)
+UPDATE_SELECTION1: str = str(os.getenv("NAMD_ENERGY_UPDATE_SELECTION1", 0))
+UPDATE_SELECTION2: str = str(os.getenv("NAMD_ENERGY_UPDATE_SELECTION2", 0))
+
+## Output file names
+OUT_FILE_PREFIX: str = os.getenv("NAMD_ENERGY_OUT_PREFIX", "interaction")    # TODO: or set ENV VAR: NAMD_ENERGY_OUT_PREFIX
+
+## [OPTIONAL][ Label for this run
+LABEL: str = os.getenv("NAMD_ENERGY_LABEL", "Interaction Energy (OpenMM)")   # or ser ENV VAR: NAMD_ENERGY_LABEL
+
+### Energies to calculate (as sequence of 4-letter codes)
+# -------------------------------------------------------------------------------------
+# OPTIONS: -bond -angl -dihe -impr -conf -vdw -elec -nonb -pote -all
+# -------------------------------------------------------------------------------------
+# -> -dihe (dihedral), -impr (imporper), -pote (potential)
+# -> -conf (confomational) = bond + angle + dihedral + improper
+# -> -nonb (non-nonded)    = elec + vdw
+# -> -pote (potential)     = conf + nonb
+# -------------------------------------------------------------------------------------
+# WITH SELECTION 2: ONLY [ -vdw -elec -nonb -pote -all ] ARE ALLOWED
+
+OUT_ENERGIES: list[str] = os.getenv("NAMD_ENERGY_OUT_ENERGIES", "-all").split()     # TODO: or set ENV VAR: NAMD_ENERGY_OUT_ENERGIES
+
+## Params
+CUTOFF: float = 12.0            # TODO: Cutoff distance (in Å)
+SWITCHDIST: float = 10.0        # TODO: Switch distance (in Å) for non-bonded interactions
+DIELECTRIC: float = 1.0         # ielectric constant (> 1 will lessen the electrostatic forces)
+TEMPERATURE: float = 300        # [Optional] Temperature (in K) (Only used for bookkeeping)
+
+## Periodic [OPTIONAL]
+PERIODIC: bool = True
+PME_ENABLED: bool = True        # [ONLY PERIODIC] PME for long-range electrostatics
+
+## TIme Step parameters (ONLY USED FOR OUTPUT COLUMNS, DOES NOT AFFECT CALCULATION)
+TIMESTEP_FIRST: int = 0         # only for bookkeeping
+FRAME_FREQ: int = 100           # TODO: timesteps between frames (=dcd_freq). only for bookkeeping
+
+# Skip Frames, faster calculation
+FRAME_SKIP: int = 49            # TODO: frame_step = frame_skip + 1
+
+# ==================================
+# OUTPUT Params
+# ==================================
+
+## Force Output	(ONLY APPLICABLE when SEL-2 is defined)
+# -> Calculates force on SEL-1 due to SEL-2
+OUT_FORCE: bool = True
+OUT_FORCE_COMPONENTS: bool = False  # output force XYZ components
+
+# total force will be the VECTOR SUM: mag(total_force) = mag(vdw_force + elec_force vectors) [true physical behaviour].
+# Else, mag(total_force) = mag(vdw_force) + mag(elec_force)    [NO CANCELLATIONS, PHYSICALLY INACCURATE]
+TOTAL_FORCE_VECTOR_SUM: bool = True
+
+OUT_ENERGY_FORMAT = "{:.4f}"
+OUT_DELIMITER = " "
+COMMENT_TOKEN = "#"
+
+# ==============================================
+# FRAME LOADING and PERFORMANCE
+# ==============================================
+QUEUE_BUFFER_SIZE = 1000 if USE_GPU else 100     # Max allowed pending frames in queue. Frame Reading will stop if queue is full
+
+RAM_LOADING_ENABLED: bool = False     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
+RAM_DISK_PATH = "/tmp/namd_energy.openmm"          # ram disk path to use
+RAM_READER_COUNT = 2                  # Concurrent readers for RAM chunks
+
+# Chunking to RAM
+RAM_CHUNK_MODE: bool = True           # Loads big DCD files to RAM_DISK in chunks
+RAM_CHUNK_DYNAMIC: bool = True        # Automatically shrink chunk if RAM is constrained
+RAM_CHUNK_FRAMES: int = 10000         # Max frames per chunk
+RAM_CHUNK_MIN_FRAMES: int = 2000      # Fallback to disk streaming if chunks cannot meet this size
+
+RAM_SAFETY_MARGIN_GB = 1.0          # Base free RAM margin required (GiB)
+RAM_EXTRA_MARGIN_GB = 0.1           # Extra buffer headroom (GiB)
+
+## Thread controls
+# 0 = Smart Auto-Allocation, >0 = Override
+MDA_THREADS = 0                 # Threads per MDAnalysis reader instance (OpenMP)
+OPENMM_CPU_THREADS = 0          # Compute threads for OpenMM (applies only if running on CPU)
+
+
+
+# -----------------------------------
+# Other Flags
+# -----------------------------------
+PROGRESS_REPORT_INTERVAL_FRAMES: int = 1000  # num frames
+
+MANUAL_GC_ENABLED: bool = True
+MANUAL_GC_INTERVAL_FRAMES: int = 5000   # num frames
+
+## Experimental Features -----------
+## experimental flag to tun off erfc(ewald_beta * r) factor in short range direct electrostatics
+# if true: multiplies short range raw coulomb energy with erfc(ewald_beta * r) (very fast decaying factor)
+# else: uses raw coulomb energy expression for short range electrostatics with sharp discontinuity at the cutoff
+PME_SHORT_RANGE_USE_EWALD_BETA: bool = True
+PME_TOLERANCE: float = 1e-6     # NAMD default PME error tolerance (unitless factor)
+
+
+
+
+# ==========================================================================
+# MAIN
+# ==========================================================================
+
+# Thread Allocation -------------------------------------------------
+# Must be before all major imports
 sys_cores = os.cpu_count() or 4
-actual_ram_reader_threads = min(NUM_RAM_READER_THREADS, sys_cores)
+actual_ram_reader_threads = min(RAM_READER_COUNT, sys_cores)
 
 # Smart Thread Allocation Logic
 if OPENMM_CPU_THREADS > 0:
@@ -56,7 +217,11 @@ else:
 
 # Set OpenMP thread limit prior to loading C-extensions
 os.environ["OMP_NUM_THREADS"] = str(assigned_mda_threads)
+# ---------------------------------------------------------------------
 
+# Imports (must be after thread allocation)
+import warnings
+warnings.filterwarnings("ignore", message=r".*DCDReader currently makes independent timesteps.*")
 import gc
 import time
 import queue
@@ -73,90 +238,18 @@ import MDAnalysis as mda
 import openmm as mm
 from openmm import app, unit
 
-# =============================================================================
-# CONFIGURATION INPUTS
-# =============================================================================
 
-PARAM_FILES = [
-    "../../common/ff/par_all36m_prot.prm",
-    "../../common/ff/toppar_water_ions.prot.str"
-]
-PSF_FILE = "../../common/amyl_wb.psf"
-DCD_FILES = ["../amyl_wb_eq2.dcd"]
-
-# resname TIP3 and around 4.25 protein
-SELECTION1: str = os.getenv("NAMD_ENERGY_SELECTION1", "")
-SELECTION2: str = os.getenv("NAMD_ENERGY_SELECTION2", "")
-
-UPDATE_SELECTION1: str = str(os.getenv("NAMD_ENERGY_UPDATE_SELECTION1", 0))
-UPDATE_SELECTION2: str = str(os.getenv("NAMD_ENERGY_UPDATE_SELECTION2", 0))
-
-OUT_FILE_PREFIX: str = os.getenv("NAMD_ENERGY_OUT_PREFIX", "interaction")
-OUT_ENERGIES: list[str] = os.getenv("NAMD_ENERGY_OUT_ENERGIES", "-all").split()
-LABEL: str = os.getenv("NAMD_ENERGY_LABEL", "Interaction Energy (OpenMM)")
-
-TEMPERATURE: float = 300
-CUTOFF: float = 12.0
-SWITCHDIST: float = 10.0
-DIELECTRIC: float = 1.0
-
-PERIODIC: bool = True
-PME_ENABLED: bool = True  # Set to True if the NAMD simulation used PME
-PME_TOLERANCE: float = 1e-6  # NAMD default PME error tolerance (unitless factor)
-
-FRAME_SKIP: int = 49
-TIMESTEP_FIRST: int = 0  # only for bookkeeping
-FRAME_FREQ: int = 100  # timesteps between frames (=dcd_freq). only for bookkeeping
-
-OUT_FORCE = True
-OUT_FORCE_COMPONENTS = False  # output force XYZ components
-TOTAL_FORCE_VECTOR_SUM = True  # total force will be the VECTOR SUM: mag(total_force) = mag(vdw_force + elec_force vectors) [causes CANCELLATIONS, true physical behaviour].
-# Else, mag(total_force) = mag(vdw_force) + mag(elec_force)    [NO CANCELLATIONS, not good physics]
-
-OUT_DELIMITER = " "
-OUT_ENERGY_FORMAT = "{:.4f}"
-COMMENT_TOKEN = "#"
-
-# --- RAM Disk & Chunk Optimization ---
-RAM_LOADING_ENABLED = False
-RAM_CHUNK_MODE = True
-RAM_CHUNK_FRAMES = 5000  # Target frame count per chunk
-DYNAMIC_CHUNK_SIZE_ENABLED = True  # Automatically shrink chunk if RAM is constrained
-MIN_CHUNK_FRAMES = 2000  # Fallback to disk streaming if chunks cannot meet this size
-RAM_DISK_PATH = "/tmp"
-RAM_SAFETY_MARGIN_GB = 1.0  # Base free RAM margin required
-RAM_EXTRA_MARGIN_GB = 0.1  # Extra buffer headroom
-
-QUEUE_BUFFER_SIZE = 400 if USE_GPU else 100
-
-# -----------------------------------------------------------------------------
-## Other Flags ---------------------
-PROGRESS_REPORT_INTERVAL_FRAMES = 10  # num frames
-
-MANUAL_GC_ENABLED = True
-MANUAL_GC_INTERVAL_FRAMES = 5000  # num frames
-
-## Experimental Features -----------
-## experimental flag to tun off erfc(ewald_beta * r) factor in short range direct electrostatics
-# if true: multiplies short range raw coulomb energy with erfc(ewald_beta * r) (very fast decaying factor)
-# else: uses raw coulomb energy expression for short range electrostatics with sharp discontinuity at the cutoff
-PME_SHORT_RANGE_USE_EWALD_BETA = True
+# Logging ------------------------------
+def log_info(msg): print(f"\033[92m[INFO]\033[0m {msg}")
 
 
-# =============================================================================
-# HELPER FUNCTIONS & GLOBAL STATE
-# =============================================================================
-def log_info(msg):    print(f"\033[92m[INFO]\033[0m {msg}")
+def log_warn(msg): print(f"\033[93m[WARN]\033[0m {msg}")
 
 
-def log_warn(msg):    print(f"\033[93m[WARN]\033[0m {msg}")
-
-
-def log_error(msg):   print(f"\033[91m[ERROR]\033[0m {msg}"); sys.exit(1)
+def log_error(msg): print(f"\033[91m[ERROR]\033[0m {msg}"); sys.exit(1)
 
 
 # Helper functions ------------------------------
-
 def boolify(value: str, default_val: bool = False, err_msg: str = "") -> bool:
     value = value.strip().lower()
     truthy = {"1", "true", "t", "yes", "y", "on"}
@@ -171,10 +264,9 @@ def boolify(value: str, default_val: bool = False, err_msg: str = "") -> bool:
 
 def get_cur_datetime_formatted() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+# -------------------------------------------------------------------
 
-# -----------------------------------
-# Main vars
-# -----------------------------------
+# Global State ------------------
 SHUTDOWN_REQUESTED = False
 ACTIVE_RAM_FILES = set()
 RAM_FILES_LOCK = threading.Lock()
@@ -184,7 +276,9 @@ t_ram_load_total = 0.0
 t_compute_total = 0.0
 t_io_wait_total = 0.0
 
-
+# -------------------------------------------------
+# Cleanup Handlers
+# -------------------------------------------------
 def register_ram_file(filepath):
     with RAM_FILES_LOCK: ACTIVE_RAM_FILES.add(filepath)
 
@@ -268,8 +362,15 @@ if FRAME_SKIP < 0:
     FRAME_SKIP = 0
 FRAME_STEP = FRAME_SKIP + 1
 
-if RAM_LOADING_ENABLED and RAM_CHUNK_MODE:
-    if shutil.which("catdcd") is None:
+
+if RAM_LOADING_ENABLED:
+    # make sure ram disk exists
+    try:
+        os.makedirs(RAM_DISK_PATH, exist_ok=True)
+    except Exception as e:
+        log_error(f"RAM loading enabled but failed to create RAM_DISK directory {RAM_DISK_PATH}: {e}")
+
+    if RAM_CHUNK_MODE and shutil.which("catdcd") is None:
         log_warn("'catdcd' executable not found on system PATH. Falling back to Loader 1 (Blind Copy)...")
         RAM_CHUNK_MODE = False
 
@@ -950,7 +1051,7 @@ def master_producer(q_main):
             two_chunk_bytes = (active_chunk_frames * bytes_per_frame * 2) + margin_bytes
 
             if free_space < two_chunk_bytes:
-                if not DYNAMIC_CHUNK_SIZE_ENABLED:
+                if not RAM_CHUNK_DYNAMIC:
                     log_warn(
                         f"Insufficient RAM and Dynamic Chunking is disabled. Falling back to Disk Streaming for {os.path.basename(dcd_file)}.")
                     disk_stream(q_main, dcd_file, total_frames, global_frame_offset)
@@ -961,8 +1062,8 @@ def master_producer(q_main):
                 available_for_chunks = free_space - margin_bytes
                 resized_frames = int(available_for_chunks / (2 * bytes_per_frame)) if available_for_chunks > 0 else 0
 
-                if resized_frames < MIN_CHUNK_FRAMES:
-                    log_warn(f"Dynamic chunk size ({resized_frames}) below MIN_CHUNK_FRAMES ({MIN_CHUNK_FRAMES}).")
+                if resized_frames < RAM_CHUNK_MIN_FRAMES:
+                    log_warn(f"Dynamic chunk size ({resized_frames}) below MIN_CHUNK_FRAMES ({RAM_CHUNK_MIN_FRAMES}).")
                     log_warn(f"Falling back to Disk Streaming for {os.path.basename(dcd_file)}.")
                     disk_stream(q_main, dcd_file, total_frames, global_frame_offset)
                     global_frame_offset += total_frames
@@ -1217,7 +1318,7 @@ io_thread.join()
 # =============================================================================
 
 def create_comments_str() -> str:
-    kbt_val = 1.0 / (0.0019872 * TEMPERATURE)
+    kbt_in_kcal_per_mol = 1.0 / (0.0019872 * TEMPERATURE) if TEMPERATURE is not None and TEMPERATURE > 0 else None
 
     comments = [
         f"================ {LABEL} ================",
@@ -1238,13 +1339,13 @@ def create_comments_str() -> str:
         f"FRAME Skip      : {FRAME_SKIP} frames",
         "## Simulation Params---------",
         f"Cutoff      : {CUTOFF} Å",
-        f"Switchdist  : {SWITCHDIST} Å",
+        f"Switch dist : {SWITCHDIST} Å",
         f"Dielectric  : {DIELECTRIC}",
         f"PERIODIC BC : {'ON' if PERIODIC else 'OFF'}",
         f"PME         : {'ON' if PME_ENABLED else 'OFF'} (tolerance factor: {PME_TOLERANCE:.2E})",
         "-----------------------------------------------------------------",
         "TOTAL_FORCE is the VECTOR SUM of ELECT_FORCE and VDW_FORCE vectors" if TOTAL_FORCE_VECTOR_SUM else "WARNING: TOTAL_FORCE is the magnitude sum of ELECT_FORCE and VDW_FORCE magnitudes 9PHYSICALLY INACCURATE0",
-        f"Units => ENERGY: 1 kcal/mol     = 6.95e-21 J/molecule = {kbt_val:.2e} KBT",
+        f"Units => ENERGY: 1 kcal/mol     = 6.95e-21 J/molecule {f'= {kbt_in_kcal_per_mol:.2e} KBT' if kbt_in_kcal_per_mol else ''}",
         "       => FORCE : 1 kcal/(mol Å) = 69.5 pN",
         f"Created by Python OpenMM. {get_cur_datetime_formatted()}",
         "========================================================================="
@@ -1332,7 +1433,7 @@ def create_output_erg_line(erg_row) -> str:
 # -----------------------------------------------
 data_buffer.sort(key=lambda x: x[0])
 
-output_file = f"{OUT_FILE_PREFIX}.energy4.csv"      # TODO: TEST
+output_file = f"{OUT_FILE_PREFIX}.energy.csv"
 with open(output_file, 'w') as f_out:
     f_out.write(create_comments_str()) # Comments
     f_out.write(create_output_erg_header_line())  # energy header
