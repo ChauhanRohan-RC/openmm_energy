@@ -1398,6 +1398,7 @@ def ramdisk_read_blocking(q_main, temp_dcd, num_frames, global_frame_offset):
         if start >= stop: continue
         t = threading.Thread(target=parallel_reader_worker,
                              args=(q_main, PSF_FILE, temp_dcd, start, stop, global_frame_offset, FRAME_STEP))
+        t.daemon = True
         threads.append(t)
         t.start()
 
@@ -1488,6 +1489,7 @@ def master_producer(q_main):
             q_chunks = queue.Queue(maxsize=2)
             chunk_mgr_thread = threading.Thread(target=catdcd_chunk_loader,
                                                 args=(dcd_file, total_frames, active_chunk_frames, q_chunks))
+            chunk_mgr_thread.daemon = True
             chunk_mgr_thread.start()
 
             chunk_frame_offset = 0
@@ -1671,6 +1673,7 @@ to_kcal_A = unit.kilocalorie_per_mole / unit.angstrom
 
 # Start reading frames
 io_thread = threading.Thread(target=master_producer, args=(frame_queue,))
+io_thread.daemon = True
 io_thread.start()
 
 # ---------------- COMPUTE START ----------------
@@ -1688,6 +1691,11 @@ next_manual_gc_frames = MANUAL_GC_INTERVAL_FRAMES
 # --- PROGRESS TRACKER SETUP ---
 next_progress_report_frames = PROGRESS_REPORT_INTERVAL_FRAMES
 t_last_progress_report = time.perf_counter()
+
+# SWIG ACCELERATOR: Localize method pointers to bypass Python object dictionary lookups inside the hot loop
+vdw_set = vdw_force.setParticleParameters
+elec_set = elec_force.setParticleParameters
+pme_set = pme_recip_force.setParticleParameters if (PERIODIC and PME_ENABLED) else None
 
 while not SHUTDOWN_REQUESTED:
     t0_wait = time.perf_counter()
@@ -1725,16 +1733,16 @@ while not SHUTDOWN_REQUESTED:
             vdw_tup = (dynamic_vdw_type_cache[i], val) if nbfix_force else (dynamic_vdw_sig_eps_cache[i, 0], dynamic_vdw_sig_eps_cache[i, 1], val)
 
             if is_self_interaction:
-                vdw_force.setParticleParameters(i, vdw_tup)
-                elec_force.setParticleParameters(i, (q, val))
-                if PERIODIC and PME_ENABLED:
-                    pme_recip_force.setParticleParameters(i, q * val, 1.0, 0.0)
+                vdw_set(i, vdw_tup)
+                elec_set(i, (q, val))
+                if pme_set:
+                    pme_set(i, q * val, 1.0, 0.0)
             else:
                 s2_val = 1.0 if i in idx_set2_set else 0.0
-                vdw_force.setParticleParameters(i, vdw_tup + (s2_val, ))
-                elec_force.setParticleParameters(i, (q, val, s2_val))
-                if PERIODIC and PME_ENABLED:
-                    pme_recip_force.setParticleParameters(i, q * max(val, s2_val), 1.0, 0.0)
+                vdw_set(i, vdw_tup + (s2_val, ))
+                elec_set(i, (q, val, s2_val))
+                if pme_set:
+                    pme_set(i, q * max(val, s2_val), 1.0, 0.0)
 
         if not is_self_interaction:
             for i in union_idx_sel2.difference(union_idx_sel1):
@@ -1743,10 +1751,10 @@ while not SHUTDOWN_REQUESTED:
                 s1_val = 1.0 if i in idx_set1_set else 0.0
 
                 vdw_tup = (dynamic_vdw_type_cache[i], s1_val, s2_val) if nbfix_force else (dynamic_vdw_sig_eps_cache[i, 0], dynamic_vdw_sig_eps_cache[i, 1], s1_val, s2_val)
-                vdw_force.setParticleParameters(i, vdw_tup)
-                elec_force.setParticleParameters(i, (q, s1_val, s2_val))
-                if PERIODIC and PME_ENABLED:
-                    pme_recip_force.setParticleParameters(i, q * max(s1_val, s2_val), 1.0, 0.0)
+                vdw_set(i, vdw_tup)
+                elec_set(i, (q, s1_val, s2_val))
+                if pme_set:
+                    pme_set(i, q * max(s1_val, s2_val), 1.0, 0.0)
 
         vdw_force.updateParametersInContext(context)
         elec_force.updateParametersInContext(context)
@@ -1787,21 +1795,21 @@ while not SHUTDOWN_REQUESTED:
 
                 # Pass A:
                 for i in only_sel2:
-                    pme_recip_force.setParticleParameters(i, 0.0, 1.0, 0.0)
+                    pme_set(i, 0.0, 1.0, 0.0)
                 pme_recip_force.updateParametersInContext(context)
                 st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
 
                 # Pass B:
                 for i in only_sel2:
-                    pme_recip_force.setParticleParameters(i, dynamic_elec_q_cache_np[i], 1.0, 0.0)
+                    pme_set(i, dynamic_elec_q_cache_np[i], 1.0, 0.0)
                 for i in only_sel1:
-                    pme_recip_force.setParticleParameters(i, 0.0, 1.0, 0.0)
+                    pme_set(i, 0.0, 1.0, 0.0)
                 pme_recip_force.updateParametersInContext(context)
                 st_B = context.getState(getEnergy=True, groups=(1 << 7))
 
                 # Restore XOR AB state for next frame:
                 for i in only_sel1:
-                    pme_recip_force.setParticleParameters(i, dynamic_elec_q_cache_np[i], 1.0, 0.0)
+                    pme_set(i, dynamic_elec_q_cache_np[i], 1.0, 0.0)
                 pme_recip_force.updateParametersInContext(context)
             else:
                 context.setParameter("lambda_1", 1.0)
