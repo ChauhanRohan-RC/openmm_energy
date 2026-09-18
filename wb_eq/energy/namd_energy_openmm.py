@@ -90,6 +90,7 @@ SELECTION2: str = os.getenv("NAMD_ENERGY_SELECTION2", "")   # TODO: or set ENV V
 # Dynamic Selections (update every frame)
 UPDATE_SELECTION1: str = str(os.getenv("NAMD_ENERGY_UPDATE_SELECTION1", 0))
 UPDATE_SELECTION2: str = str(os.getenv("NAMD_ENERGY_UPDATE_SELECTION2", 0))
+FAST_DYNAMIC_SELECTION: bool = True   # TODO: TEST Bypasses slow MDAnalysis 'updating=True' and manually update selection using FastDynamicSelector
 
 ## Output file names
 OUT_FILE_PREFIX: str = os.getenv("NAMD_ENERGY_OUT_PREFIX", "interaction")    # TODO: or set ENV VAR: NAMD_ENERGY_OUT_PREFIX
@@ -150,8 +151,8 @@ COMMENT_TOKEN = "#"
 QUEUE_FRAME_COUNT = 1000 if USE_GPU else 200       # Max allowed pending frames in queue. Frame Reading will stop if queue is full
 
 RAM_DISK_PATH = "/tmp/namd_energy.openmm"          # ram disk path to use
-RAM_LOADING_ENABLED: bool = True     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
-RAM_READER_COUNT = 1                  # TEST Concurrent readers for RAM chunks
+RAM_LOADING_ENABLED: bool = False     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
+RAM_READER_COUNT = 1                  # TODO TEST Concurrent readers for RAM chunks
 
 # Chunking to RAM (requires catdcd))
 RAM_CHUNK_MODE: bool = True           # Loads big DCD files to RAM_DISK in chunks
@@ -234,6 +235,7 @@ import gc
 import time
 import queue
 import math
+import re
 import uuid
 import shutil
 import signal
@@ -245,7 +247,7 @@ import numpy as np
 import MDAnalysis as mda
 import openmm as mm
 from openmm import app, unit
-
+from MDAnalysis.lib.distances import capped_distance
 
 # Logging ------------------------------
 def log_info(msg): print(f"\033[92m[INFO]\033[0m {msg}")
@@ -276,6 +278,79 @@ def boolify(value: str, default_val: bool = False, err_msg: str = "") -> bool:
 
 def get_cur_datetime_formatted() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# =======================================================
+# FAST DYNAMIC SELECTOR (C-Level Distance Engine)
+# =======================================================
+class FastDynamicSelector:
+    def __init__(self, selection_string: str, universe: mda.Universe):
+        self.selection_string = selection_string
+        self.universe = universe
+
+        # Parse the string: optional base sel + and/or + optional not + around + dist + ref sel
+        pattern = re.compile(r"^(?:(.*?)\s+(?:and|or)\s+)?(not\s+)?around\s+([0-9.]+)\s+(.*)$", re.IGNORECASE)
+        match = pattern.match(selection_string.strip())
+
+        if not match:
+            raise ValueError(
+                f"Could not parse dynamic selection: '{selection_string}'. Expected format: '<base_sel> and [not] around <distance> <ref_sel>'")
+
+        base_str, not_str, dist_str, ref_str = match.groups()
+
+        self.base_sel_str = base_str.strip() if base_str else "all"
+        self.invert = bool(not_str and "not" in not_str.lower())
+        self.cutoff = float(dist_str)
+        self.ref_sel_str = ref_str.strip()
+
+        if not self.ref_sel_str:
+            raise ValueError("Reference selection missing in 'around' clause.")
+
+        log_debug(
+            f"FastDynamicSelector parsed: Base='{self.base_sel_str}', Invert={self.invert}, Cutoff={self.cutoff}A, Ref='{self.ref_sel_str}'")
+
+        # Extract permanent indices at frame 0
+        base_ag = self.universe.select_atoms(self.base_sel_str)
+        ref_ag = self.universe.select_atoms(self.ref_sel_str)
+
+        self.base_indices = base_ag.indices.copy()
+        self.ref_indices = ref_ag.indices.copy()
+
+        if len(self.base_indices) == 0: log_warn(f"Base selection '{self.base_sel_str}' yielded 0 atoms at frame 0.")
+        if len(self.ref_indices) == 0: log_warn(f"Reference selection '{self.ref_sel_str}' yielded 0 atoms at frame 0.")
+
+    def eval(self, u: mda.Universe, is_periodic: bool) -> np.ndarray:
+        if len(self.base_indices) == 0 or len(self.ref_indices) == 0:
+            return np.array([], dtype=int) if not self.invert else self.base_indices
+
+        # OPTIMIZATION 1: Bypass high-level MDA properties, fetch raw coordinates instantly
+        coords = u.trajectory.ts.positions
+        box = u.trajectory.ts.dimensions if is_periodic else None
+
+        pos_base = coords[self.base_indices]
+        pos_ref = coords[self.ref_indices]
+
+        # OPTIMIZATION 2: The Size-Swapping Heuristic
+        # capped_distance builds the spatial grid on the FIRST argument.
+        # We MUST swap them dynamically so the smaller group is always the reference grid.
+        if len(pos_base) > len(pos_ref):
+            pairs = capped_distance(pos_ref, pos_base, self.cutoff, box=box, return_distances=False)
+            target_col = 1  # We want the indices of pos_base, which is now the second argument
+        else:
+            pairs = capped_distance(pos_base, pos_ref, self.cutoff, box=box, return_distances=False)
+            target_col = 0  # We want the indices of pos_base, which is the first argument
+
+        if len(pairs) > 0:
+            unique_base_idx = np.unique(pairs[:, target_col])
+            selected_actual_idx = self.base_indices[unique_base_idx]
+        else:
+            selected_actual_idx = np.array([], dtype=int)
+
+        if self.invert:
+            selected_actual_idx = np.setdiff1d(self.base_indices, selected_actual_idx)
+
+        return selected_actual_idx
+
 
 
 # =======================================================
@@ -363,6 +438,9 @@ class IndexStreamBuffer:
         self._check_closed()
         if index < 0:
             raise ValueError(f"{self.__class__.TAG}: Index must be greater than or equal to 0, given: {index}")
+
+        if DEBUG and index in self._data:
+            log_warn(f"{self.__class__.TAG}: INDEX {index} already present !!!")
 
         self._data[index] = value
         self._consider_flush()
@@ -548,8 +626,6 @@ else:
     UPDATE_SELECTION2: bool = False
     OUT_FORCE = False
 
-IS_DYNAMIC: bool = UPDATE_SELECTION1 or (not is_self_interaction and UPDATE_SELECTION2)
-
 if SWITCHDIST >= CUTOFF:
     log_error(
         f"Switching distance must be less than CUTOFF. Given Cutoff: {CUTOFF} Å, Switch dist: {SWITCHDIST} Å. Disabling switching")
@@ -627,23 +703,68 @@ nb_base = [f for f in base_system.getForces() if isinstance(f, mm.NonbondedForce
 
 # --- Coordinate Injection for Static Initialization ---
 u_init = mda.Universe(PSF_FILE, DCD_FILES[0])
-u_init.trajectory[0]  # initialize first frame
+u_init_ts = u_init.trajectory[0]  # initialize first frame
+
+## coordinates and box of first frame
+# u_init_coords = u_init.atoms.positions
+# u_init_dimensions = u_init_ts.dimensions if PERIODIC else None
 total_atom_count = u_init.atoms.n_atoms
 n_covalent_bonds = len(u_init.bonds)  # True covalent bonds from PSF
 
-sel1_init = u_init.select_atoms(SELECTION1)
-static_sel1_idx_set: set = set(sel1_init.indices.tolist())
+if (UPDATE_SELECTION1 or UPDATE_SELECTION2) and not FAST_DYNAMIC_SELECTION:
+    log_warn(
+        "FAST_DYNAMIC_SELECTION is OFF. Falling back to native MDAnalysis 'updating=True'. This may be slow!")
+
+FAST_SEL1_OBJ = None
+FAST_SEL2_OBJ = None
+
+# Precheck & Instantiate FastDynamicSelector
+if UPDATE_SELECTION1:
+    if "around" not in SELECTION1.lower():
+        log_warn(
+            f"SELECTION1 ('{SELECTION1}') does not contain 'around' or 'not around'. Turning OFF UPDATE_SELECTION1.")
+        UPDATE_SELECTION1 = False
+    elif FAST_DYNAMIC_SELECTION:
+        try:
+            FAST_SEL1_OBJ = FastDynamicSelector(SELECTION1, u_init)
+        except ValueError as e:
+            log_error(str(e))
+
+if not is_self_interaction and UPDATE_SELECTION2:
+    if "around" not in SELECTION2.lower():
+        log_warn(
+            f"SELECTION2 ('{SELECTION2}') does not contain 'around' or 'not around'. Turning OFF UPDATE_SELECTION2.")
+        UPDATE_SELECTION2 = False
+    elif FAST_DYNAMIC_SELECTION:
+        try:
+            FAST_SEL2_OBJ = FastDynamicSelector(SELECTION2, u_init)
+        except ValueError as e:
+            log_error(str(e))
+
+# Must reset this flag now
+IS_DYNAMIC = UPDATE_SELECTION1 or (not is_self_interaction and UPDATE_SELECTION2)
+
+# Frame 0 Initial Sets
+if FAST_DYNAMIC_SELECTION and UPDATE_SELECTION1:
+    static_sel1_idx_set = set(FAST_SEL1_OBJ.eval(u_init, PERIODIC).tolist())
+else:
+    sel1_init = u_init.select_atoms(SELECTION1)
+    static_sel1_idx_set = set(sel1_init.indices.tolist())
 
 if not UPDATE_SELECTION1 and len(static_sel1_idx_set) == 0:
     log_error(f"UPDATE_SELECTION1 is False, but SELECTION1 yielded 0 atoms at frame 0.")
 
 if not is_self_interaction:
-    sel2_init = u_init.select_atoms(SELECTION2)
-    static_sel2_idx_set: set = set(sel2_init.indices.tolist()) - static_sel1_idx_set
+    if FAST_DYNAMIC_SELECTION and UPDATE_SELECTION2:
+        static_sel2_idx_set = set(FAST_SEL2_OBJ.eval(u_init, PERIODIC).tolist()) - static_sel1_idx_set
+    else:
+        sel2_init = u_init.select_atoms(SELECTION2)
+        static_sel2_idx_set = set(sel2_init.indices.tolist()) - static_sel1_idx_set
+
     if not UPDATE_SELECTION2 and len(static_sel2_idx_set) == 0:
         log_error(f"UPDATE_SELECTION2 is False, but SELECTION2 yielded 0 valid atoms at frame 0.")
 else:
-    static_sel2_idx_set: set = static_sel1_idx_set
+    static_sel2_idx_set = static_sel1_idx_set
 
 print("\n------------------------------------------------------")
 print(" SYSTEM INFORMATION ")
@@ -1090,6 +1211,8 @@ del params
 
 u_init.trajectory.close()
 del u_init
+del u_init_ts
+# del u_init_coords; del u_init_dimensions
 gc.collect()  # force python gc
 
 log_info("Creating OpenMM Context...")
@@ -1116,8 +1239,11 @@ def parallel_reader_worker(q_main, psf, dcd, start, stop, global_offset, step):
     u, sel1, sel2 = None, None, None
     try:
         u = mda.Universe(psf, dcd)
-        sel1 = u.select_atoms(SELECTION1, updating=UPDATE_SELECTION1)
-        sel2 = sel1 if is_self_interaction else u.select_atoms(SELECTION2, updating=UPDATE_SELECTION2)
+        # Only fallback to native MDA if our Fast Engine is disabled
+        if not FAST_DYNAMIC_SELECTION or not UPDATE_SELECTION1:
+            sel1 = u.select_atoms(SELECTION1, updating=UPDATE_SELECTION1)
+        if not is_self_interaction and (not FAST_DYNAMIC_SELECTION or not UPDATE_SELECTION2):
+            sel2 = sel1 if is_self_interaction else u.select_atoms(SELECTION2, updating=UPDATE_SELECTION2)
 
         # TODO TEST : benchmark frame load times
         t_start = time.perf_counter()
@@ -1129,15 +1255,29 @@ def parallel_reader_worker(q_main, psf, dcd, start, stop, global_offset, step):
             ts = u.trajectory[i]
             abs_f = global_offset + ts.frame
 
-            coords = u.atoms.positions / 10.0
-            box = ts.triclinic_dimensions / 10.0 if PERIODIC else None
+            # -------------------------------------------------
+            # Execute High-Speed Distance Engine
+            if FAST_DYNAMIC_SELECTION and UPDATE_SELECTION1:
+                arr1 = FAST_SEL1_OBJ.eval(u, PERIODIC)
+            else:
+                arr1 = sel1.indices.copy()      # MDAnalysis updates it automatically when accessing indices
 
-            arr1 = sel1.indices.copy()
-            arr2 = None if is_self_interaction else sel2.indices.copy()
+            if not is_self_interaction:
+                if FAST_DYNAMIC_SELECTION and UPDATE_SELECTION2:
+                    arr2 = FAST_SEL2_OBJ.eval(u, PERIODIC)
+                else:
+                    arr2 = sel2.indices.copy()  # MDAnalysis updates it automatically when accessing indices
+            else:
+                arr2 = None
+
+            # ------------------------------------------------------
+            # Create data for OpenMM
+            coords_nm = u.atoms.positions / 10.0  # convert to nm for OpenMM
+            box_nm = ts.triclinic_dimensions / 10.0 if PERIODIC else None  # convert to nm for OpenMM
 
             while not SHUTDOWN_REQUESTED:
                 try:
-                    q_main.put((abs_f, coords, box, arr1, arr2), timeout=1.0)
+                    q_main.put((abs_f, coords_nm, box_nm, arr1, arr2), timeout=1.0)
                     break
                 except queue.Full:
                     continue
@@ -1211,11 +1351,11 @@ def catdcd_chunk_loader(dcd_file, total_frames, chunk_frames, q_chunks):
     q_chunks.put(None)
 
 
-def disk_stream(q_main, dcd_file, total_frames, global_frame_offset):
+def disk_stream_blocking(q_main, dcd_file, total_frames, global_frame_offset):
     parallel_reader_worker(q_main, PSF_FILE, dcd_file, 0, total_frames, global_frame_offset, FRAME_STEP)
 
 
-def start_ramdisk_read(q_main, temp_dcd, num_frames, global_frame_offset):
+def ramdisk_read_blocking(q_main, temp_dcd, num_frames, global_frame_offset):
     threads = []
     c_size = math.ceil(num_frames / actual_ram_reader_threads)
     for i in range(actual_ram_reader_threads):
@@ -1253,7 +1393,7 @@ def master_producer(q_main):
             # Logic for determining Loader Strategy
             if not RAM_LOADING_ENABLED:
                 log_info(f"RAM Loading Disabled. Streaming {base_name} from Disk...")
-                disk_stream(q_main, dcd_file, total_frames, global_frame_offset)
+                disk_stream_blocking(q_main, dcd_file, total_frames, global_frame_offset)
                 global_frame_offset += total_frames
                 continue
 
@@ -1273,12 +1413,12 @@ def master_producer(q_main):
                     t_ram_load_total += (time.perf_counter() - t0)
 
                     register_ram_file(temp_dcd)
-                    start_ramdisk_read(q_main, temp_dcd, total_frames, global_frame_offset)
+                    ramdisk_read_blocking(q_main, temp_dcd, total_frames, global_frame_offset)
                     unregister_ram_file(temp_dcd)
                 elif not RAM_CHUNK_MODE:
                     log_warn(
                         f"Insufficient RAM for direct copy of {os.path.basename(dcd_file)}. Falling back to disk streaming.")
-                    disk_stream(q_main, dcd_file, total_frames, global_frame_offset)
+                    disk_stream_blocking(q_main, dcd_file, total_frames, global_frame_offset)
 
                 global_frame_offset += total_frames
                 continue
@@ -1291,7 +1431,7 @@ def master_producer(q_main):
                 if not RAM_CHUNK_DYNAMIC:
                     log_warn(
                         f"Insufficient RAM and Dynamic Chunking is disabled. Falling back to Disk Streaming for {os.path.basename(dcd_file)}.")
-                    disk_stream(q_main, dcd_file, total_frames, global_frame_offset)
+                    disk_stream_blocking(q_main, dcd_file, total_frames, global_frame_offset)
                     global_frame_offset += total_frames
                     continue
 
@@ -1302,7 +1442,7 @@ def master_producer(q_main):
                 if resized_frames < RAM_CHUNK_MIN_FRAMES:
                     log_warn(f"Dynamic chunk size ({resized_frames}) below MIN_CHUNK_FRAMES ({RAM_CHUNK_MIN_FRAMES}).")
                     log_warn(f"Falling back to Disk Streaming for {os.path.basename(dcd_file)}.")
-                    disk_stream(q_main, dcd_file, total_frames, global_frame_offset)
+                    disk_stream_blocking(q_main, dcd_file, total_frames, global_frame_offset)
                     global_frame_offset += total_frames
                     continue
 
@@ -1315,12 +1455,14 @@ def master_producer(q_main):
                                                 args=(dcd_file, total_frames, active_chunk_frames, q_chunks))
             chunk_mgr_thread.start()
 
+            chunk_frame_offset = 0
             while not SHUTDOWN_REQUESTED:
                 chunk_data = q_chunks.get()
                 if chunk_data is None: break
                 temp_dcd, n_frames = chunk_data
 
-                start_ramdisk_read(q_main, temp_dcd, n_frames, global_frame_offset)
+                ramdisk_read_blocking(q_main, temp_dcd, n_frames, global_frame_offset + chunk_frame_offset)
+                chunk_frame_offset += n_frames
                 unregister_ram_file(temp_dcd)
 
             chunk_mgr_thread.join()
