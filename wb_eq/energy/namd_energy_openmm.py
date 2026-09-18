@@ -241,13 +241,14 @@ import shutil
 import signal
 import atexit
 import threading
+import traceback
 from itertools import chain
 import subprocess
 import numpy as np
 import MDAnalysis as mda
 import openmm as mm
 from openmm import app, unit
-from MDAnalysis.lib.distances import capped_distance
+from scipy.spatial import cKDTree
 
 # Logging ------------------------------
 def log_info(msg): print(f"\033[92m[INFO]\033[0m {msg}")
@@ -284,9 +285,11 @@ def get_cur_datetime_formatted() -> str:
 # FAST DYNAMIC SELECTOR (C-Level Distance Engine)
 # =======================================================
 class FastDynamicSelector:
+
     def __init__(self, selection_string: str, universe: mda.Universe):
         self.selection_string = selection_string
         self.universe = universe
+        self._triclinic_warned = False
 
         # Parse the string: optional base sel + and/or + optional not + around + dist + ref sel
         pattern = re.compile(r"^(?:(.*?)\s+(?:and|or)\s+)?(not\s+)?around\s+([0-9.]+)\s+(.*)$", re.IGNORECASE)
@@ -323,28 +326,59 @@ class FastDynamicSelector:
         if len(self.base_indices) == 0 or len(self.ref_indices) == 0:
             return np.array([], dtype=int) if not self.invert else self.base_indices
 
-        # OPTIMIZATION 1: Bypass high-level MDA properties, fetch raw coordinates instantly
+        # Fetch raw C-level coordinates instantly
         coords = u.trajectory.ts.positions
         box = u.trajectory.ts.dimensions if is_periodic else None
 
         pos_base = coords[self.base_indices]
         pos_ref = coords[self.ref_indices]
 
-        # OPTIMIZATION 2: The Size-Swapping Heuristic
-        # capped_distance builds the spatial grid on the FIRST argument.
-        # We MUST swap them dynamically so the smaller group is always the reference grid.
-        if len(pos_base) > len(pos_ref):
-            pairs = capped_distance(pos_ref, pos_base, self.cutoff, box=box, return_distances=False)
-            target_col = 1  # We want the indices of pos_base, which is now the second argument
-        else:
-            pairs = capped_distance(pos_base, pos_ref, self.cutoff, box=box, return_distances=False)
-            target_col = 0  # We want the indices of pos_base, which is the first argument
+        use_scipy = True
+        boxsize = None
+        if box is not None:
+            # SciPy cKDTree only supports orthogonal periodic boxes (angles == 90)
+            if np.allclose(box[3:], 90.0):
+                boxsize = box[:3]
+            else:
+                use_scipy = False
+                if not self._triclinic_warned:
+                    log_warn(
+                        "Triclinic box detected! SciPy cKDTree requires orthogonal boxes. Falling back to MDAnalysis capped_distance (Slower).")
+                    self._triclinic_warned = True
 
-        if len(pairs) > 0:
-            unique_base_idx = np.unique(pairs[:, target_col])
-            selected_actual_idx = self.base_indices[unique_base_idx]
+        if use_scipy:
+            # SciPy strictly requires coordinates to be inside the [0, boxsize) domain.
+            # We must wrap them using modulo arithmetic.
+            if boxsize is not None:
+                pos_ref = pos_ref % boxsize
+                pos_base = pos_base % boxsize
+
+                # IEEE 754 Float Quirk: Modulo can occasionally yield a value exactly equal to boxsize.
+                # In periodic bounds, boxsize is physically identical to 0.0, so we snap it back.
+                pos_ref[pos_ref >= boxsize] = 0.0
+                pos_base[pos_base >= boxsize] = 0.0
+
+            # 1. Build C++ spatial grid on the reference (Protein)
+            tree = cKDTree(pos_ref, boxsize=boxsize)
+
+            # 2. Query with base (Water).
+            # k=1 (only find the single nearest atom).
+            # distance_upper_bound early-exits math if further than cutoff.
+            # workers=-1 automatically multithreads across all CPU cores.
+            dists, _ = tree.query(pos_base, k=1, distance_upper_bound=self.cutoff, workers=-1)
+
+            # 3. Create boolean mask (values > cutoff are returned as 'inf' by SciPy)
+            valid_mask = dists <= self.cutoff
+            selected_actual_idx = self.base_indices[valid_mask]
         else:
-            selected_actual_idx = np.array([], dtype=int)
+            # Fallback for Triclinic/Non-Orthogonal boxes
+            from MDAnalysis.lib.distances import capped_distance
+            pairs = capped_distance(pos_base, pos_ref, self.cutoff, box=box, return_distances=False)
+            if len(pairs) > 0:
+                unique_base_idx = np.unique(pairs[:, 0])
+                selected_actual_idx = self.base_indices[unique_base_idx]
+            else:
+                selected_actual_idx = np.array([], dtype=int)
 
         if self.invert:
             selected_actual_idx = np.setdiff1d(self.base_indices, selected_actual_idx)
@@ -1372,6 +1406,7 @@ def ramdisk_read_blocking(q_main, temp_dcd, num_frames, global_frame_offset):
 
 def master_producer(q_main):
     global t_ram_load_total
+    global SHUTDOWN_REQUESTED
 
     try:
         global_frame_offset = 0
@@ -1469,6 +1504,8 @@ def master_producer(q_main):
             global_frame_offset += total_frames
 
     except Exception as e:
+        SHUTDOWN_REQUESTED = True
+        traceback.print_exc()
         log_error(f"Producer thread crashed: {e}")
     finally:
         while not SHUTDOWN_REQUESTED:
