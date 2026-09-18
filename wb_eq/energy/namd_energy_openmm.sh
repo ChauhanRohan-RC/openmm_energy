@@ -9,7 +9,7 @@
 #set -e
 
 run_openmm() {
-	./namd_energy_openmm.py
+	python3 namd_energy_openmm.py
 }
 
 run_openmm_static() {
@@ -27,7 +27,7 @@ export selection_water_hydration="water and around 4.25 protein"
 export selection_water_bulk="water and not around 5.0 protein"
 
 # TEST
-OUT_FILE_SUFFIX="2"
+OUT_FILE_SUFFIX="3"
 
 
 # Run 1: Protein Self

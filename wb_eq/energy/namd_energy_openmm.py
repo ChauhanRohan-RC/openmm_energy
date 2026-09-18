@@ -14,7 +14,7 @@
 # ------------------------------------------------------------------------
 
 """
-TODO TEST:
+TODO TEST: (seach for TEST)
 0. UPDATE_SELECTION is very slow in MDAnalysis
 1. if RAM_READER_COUNT > 1, very high bottleneck (thread contention), especially with UPDATE_SELECTION
 """
@@ -22,7 +22,7 @@ TODO TEST:
 ## USAGE --------------------------------------------------
 # 0: First run normal simulation to obtain .dcd trajectories
 # 1. Copy script to working dir
-# 2. INPUT: Set input strcuture (.psf) and trajectories (.dcd)
+# 2. INPUT: Set input structure (.psf) and trajectories (.dcd)
 # 3. INPUT: Set selection 1, Selection 2 (Optional), out_energies (Optional), out_file_prefix
 #----------------------------------------------------------------------------
 # -> ALTERNATIVELY, SET ENVIRONMENT VARIABLES (used when variables are not set in script)
@@ -147,7 +147,7 @@ COMMENT_TOKEN = "#"
 # ==============================================
 # FRAME LOADING and PERFORMANCE
 # ==============================================
-QUEUE_BUFFER_SIZE = 2000 if USE_GPU else 200     # Max allowed pending frames in queue. Frame Reading will stop if queue is full
+QUEUE_BUFFER_SIZE = 1000 if USE_GPU else 200       # Max allowed pending frames in queue. Frame Reading will stop if queue is full
 
 RAM_DISK_PATH = "/tmp/namd_energy.openmm"          # ram disk path to use
 RAM_LOADING_ENABLED: bool = False     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
@@ -173,13 +173,17 @@ OPENMM_CPU_THREADS = 0          # Compute threads for OpenMM (applies only if ru
 # Other Flags
 # -----------------------------------
 DEBUG: bool = True
-PROGRESS_REPORT_INTERVAL_FRAMES: int = 1000      # num frames
-
-MANUAL_GC_ENABLED: bool = True
-MANUAL_GC_INTERVAL_FRAMES: int = 5000            # num frames
+PROGRESS_REPORT_INTERVAL_FRAMES: int = 100      # TEST num frames
 
 INDEX_STREAM_BUFFER_CHUNK_SIZE: int = 5000       # num of frames to hold the computed energy data in RAM
 INDEX_STREAM_BUFFER_ALWAYS_OPEN: bool = True     # keep output file open
+
+# Optimize Memory: Force masking for large interaction pair count to avoid OOM crashes
+MAX_INTERACTION_PAIRS_IN_RAM = 250_000_000      # consumes 4-8 bytes per interaction pair
+INTERACTION_PAIR_MEMORY_MB = 8.0 / (1024 ** 2)  # memory (MiB) per interaction pair
+
+MANUAL_GC_ENABLED: bool = True
+MANUAL_GC_INTERVAL_FRAMES: int = 5000            # num frames
 
 ## Experimental Features -----------
 ## experimental flag to tun off erfc(ewald_beta * r) factor in short range direct electrostatics
@@ -430,9 +434,11 @@ class IndexStreamBuffer:
                     self._out_fd.close()
                 except Exception as e:
                     print(f"{self.__class__.TAG}: WARNING Could not close output file: {self.out_file_path}", e)
-# -------------------------------------------------------------------
 
-# Global State ------------------
+
+# ------------------------------------------------------------------------
+# GLOBAL VARIABLES
+# ------------------------------------------------------------------------
 SHUTDOWN_REQUESTED = False
 ACTIVE_RAM_FILES = set()
 RAM_FILES_LOCK = threading.Lock()
@@ -445,9 +451,9 @@ t_ram_load_total = 0.0
 t_compute_total = 0.0
 t_io_wait_total = 0.0
 
-# -------------------------------------------------
+# --------------------------------------------------------------------
 # Cleanup Handlers
-# -------------------------------------------------
+# --------------------------------------------------------------------
 def register_ram_file(filepath):
     with RAM_FILES_LOCK: ACTIVE_RAM_FILES.add(filepath)
 
@@ -498,9 +504,12 @@ def handle_exit():
 
 def handle_os_signal(signum, frame):
     global SHUTDOWN_REQUESTED
-    sig_name = signal.Signals(signum).name
-    log_warn(f"\nReceived OS Signal: {sig_name}. Initiating clean shutdown...")
     SHUTDOWN_REQUESTED = True
+
+    sig_name = signal.Signals(signum).name
+    print("")
+    log_warn(f"Received OS Signal: {sig_name}. Initiating clean shutdown...")
+
 
 
 atexit.register(handle_exit)
@@ -512,7 +521,7 @@ except AttributeError:
     pass
 
 # =============================================================================
-# 1. VALIDATION AND PRECONDITIONS
+# VALIDATION AND PRECONDITIONS
 # =============================================================================
 print("\n" + "=" * 50)
 log_info(f"Starting Pair Interaction Analysis ({LABEL})")
@@ -553,7 +562,6 @@ if FRAME_SKIP < 0:
     FRAME_SKIP = 0
 FRAME_STEP = FRAME_SKIP + 1
 
-
 if RAM_LOADING_ENABLED:
     # make sure ram disk exists
     try:
@@ -591,6 +599,7 @@ final_erg_components: list[str] = [e for e in ["vdw", "elec", "bond", "angl", "d
 if len(final_erg_components) == 0:
     log_error(f"No supported energies requested")
 
+
 # =============================================================================
 # OPENMM SYSTEM INITIALIZATION
 # =============================================================================
@@ -621,36 +630,44 @@ total_atom_count = u_init.atoms.n_atoms
 n_covalent_bonds = len(u_init.bonds)  # True covalent bonds from PSF
 
 sel1_init = u_init.select_atoms(SELECTION1)
-static_sel1_idx = set(sel1_init.indices.tolist())
+static_sel1_idx_set: set = set(sel1_init.indices.tolist())
 
-if not UPDATE_SELECTION1 and len(static_sel1_idx) == 0:
+if not UPDATE_SELECTION1 and len(static_sel1_idx_set) == 0:
     log_error(f"UPDATE_SELECTION1 is False, but SELECTION1 yielded 0 atoms at frame 0.")
 
 if not is_self_interaction:
     sel2_init = u_init.select_atoms(SELECTION2)
-    static_sel2_idx = set(sel2_init.indices.tolist()) - static_sel1_idx
-    if not UPDATE_SELECTION2 and len(static_sel2_idx) == 0:
+    static_sel2_idx_set: set = set(sel2_init.indices.tolist()) - static_sel1_idx_set
+    if not UPDATE_SELECTION2 and len(static_sel2_idx_set) == 0:
         log_error(f"UPDATE_SELECTION2 is False, but SELECTION2 yielded 0 valid atoms at frame 0.")
 else:
-    static_sel2_idx = static_sel1_idx
+    static_sel2_idx_set: set = static_sel1_idx_set
 
+print("\n------------------------------------------------------")
+print(" SYSTEM INFORMATION ")
 print("------------------------------------------------------")
 log_info(f"TOTAL ATOM COUNT: {total_atom_count}")
-log_info(f"SELECTION-1  : \"{SELECTION1}\" (atom count at frame 0: {len(static_sel1_idx)})")
+log_info(f"SELECTION-1  : \"{SELECTION1}\" (atom count at frame 0: {len(static_sel1_idx_set)})")
 log_info(f"UPDATE SEL-1 : {'ON' if UPDATE_SELECTION1 else 'OFF'}")
 if not is_self_interaction:
-    log_info(f"SELECTION-2  : \"{SELECTION2}\" (atom count at frame 0: {len(static_sel2_idx)})")
+    log_info(f"SELECTION-2  : \"{SELECTION2}\" (atom count at frame 0: {len(static_sel2_idx_set)})")
     log_info(f"UPDATE SEL-2 : {'ON' if UPDATE_SELECTION2 else 'OFF'}")
-print("------------------------------------------------------")
+print("------------------------------------------------------\n")
 
-# --- FEATURE 8: NBFIX Detection and Cloning ---
+
+# ------------------------------------------------------------------------
+# VDW NBFIX Detection and Cloning
+# ------------------------------------------------------------------------
 nbfix_force = None
 for f in base_system.getForces():
     if isinstance(f, mm.CustomNonbondedForce) and "acoef" in f.getEnergyFunction():
         nbfix_force = f
         break
 
-# --- FEATURE 6: NAMD X-PLOR Cutoff & Shifting Algebra ---
+# ------------------------------------------------------------------------
+# VDW and ELECTRIC Force definition
+# ------------------------------------------------------------------------
+# NAMD X-PLOR Cutoff & Shifting Algebra
 if SWITCHDIST > 0 and SWITCHDIST < CUTOFF:
     ron = SWITCHDIST / 10.0
     roff = CUTOFF / 10.0
@@ -679,7 +696,7 @@ else:
     log_info("Standard Lorentz-Berthelot mixing detected.")
     vdw_base = f"(4*epsilon*((sigma/r)^12 - (sigma/r)^6) * {S_vdw}); sigma=0.5*(sigma1+sigma2); epsilon=sqrt(abs(epsilon1*epsilon2))"
 
-# Electrostatic Definition
+# Electrostatic Definition -------------
 is_elec_raw_requested = "elec" in raw_erg_requested
 elec_base_main = f"({138.935456 / DIELECTRIC} * (charge1 * charge2 / r))"
 pme_recip_force = None
@@ -708,27 +725,29 @@ else:
     elec_base = f"({elec_base_main} * {S_elec})"
     log_info(f"Using standard Coulombic Electrostatics with Shift/Switch factor: {S_elec}")
 
-# Optimize Memory: Force masking for Dynamic OR Static Self-Interactions to avoid OOM crashes
-MAX_INTERACTION_PAIRS_IN_RAM = 250_000_000  # consumes 4 bytes per interaction pair
-
+## PARAMETER MASKING -------------------------------
+print("")
 if IS_DYNAMIC:
     USE_MASK = True
 else:
-    n1_count = len(static_sel1_idx)
-    n2_count = len(static_sel2_idx) if not is_self_interaction else n1_count
+    n1_count = len(static_sel1_idx_set)
+    n2_count = len(static_sel2_idx_set) if not is_self_interaction else n1_count
     pair_count = n1_count * n2_count
 
-    if pair_count > MAX_INTERACTION_PAIRS_IN_RAM:
+    USE_MASK = pair_count > MAX_INTERACTION_PAIRS_IN_RAM
+
+    # APPROX memory usage (only for logging)
+    pairs_mb = pair_count * INTERACTION_PAIR_MEMORY_MB
+    max_pairs_mb = MAX_INTERACTION_PAIRS_IN_RAM * INTERACTION_PAIR_MEMORY_MB
+    if USE_MASK:
         log_warn(
-            f"Interaction pairs ({pair_count:,}) exceed memory safety limit of {MAX_INTERACTION_PAIRS_IN_RAM:,} pairs. Falling back to Algebraic Masking. This will be slow but uses very less memory")
-        USE_MASK = True
+            f"INTERACTION PAIR COUNT: {pair_count:,} (~{pairs_mb:.2f} MiB) exceed memory safety limit of {MAX_INTERACTION_PAIRS_IN_RAM:,} pairs (~{max_pairs_mb:.2f} MiB). Falling back to PARAMETER MASKING")
     else:
-        log_info(
-            f"Interaction pairs ({pair_count:,}) fit in memory. Engaging explicit InteractionGroup for max speed, but consumes RAM")
-        USE_MASK = False
+        log_warn(
+            f"INTERACTION PAIR COUNT: {pair_count:,} (~{pairs_mb:.2f} MiB) fit within memory safety limit of {MAX_INTERACTION_PAIRS_IN_RAM:,} pairs (~{max_pairs_mb:.2f} MiB)")
 
 if USE_MASK:
-    log_info("Using Parameter Masking (Dynamic Mode or Large Static Interaction).")
+    log_warn("PARAMETER MASKING ENABLED: Dynamic Mode or Large Static Interaction [SLOW but uses very little memory]")
     mask_expr = "(is_sel11*is_sel12)" if is_self_interaction else "((is_sel11*is_sel22)+(is_sel21*is_sel12))"
 
     vdw_expr = f"mask*{vdw_base}; mask={mask_expr}"
@@ -751,7 +770,7 @@ if USE_MASK:
         vdw_force.addPerParticleParameter("is_sel2")
         elec_force.addPerParticleParameter("is_sel2")
 else:
-    log_info("Masking Disabled. Engaging Static Fast-Path Native Topology.")
+    log_warn("PARAMETER MASKING DISABLED. Using INTERACTION GROUPS [FAST but consumes memory]")
     vdw_force = mm.CustomNonbondedForce(vdw_base)
     elec_force = mm.CustomNonbondedForce(elec_base)
 
@@ -774,9 +793,10 @@ if nbfix_force:
 
 vdw_force.setForceGroup(1)
 elec_force.setForceGroup(2)
+print("")
 
 # ------------------------------------------------------------------------
-# Setting atom parameters
+# Setting ATOM PARAMETERS
 # ------------------------------------------------------------------------
 N_ATOMS = base_system.getNumParticles()
 
@@ -819,8 +839,8 @@ for i in range(N_ATOMS):
             val1, val2 = 0.0, 0.0
         else:
             # Static Selections (self or cross): initializes valid masks permanently right here
-            val1 = 1.0 if i in static_sel1_idx else 0.0
-            val2 = 1.0 if (not is_self_interaction and i in static_sel2_idx) else 0.0
+            val1 = 1.0 if i in static_sel1_idx_set else 0.0
+            val2 = 1.0 if (not is_self_interaction and i in static_sel2_idx_set) else 0.0
 
         if is_self_interaction:
             vdw_force.addParticle((*vdw_params, val1))
@@ -837,28 +857,50 @@ for i in range(N_ATOMS):
         if IS_DYNAMIC:
             # Initialize with frame 0 combined mask for A+B state
             if is_self_interaction:
-                q_pme = c_val if i in static_sel1_idx else 0.0
+                q_pme = c_val if i in static_sel1_idx_set else 0.0
             else:
-                q_pme = c_val if (i in static_sel1_idx or i in static_sel2_idx) else 0.0
+                q_pme = c_val if (i in static_sel1_idx_set or i in static_sel2_idx_set) else 0.0
 
             # Failsafe: Prevent compiler from stripping Coulomb kernel if Frame 0 selection is completely empty
             if q_pme == 0.0 and i == 0: q_pme = 1e-10
             pme_recip_force.addParticle(q_pme, 1.0, 0.0)
         else:
             if is_self_interaction:
-                q_pme = c_val if i in static_sel1_idx else 0.0
+                q_pme = c_val if i in static_sel1_idx_set else 0.0
 
                 # Failsafe: Prevent compiler from stripping Coulomb kernel if Frame 0 selection is completely empty
                 if q_pme == 0.0 and i == 0: q_pme = 1e-10
                 pme_recip_force.addParticle(q_pme, 1.0, 0.0)
             else:
                 pme_recip_force.addParticle(0.0, 1.0, 0.0)
-                if i in static_sel1_idx:
+                if i in static_sel1_idx_set:
                     pme_recip_force.addParticleParameterOffset("lambda_1", i, c_val, 0.0, 0.0)
-                elif i in static_sel2_idx:
+                elif i in static_sel2_idx_set:
                     pme_recip_force.addParticleParameterOffset("lambda_2", i, c_val, 0.0, 0.0)
 
-# --- FEATURE 7: Exclusions & PME Exception Re-injection ---
+
+# ------------------------------------------------------------------------
+# Adding VDW and ELECTRIC forces to pair system
+# ------------------------------------------------------------------------
+if not USE_MASK:
+    # Bipartite Small Static Interactions use InteractionGroups safely to drop water-water math natively
+    vdw_force.addInteractionGroup(static_sel1_idx_set, static_sel2_idx_set)
+    elec_force.addInteractionGroup(static_sel1_idx_set, static_sel2_idx_set)
+
+nb_method = mm.CustomNonbondedForce.CutoffPeriodic if PERIODIC else mm.CustomNonbondedForce.CutoffNonPeriodic
+for custom_f in [vdw_force, elec_force]:
+    custom_f.setNonbondedMethod(nb_method)
+    custom_f.setCutoffDistance((CUTOFF / 10.0) * unit.nanometers)
+    # CRITICAL: Disable OpenMM native C5 switch because we injected NAMD X-PLOR explicitly
+    custom_f.setUseSwitchingFunction(False)
+
+pair_system.addForce(vdw_force)
+pair_system.addForce(elec_force)
+
+
+# -----------------------------------------------------------------------
+# Exclusions & PME Exception Re-injection
+# -----------------------------------------------------------------------
 vdw_14_force = mm.CustomBondForce(f"4*epsilon*((sigma/r)^12 - (sigma/r)^6)")
 vdw_14_force.addPerBondParameter("sigma")
 vdw_14_force.addPerBondParameter("epsilon")
@@ -887,7 +929,7 @@ for i in range(nb_base.getNumExceptions()):
     if PERIODIC and PME_ENABLED:
         pme_recip_force.addException(p1, p2, 0.0, 1.0, 0.0)
 
-    if is_self_interaction and {p1, p2}.issubset(static_sel1_idx):
+    if is_self_interaction and {p1, p2}.issubset(static_sel1_idx_set):
         q_val = q.value_in_unit(unit.elementary_charge ** 2)
         s_val = s.value_in_unit(unit.nanometers)
         e_val = e.value_in_unit(unit.kilojoules_per_mole)
@@ -912,25 +954,10 @@ if PERIODIC and PME_ENABLED:
     pair_system.addForce(pme_recip_force)
 log_info(f"Re-injected Exceptions: VDW={vdw_14_count}, ELEC(PME Corrections)={elec_ex_count}")
 
-if not USE_MASK:
-    # Bipartite Small Static Interactions use InteractionGroups safely to drop water-water math natively
-    log_warn("Using interaction groups without masking. Extremely fast but many consume RAM")
-    vdw_force.addInteractionGroup(static_sel1_idx, static_sel2_idx)
-    elec_force.addInteractionGroup(static_sel1_idx, static_sel2_idx)
-else:
-    log_info("Bypassing interaction group allocation, and using Masking. This will be slow but uses very little RAM")
 
-nb_method = mm.CustomNonbondedForce.CutoffPeriodic if PERIODIC else mm.CustomNonbondedForce.CutoffNonPeriodic
-for custom_f in [vdw_force, elec_force]:
-    custom_f.setNonbondedMethod(nb_method)
-    custom_f.setCutoffDistance((CUTOFF / 10.0) * unit.nanometers)
-    # CRITICAL: Disable OpenMM native C5 switch because we injected NAMD X-PLOR explicitly
-    custom_f.setUseSwitchingFunction(False)
-
-pair_system.addForce(vdw_force)
-pair_system.addForce(elec_force)
-
-# --- FEATURE 5: Dynamic Bonded Force Dispatcher ---
+# ------------------------------------------------------------------------
+# BONDED FORCE Detection
+# ------------------------------------------------------------------------
 if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl", "dihe", "impr", "cmap"]):
     log_info("Dynamically dispatching bonded forces from Topology...")
 
@@ -946,7 +973,7 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
                 added = 0
                 for i in range(f.getNumBonds()):
                     p1, p2, l, k = f.getBondParameters(i)
-                    if {p1, p2}.issubset(static_sel1_idx):
+                    if {p1, p2}.issubset(static_sel1_idx_set):
                         new_f.addBond(p1, p2, l, k)
                         added += 1
                 if added > 0:
@@ -959,7 +986,7 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
                 added = 0
                 for i in range(f.getNumBonds()):
                     p1, p2, l, k = f.getBondParameters(i)
-                    if {p1, p2}.issubset(static_sel1_idx):
+                    if {p1, p2}.issubset(static_sel1_idx_set):
                         new_f.addBond(p1, p2, l, k)
                         added += 1
                 if added > 0:
@@ -972,7 +999,7 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
             added = 0
             for i in range(f.getNumAngles()):
                 p1, p2, p3, th, k = f.getAngleParameters(i)
-                if {p1, p2, p3}.issubset(static_sel1_idx):
+                if {p1, p2, p3}.issubset(static_sel1_idx_set):
                     new_f.addAngle(p1, p2, p3, th, k)
                     added += 1
             if added > 0:
@@ -985,7 +1012,7 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
             added = 0
             for i in range(f.getNumTorsions()):
                 p1, p2, p3, p4, per, ph, k = f.getTorsionParameters(i)
-                if {p1, p2, p3, p4}.issubset(static_sel1_idx):
+                if {p1, p2, p3, p4}.issubset(static_sel1_idx_set):
                     new_f.addTorsion(p1, p2, p3, p4, per, ph, k)
                     added += 1
             if added > 0:
@@ -1002,7 +1029,7 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
             added = 0
             for i in range(f.getNumTorsions()):
                 p1, p2, p3, p4, params = f.getTorsionParameters(i)
-                if {p1, p2, p3, p4}.issubset(static_sel1_idx):
+                if {p1, p2, p3, p4}.issubset(static_sel1_idx_set):
                     new_f.addTorsion(p1, p2, p3, p4, params)
                     added += 1
             if added > 0:
@@ -1018,7 +1045,7 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
             added = 0
             for i in range(f.getNumTorsions()):
                 map_idx, p1, p2, p3, p4, p5, p6, p7, p8 = f.getTorsionParameters(i)
-                if {p1, p2, p3, p4, p5, p6, p7, p8}.issubset(static_sel1_idx):
+                if {p1, p2, p3, p4, p5, p6, p7, p8}.issubset(static_sel1_idx_set):
                     new_f.addTorsion(map_idx, p1, p2, p3, p4, p5, p6, p7, p8)
                     added += 1
             if added > 0:
@@ -1027,6 +1054,10 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
 
     print("")
 
+
+# ------------------------------------------------------------------------
+# HARDWARE INIT
+# ------------------------------------------------------------------------
 # Hardware Initialization (CUDA -> HIP -> OpenCL -> CPU)
 platform = None
 platform_name = "CPU"
@@ -1043,9 +1074,10 @@ if USE_GPU:
     if platform is None:
         log_warn("GPU requested but CUDA, HIP, and OpenCL are unavailable. Falling back to CPU.")
 
-# =============================================================================
+
+# ------------------------------------------------------------------------
 # OPENMM CONTEXT CREATION  (Memory intensive)
-# =============================================================================
+# ------------------------------------------------------------------------
 
 # --- MEMORY OPTIMIZATION: PRE-CONTEXT FLUSH ---
 log_info("Flushing parsed topology databases to free RAM for Context allocation...\n")
@@ -1075,7 +1107,7 @@ active_fetches = [(1 << group_map[c], comp_idx[c]) for c in final_erg_components
 
 
 # =============================================================================
-# 3. BACKGROUND PRODUCER PIPELINE
+# BACKGROUND PRODUCER PIPELINE
 # =============================================================================
 def parallel_reader_worker(q_main, psf, dcd, start, stop, global_offset, step):
     u, sel1, sel2 = None, None, None
@@ -1300,14 +1332,17 @@ def create_comments_str() -> str:
     kbt_in_kcal_per_mol = 1.0 / (0.0019872 * TEMPERATURE) if TEMPERATURE is not None and TEMPERATURE > 0 else None
 
     comments = [
-        f"================ {LABEL} ================",
+        f"Created by Python OpenMM. {get_cur_datetime_formatted()}",
+        f"------------------------------------------------",
+        f"=========   {LABEL}    ========",
+        f"------------------------------------------------",
         f"PARAM File(s): {PARAM_FILES}",
         f"PSF File     : {PSF_FILE}",
         f"DCD File(s)  : {DCD_FILES}",
         f"TOTAL Atom Count: {total_atom_count}",
         "## Selections ---------------",
-        f"SELECTION 1  : \"{SELECTION1}\"  (atom count at frame 0: {len(static_sel1_idx)})",
-        f"SELECTION 2  : \"{SELECTION2}\"  (atom count at frame 0: {len(static_sel2_idx) if not is_self_interaction else 0})",
+        f"SELECTION 1  : \"{SELECTION1}\"  (atom count at frame 0: {len(static_sel1_idx_set)})",
+        f"SELECTION 2  : \"{SELECTION2}\"  (atom count at frame 0: {len(static_sel2_idx_set) if not is_self_interaction else 0})",
         f"Update SEL-1 : {'ON' if UPDATE_SELECTION1 else 'OFF'}",
         f"Update SEL-2 : {'ON' if UPDATE_SELECTION2 else 'OFF'}",
         "## Output -------------------",
@@ -1323,10 +1358,11 @@ def create_comments_str() -> str:
         f"PERIODIC BC : {'ON' if PERIODIC else 'OFF'}",
         f"PME         : {'ON' if PME_ENABLED else 'OFF'} (tolerance factor: {PME_TOLERANCE:.2E})",
         "-----------------------------------------------------------------",
-        "TOTAL_FORCE is the VECTOR SUM of ELECT_FORCE and VDW_FORCE vectors" if TOTAL_FORCE_VECTOR_SUM else "WARNING: TOTAL_FORCE is the magnitude sum of ELECT_FORCE and VDW_FORCE magnitudes 9PHYSICALLY INACCURATE0",
+        "NOTE-1: TOTAL energy is the same as POTENTIAL energy (interaction b/w groups)",
+        "NOTE-2: TOTAL_FORCE is the VECTOR SUM of ELECT_FORCE and VDW_FORCE vectors" if TOTAL_FORCE_VECTOR_SUM else "WARNING: TOTAL_FORCE is the magnitude sum of ELECT_FORCE and VDW_FORCE magnitudes 9PHYSICALLY INACCURATE0",
+        "---------",
         f"Units => ENERGY: 1 kcal/mol     = 6.95e-21 J/molecule {f'= {kbt_in_kcal_per_mol:.2e} KBT' if kbt_in_kcal_per_mol else ''}",
         "       => FORCE : 1 kcal/(mol Å) = 69.5 pN",
-        f"Created by Python OpenMM. {get_cur_datetime_formatted()}",
         "========================================================================="
     ]
 
@@ -1408,9 +1444,9 @@ def create_output_erg_line(erg_row) -> str:
     return OUT_DELIMITER.join(out_row) + "\n"
 
 
-# -----------------------------------------------
+# -----------------------------------------------------------------------------
 # OUTPUT file and IndexStreamBuffer Setup
-# -----------------------------------------------
+# -----------------------------------------------------------------------------
 
 def _on_index_streamer_pre_chunk_write(chunk_index: int) -> str | None:
     # print(f"PRE_CHUNK_WRITE: {chunk_index}")
@@ -1434,7 +1470,7 @@ index_stream_buffer = IndexStreamBuffer(output_file_path=out_file_path,
 
 
 # =============================================================================
-# 4. COMPUTE CONSUMER LOOP
+# COMPUTE CONSUMER LOOP
 # =============================================================================
 frame_queue: queue.Queue = queue.Queue(maxsize=QUEUE_BUFFER_SIZE)
 to_kcal = unit.kilocalorie_per_mole
@@ -1650,7 +1686,7 @@ io_thread.join()
 
 
 # =============================================================================
-# 6. EXECUTION REPORT
+# EXECUTION REPORT
 # =============================================================================
 t_total = time.perf_counter() - t_app_start
 compute_active_time = max(0.0, t_compute_total - t_io_wait_total)
