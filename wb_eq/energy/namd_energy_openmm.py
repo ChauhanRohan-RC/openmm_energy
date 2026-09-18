@@ -288,7 +288,6 @@ class FastDynamicSelector:
 
     def __init__(self, selection_string: str, universe: mda.Universe):
         self.selection_string = selection_string
-        self.universe = universe
         self._triclinic_warned = False
 
         # Parse the string: optional base sel + and/or + optional not + around + dist + ref sel
@@ -313,8 +312,8 @@ class FastDynamicSelector:
             f"FastDynamicSelector parsed: Base='{self.base_sel_str}', Invert={self.invert}, Cutoff={self.cutoff}A, Ref='{self.ref_sel_str}'")
 
         # Extract permanent indices at frame 0
-        base_ag = self.universe.select_atoms(self.base_sel_str)
-        ref_ag = self.universe.select_atoms(self.ref_sel_str)
+        base_ag = universe.select_atoms(self.base_sel_str)
+        ref_ag = universe.select_atoms(self.ref_sel_str)
 
         self.base_indices = base_ag.indices.copy()
         self.ref_indices = ref_ag.indices.copy()
