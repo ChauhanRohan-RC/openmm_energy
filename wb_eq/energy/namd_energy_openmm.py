@@ -9,7 +9,7 @@
 # => STATIC and DYNAMIC selections, self and cross-interactions
 # => PME for long range electrostatics (NAMD pairinteraction does not have this)
 #    Electrostatic energies with PME will be highly negative compared to NAMD pairinteraction
-# => Trajectory Disk Streaming/RAM loading/RAM chunking modes
+# => Trajectory Disk Streaming/RAM loading/RAM chunking modes (chunking requires catdcd)
 # => Smart multithreading allocation
 # ------------------------------------------------------------------------
 
@@ -61,7 +61,7 @@ def find_files(dir_path, prefix, suffix, min_num=None, max_num=None, sort_natura
             if match:
                 num = int(match.group(1))
                 if (min_num is None or num >= min_num) and (max_num is None or num <= max_num):
-                    result_list.append(str(f.resolve()) if return_abs_path else str(f.name))
+                    result_list.append(str(f.resolve()) if return_abs_path else str(f.relative_to(".")))
 
     if sort_natural:
         def natural_sort_key(s): return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
@@ -124,8 +124,8 @@ PME_ENABLED: bool = True        # [ONLY PERIODIC] PME for long-range electrostat
 TIMESTEP_FIRST: int = 0         # only for bookkeeping
 FRAME_FREQ: int = 100           # TODO: timesteps between frames (=dcd_freq). only for bookkeeping
 
-# Skip Frames, faster calculation
-FRAME_SKIP: int = 49            # TODO: frame_step = frame_skip + 1
+# Skip Frames, faster calculation   # TODO: TEST
+FRAME_SKIP: int = 0             # TODO: frame_step = frame_skip + 1
 
 # ==================================
 # OUTPUT Params
@@ -153,7 +153,7 @@ RAM_LOADING_ENABLED: bool = False     # TODO: Loads DCD files to RAM_DISK before
 RAM_DISK_PATH = "/tmp/namd_energy.openmm"          # ram disk path to use
 RAM_READER_COUNT = 2                  # Concurrent readers for RAM chunks
 
-# Chunking to RAM
+# Chunking to RAM (requires catdcd))
 RAM_CHUNK_MODE: bool = True           # Loads big DCD files to RAM_DISK in chunks
 RAM_CHUNK_DYNAMIC: bool = True        # Automatically shrink chunk if RAM is constrained
 RAM_CHUNK_FRAMES: int = 10000         # Max frames per chunk
@@ -172,10 +172,15 @@ OPENMM_CPU_THREADS = 0          # Compute threads for OpenMM (applies only if ru
 # -----------------------------------
 # Other Flags
 # -----------------------------------
-PROGRESS_REPORT_INTERVAL_FRAMES: int = 1000  # num frames
+DEBUG: bool = True
+PROGRESS_REPORT_INTERVAL_FRAMES: int = 100  # num frames  TODO: TEST
 
 MANUAL_GC_ENABLED: bool = True
 MANUAL_GC_INTERVAL_FRAMES: int = 5000   # num frames
+
+# TODO: TEST
+INDEX_STREAM_BUFFER_CHUNK_SIZE: int = 100       # num of frames to hold the computed energy data in RAM
+INDEX_STREAM_BUFFER_ALWAYS_OPEN: bool = True    # keep output file open
 
 ## Experimental Features -----------
 ## experimental flag to tun off erfc(ewald_beta * r) factor in short range direct electrostatics
@@ -246,10 +251,14 @@ def log_info(msg): print(f"\033[92m[INFO]\033[0m {msg}")
 def log_warn(msg): print(f"\033[93m[WARN]\033[0m {msg}")
 
 
+def log_debug(msg):
+    if DEBUG: print(f"\033[93m[DEBUG]\033[0m {msg}")
+
+
 def log_error(msg): print(f"\033[91m[ERROR]\033[0m {msg}"); sys.exit(1)
 
 
-# Helper functions ------------------------------
+# Helper functions and classes ------------------------------
 def boolify(value: str, default_val: bool = False, err_msg: str = "") -> bool:
     value = value.strip().lower()
     truthy = {"1", "true", "t", "yes", "y", "on"}
@@ -264,6 +273,164 @@ def boolify(value: str, default_val: bool = False, err_msg: str = "") -> bool:
 
 def get_cur_datetime_formatted() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# =======================================================
+# IndexStreamBuffer
+# =======================================================
+class IndexStreamBuffer:
+    """
+    A data structure to write the values in order of indices
+    Since energy values can come in any order due to asynchronous namd calls
+
+    -> It stores mappings of index -> value in a dict
+    -> checks if a contiguous block of consecutive indices exists
+    -> dumps the block to file, and free up memory
+    """
+
+    TAG = "IndexStreamBuffer"
+
+    def __init__(self,
+                 output_file_path: str,
+                 chunk_size: int,
+                 keep_file_open: bool = False,
+                 string_converter_callback=None,
+                 pre_chunk_write_callback=None,
+                 post_chunk_write_callback=None):
+
+        """
+        :parameter output_file_path: output file path
+        :parameter chunk_size: a contiguous block of indices to write to output file
+        :parameter string_converter_callback: a function that converts actual data to strings for writing
+        :parameter pre_chunk_write_callback: a function that is called before a chunk is written to output file.
+                   It takes chunk_index as input, and may return a string  to be written before the chunk
+        :parameter post_chunk_write_callback: a function that is called after a chunk is written to output file.
+                   It takes chunk_index and chunk_size (number of entries in the chunk)_as input, and returns nothing
+        :parameter keep_file_open:  if true, file descriptor is kept open for the entire time until close() is called
+        """
+
+        if output_file_path is None or len(output_file_path.strip()) == 0:
+            raise ValueError(f"{self.__class__.TAG}: output_file_path cannot be empty")
+        if chunk_size <= 0:
+            raise ValueError(f"{self.__class__.TAG}: Chunk size must be greater than zero. Given: {chunk_size}")
+
+        self.out_file_path = output_file_path
+        self.chunk_size = chunk_size
+        self.string_converter_callback = string_converter_callback if string_converter_callback is not None else str
+        self.pre_chunk_write_callback = pre_chunk_write_callback
+        self.post_chunk_write_callback = post_chunk_write_callback
+        self.keep_file_open = keep_file_open
+
+        # internal state
+        self._written_chunk_count: int = 0
+        self._out_fd = None  # only when keep_file_open is true
+        self._is_closed: bool = False
+        self._lock = threading.Lock()
+
+        self._data: dict = {}
+        self._next_index: int = 0
+        # self._next_range_set: set = set()
+        self._set_next_index(0)  # init next index
+
+    def _consider_delete_file(self):
+        if self._written_chunk_count == 0 and os.path.exists(self.out_file_path):
+            try:
+                os.remove(self.out_file_path)
+            except Exception as e:
+                raise RuntimeError("{self.__class__.TAG}: Could not remove file: " + self.out_file_path) from e
+
+    def _set_next_index(self, next_index: int):
+        self._next_index: int = next_index
+        self._next_range_set: set = set(range(self._next_index, self._next_index + self.chunk_size))
+
+    def _check_closed(self):
+        if self._is_closed:
+            raise RuntimeError("{self.__class__.TAG}: Index buffer already is closed")
+
+    def is_closed(self) -> bool:
+        return self._is_closed
+
+    def written_chunk_count(self) -> int:
+        return self._written_chunk_count
+
+    def size(self) -> int:
+        return len(self._data)
+
+    def insert(self, index: int, value: object):
+        self._check_closed()
+        if index < 0:
+            raise ValueError(f"{self.__class__.TAG}: Index must be greater than or equal to 0, given: {index}")
+
+        self._data[index] = value
+        self._consider_flush()
+
+    def __write_indices_to_fd(self, fd, indices_sorted, pre_string = None):
+        # Pre string
+        if pre_string is not None and isinstance(pre_string, str) and len(pre_string) > 0:
+            fd.write(pre_string)
+
+        # actual data
+        for i in indices_sorted:
+            fd.write(self.string_converter_callback(self._data.pop(i)))
+
+    def _write_chunk_indices(self, indices_sorted, indices_size: int, execute_pre_write_callback: bool = True):
+        chunk_index = self._written_chunk_count
+
+        pre_string = None
+        if execute_pre_write_callback and self.pre_chunk_write_callback is not None:
+            pre_string = self.pre_chunk_write_callback(chunk_index)
+
+        if self.keep_file_open:
+            if self._out_fd is None:
+                self._out_fd = open(self.out_file_path, "w")
+            self.__write_indices_to_fd(self._out_fd, indices_sorted, pre_string=pre_string)
+        else:
+            self._consider_delete_file()
+            with open(self.out_file_path, "a") as out_fd:
+                self.__write_indices_to_fd(out_fd, indices_sorted, pre_string=pre_string)
+
+        self._written_chunk_count += 1
+        self._set_next_index(self._next_index + indices_size)
+
+        # Post-write callback
+        if self.post_chunk_write_callback is not None:
+            self.post_chunk_write_callback(chunk_index, indices_size)
+
+    def _consider_flush(self):
+        self._check_closed()
+
+        while len(self._data) >= self.chunk_size:
+            # Check if the current range exists
+            range_exists = self._next_range_set.issubset(self._data.keys())
+            if not range_exists:
+                return
+
+            with self._lock:
+                # write chunk to file
+                indices = range(self._next_index, self._next_index + self.chunk_size)
+                self._write_chunk_indices(indices, indices_size=self.chunk_size)
+
+    def close(self):
+        if self._is_closed:
+            return
+
+        with self._lock:
+            if self._is_closed:
+                return
+            self._is_closed = True
+
+            # force flush remaining indices in order
+            if len(self._data) > 0:
+                sorted_indices = sorted(self._data.keys())
+                self._write_chunk_indices(sorted_indices, indices_size=len(sorted_indices))
+            self._data.clear()
+
+            # Close file descriptor
+            if self._out_fd is not None:
+                try:
+                    self._out_fd.close()
+                except Exception as e:
+                    print(f"{self.__class__.TAG}: WARNING Could not close output file: {self.out_file_path}", e)
 # -------------------------------------------------------------------
 
 # Global State ------------------
@@ -271,6 +438,9 @@ SHUTDOWN_REQUESTED = False
 ACTIVE_RAM_FILES = set()
 RAM_FILES_LOCK = threading.Lock()
 
+index_stream_buffer: IndexStreamBuffer = None    # will initialize later
+
+# Time benchmarks
 t_app_start = time.perf_counter()
 t_ram_load_total = 0.0
 t_compute_total = 0.0
@@ -296,6 +466,9 @@ def unregister_ram_file(filepath):
 
 def cleanup_ramdisk():
     with RAM_FILES_LOCK:
+        if len(ACTIVE_RAM_FILES) == 0: return
+
+        log_info(f"Cleaning up RAM disk {RAM_DISK_PATH}")
         for f in list(ACTIVE_RAM_FILES):
             if os.path.exists(f):
                 try:
@@ -305,18 +478,36 @@ def cleanup_ramdisk():
             ACTIVE_RAM_FILES.remove(f)
 
 
-def signal_handler(signum, frame):
+def cleanup():
+    idx_streamer = index_stream_buffer
+    if idx_streamer is not None and isinstance(idx_streamer, IndexStreamBuffer):
+        log_info("Closing output file...")
+        idx_streamer.close()
+
+    cleanup_ramdisk()
+
+
+# SIGNAL HANDLERS --------------------
+# called on exit
+def handle_exit():
+    global SHUTDOWN_REQUESTED
+    SHUTDOWN_REQUESTED = True
+
+    log_info(f"\nExiting...")
+    cleanup()
+
+def handle_os_signal(signum, frame):
     global SHUTDOWN_REQUESTED
     sig_name = signal.Signals(signum).name
     log_warn(f"\nReceived OS Signal: {sig_name}. Initiating clean shutdown...")
     SHUTDOWN_REQUESTED = True
 
 
-atexit.register(cleanup_ramdisk)
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+atexit.register(handle_exit)
+signal.signal(signal.SIGINT, handle_os_signal)
+signal.signal(signal.SIGTERM, handle_os_signal)
 try:
-    signal.signal(signal.SIGHUP, signal_handler)
+    signal.signal(signal.SIGHUP, handle_os_signal)
 except AttributeError:
     pass
 
@@ -1100,221 +1291,9 @@ def master_producer(q_main):
                 continue
 
 
-# =============================================================================
-# 4. COMPUTE CONSUMER LOOP
-# =============================================================================
-frame_queue: queue.Queue = queue.Queue(maxsize=QUEUE_BUFFER_SIZE)
-data_buffer = []
-to_kcal = unit.kilocalorie_per_mole
-to_kcal_A = unit.kilocalorie_per_mole / unit.angstrom
-
-io_thread = threading.Thread(target=master_producer, args=(frame_queue,))
-io_thread.start()
-
-# ----- COMPUTE START ------------
-# selection index trackers in dynamic mode
-prev_idx_se11_set: set = set()
-prev_idx_sel2_set: set = set()
-
-frames_processed = 0
-t_compute_start = time.perf_counter()
-log_info(f"Compute Engine [{platform_name}] is consuming frames...")
-
-# --- MANUAL GC SETUP ---
-next_manual_gc_frames = MANUAL_GC_INTERVAL_FRAMES
-
-# --- PROGRESS TRACKER SETUP ---
-next_progress_report_frames = PROGRESS_REPORT_INTERVAL_FRAMES
-t_last_progress_report = time.perf_counter()
-
-while not SHUTDOWN_REQUESTED:
-    t0_wait = time.perf_counter()
-    try:
-        payload = frame_queue.get(timeout=1.0)
-        t_io_wait_total += (time.perf_counter() - t0_wait)
-    except queue.Empty:
-        t_io_wait_total += (time.perf_counter() - t0_wait)
-        continue
-
-    if payload is None: break
-
-    abs_f, coords_nm, box_nm, arr_sel1, arr_sel2 = payload
-    n1, n2 = len(arr_sel1), len(arr_sel2) if not is_self_interaction else 0
-    if n1 == 0:
-        log_warn(f"SELECTION-1 Atom count 0 at frame {abs_f}")
-        continue
-
-    context.setPositions(coords_nm)
-    if PERIODIC:
-        context.setPeriodicBoxVectors(box_nm[0], box_nm[1], box_nm[2])
-
-    idx_set1_set: set = None
-    idx_set2_set: set = None
-    if IS_DYNAMIC:
-        idx_set1_set: set = set(arr_sel1)
-        idx_set2_set: set = idx_set1_set if is_self_interaction else (set(arr_sel2) - idx_set1_set)
-
-        union_idx_sel1: set = idx_set1_set ^ prev_idx_se11_set
-        union_idx_sel2: set = idx_set2_set ^ prev_idx_sel2_set
-
-        for i in union_idx_sel1:
-            val = 1.0 if i in idx_set1_set else 0.0
-            q = float(dynamic_elec_q_cache_np[i])
-            vdw_tup = (dynamic_vdw_type_cache[i], val) if nbfix_force else (dynamic_vdw_sig_eps_cache[i, 0], dynamic_vdw_sig_eps_cache[i, 1], val)
-
-            if is_self_interaction:
-                vdw_force.setParticleParameters(i, vdw_tup)
-                elec_force.setParticleParameters(i, (q, val))
-                if PERIODIC and PME_ENABLED:
-                    pme_recip_force.setParticleParameters(i, q * val, 1.0, 0.0)
-            else:
-                s2_val = 1.0 if i in idx_set2_set else 0.0
-                vdw_force.setParticleParameters(i, vdw_tup + (s2_val, ))
-                elec_force.setParticleParameters(i, (q, val, s2_val))
-                if PERIODIC and PME_ENABLED:
-                    pme_recip_force.setParticleParameters(i, q * max(val, s2_val), 1.0, 0.0)
-
-        if not is_self_interaction:
-            for i in union_idx_sel2.difference(union_idx_sel1):
-                q = float(dynamic_elec_q_cache_np[i])
-                s2_val = 1.0 if i in idx_set2_set else 0.0
-                s1_val = 1.0 if i in idx_set1_set else 0.0
-
-                vdw_tup = (dynamic_vdw_type_cache[i], s1_val, s2_val) if nbfix_force else (dynamic_vdw_sig_eps_cache[i, 0], dynamic_vdw_sig_eps_cache[i, 1], s1_val, s2_val)
-                vdw_force.setParticleParameters(i, vdw_tup)
-                elec_force.setParticleParameters(i, (q, s1_val, s2_val))
-                if PERIODIC and PME_ENABLED:
-                    pme_recip_force.setParticleParameters(i, q * max(s1_val, s2_val), 1.0, 0.0)
-
-        vdw_force.updateParametersInContext(context)
-        elec_force.updateParametersInContext(context)
-        if PERIODIC and PME_ENABLED:
-            pme_recip_force.updateParametersInContext(context)
-
-        prev_idx_se11_set = idx_set1_set
-        prev_idx_sel2_set = idx_set2_set
-
-    # Query Energies
-    erg_raw = [0.0] * len(group_map)  # 6
-    for mask, idx in active_fetches:
-        erg_raw[idx] = context.getState(getEnergy=True, groups=mask).getPotentialEnergy().value_in_unit(to_kcal)
-
-    # --- PME Reciprocal Space 3-Pass Subtraction ---
-    f_pme_cross_raw = None
-    if PERIODIC and PME_ENABLED and is_elec_raw_requested:
-        if is_self_interaction:
-            state_recip = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
-            e_recip = state_recip.getPotentialEnergy().value_in_unit(to_kcal)
-
-            if is_dynamic_elec_q_cache_needed:  # if we have cache
-                sel1_q_sq_sum = np.sum(dynamic_elec_q_cache_np[arr_sel1] ** 2)
-            else:
-                sel1_q_sq_sum = 0
-                for i in arr_sel1:
-                    sel1_q_sq_sum += nb_base.getParticleParameters(i)[0].value_in_unit(unit.elementary_charge) ** 2
-
-            pme_self = - (138.935456 / DIELECTRIC) * (ewald_beta / math.sqrt(math.pi)) * sel1_q_sq_sum
-            erg_raw[comp_idx["elec"]] += (e_recip + pme_self)
-            if OUT_FORCE:
-                f_pme_cross_raw = state_recip.getForces(asNumpy=True).value_in_unit(to_kcal_A)
-        else:
-            if IS_DYNAMIC:
-                st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
-                only_sel1 = idx_set1_set - idx_set2_set
-                only_sel2 = idx_set2_set - idx_set1_set
-
-                # Pass A:
-                for i in only_sel2:
-                    pme_recip_force.setParticleParameters(i, 0.0, 1.0, 0.0)
-                pme_recip_force.updateParametersInContext(context)
-                st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
-
-                # Pass B:
-                for i in only_sel2:
-                    pme_recip_force.setParticleParameters(i, dynamic_elec_q_cache_np[i], 1.0, 0.0)
-                for i in only_sel1:
-                    pme_recip_force.setParticleParameters(i, 0.0, 1.0, 0.0)
-                pme_recip_force.updateParametersInContext(context)
-                st_B = context.getState(getEnergy=True, groups=(1 << 7))
-
-                # Restore XOR AB state for next frame:
-                for i in only_sel1:
-                    pme_recip_force.setParticleParameters(i, dynamic_elec_q_cache_np[i], 1.0, 0.0)
-                pme_recip_force.updateParametersInContext(context)
-            else:
-                context.setParameter("lambda_1", 1.0)
-                context.setParameter("lambda_2", 1.0)
-                st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
-                context.setParameter("lambda_1", 1.0)
-                context.setParameter("lambda_2", 0.0)
-                st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
-                context.setParameter("lambda_1", 0.0)
-                context.setParameter("lambda_2", 1.0)
-                st_B = context.getState(getEnergy=True, groups=(1 << 7))
-
-            e_AB = st_AB.getPotentialEnergy().value_in_unit(to_kcal)
-            e_A = st_A.getPotentialEnergy().value_in_unit(to_kcal)
-            e_B = st_B.getPotentialEnergy().value_in_unit(to_kcal)
-            erg_raw[comp_idx["elec"]] += (e_AB - e_A - e_B)  # PME self-energy perfectly cancels algebraically here!
-
-            if OUT_FORCE:
-                f_pme_cross_raw = st_AB.getForces(asNumpy=True).value_in_unit(to_kcal_A) - st_A.getForces(
-                    asNumpy=True).value_in_unit(to_kcal_A)
-
-    # Query Forces
-    force_components = None  # [elec_force_components, vdw_force_components]  # [elec_force_components, vdw_force_components]
-    force_mags = None  # [mag(elec_force), mag(vdw_force), mag(total_force)]
-    if OUT_FORCE:
-        f_ele_raw = context.getState(getForces=True, groups=(1 << 2)).getForces(asNumpy=True).value_in_unit(to_kcal_A)
-        f_vdw_raw = context.getState(getForces=True, groups=(1 << 1)).getForces(asNumpy=True).value_in_unit(to_kcal_A)
-        if f_pme_cross_raw is not None:
-            f_ele_raw += f_pme_cross_raw
-        f_ele_comp = np.sum(f_ele_raw[arr_sel1], axis=0)
-        f_vdw_comp = np.sum(f_vdw_raw[arr_sel1], axis=0)
-
-        f_ele_mag = np.linalg.norm(f_ele_comp)
-        f_vdw_mag = np.linalg.norm(f_vdw_comp)
-        if TOTAL_FORCE_VECTOR_SUM:
-            # vector sum. PHYSICALLY ACCURATE
-            f_tot_mag = np.linalg.norm(f_ele_comp + f_vdw_comp)
-        else:
-            # NOTE: sum of magnitudes. NOT PHYSICALLY ACCURATE
-            f_tot_mag = f_ele_mag + f_vdw_mag
-
-        force_mags = [f_ele_mag, f_vdw_mag, f_tot_mag]
-        if OUT_FORCE_COMPONENTS:
-            force_components = [f_ele_comp, f_vdw_comp]
-
-    # final data
-    data_buffer.append((abs_f,
-                        n1 if UPDATE_SELECTION1 else None,
-                        n2 if UPDATE_SELECTION2 else None,
-                        erg_raw,
-                        force_mags,
-                        force_components))
-
-    # ------------------ Finalize ------------------------
-    frames_processed += 1
-
-    # SWIG PROXY FLUSH (DYNAMIC MEMORY STABILIZATION)
-    if MANUAL_GC_ENABLED and IS_DYNAMIC and frames_processed == next_manual_gc_frames:
-        gc.collect()
-        next_manual_gc_frames += MANUAL_GC_INTERVAL_FRAMES
-
-    # PROGRESS TRACKER EXECUTION
-    if frames_processed == next_progress_report_frames:
-        t_now = time.perf_counter()
-        fps_current = PROGRESS_REPORT_INTERVAL_FRAMES / max(0.001, t_now - t_last_progress_report)
-        log_info(
-            f"Progress: Processed {frames_processed} frames  |  Speed: {fps_current:.1f} fps  |  Queued Frames: {frame_queue.qsize()}")
-        next_progress_report_frames += PROGRESS_REPORT_INTERVAL_FRAMES
-        t_last_progress_report = t_now
-
-t_compute_total = time.perf_counter() - t_compute_start
-io_thread.join()
 
 # =============================================================================
-# 5. POST-LOOP FORMATTING AND OUTPUT
+# DATA FORMATTING AND OUTPUT SETUP
 # =============================================================================
 
 def create_comments_str() -> str:
@@ -1428,18 +1407,247 @@ def create_output_erg_line(erg_row) -> str:
 
     return OUT_DELIMITER.join(out_row) + "\n"
 
-# -----------------------------------------------
-# Writing output to file
-# -----------------------------------------------
-data_buffer.sort(key=lambda x: x[0])
 
-output_file = f"{OUT_FILE_PREFIX}.energy.csv"
-with open(output_file, 'w') as f_out:
-    f_out.write(create_comments_str()) # Comments
-    f_out.write(create_output_erg_header_line())  # energy header
-    # energies for each frame
-    for row in data_buffer:
-        f_out.write(create_output_erg_line(row))
+# -----------------------------------------------
+# OUTPUT file and IndexStreamBuffer Setup
+# -----------------------------------------------
+
+def _on_index_streamer_pre_chunk_write(chunk_index: int) -> str | None:
+    # print(f"PRE_CHUNK_WRITE: {chunk_index}")
+    if chunk_index == 0:
+        return create_comments_str() + create_output_erg_header_line()
+    return None
+
+
+def _on_index_streamer_post_chunk_write(chunk_index: int, chunk_size: int):
+    log_debug(f"INDEX_STREAM_BUFFER: Post chunk write {chunk_index} (chunk size: {chunk_size})")
+    pass
+
+
+out_file_path = f"{OUT_FILE_PREFIX}.energy.csv"
+index_stream_buffer = IndexStreamBuffer(output_file_path=out_file_path,
+                                        chunk_size=INDEX_STREAM_BUFFER_CHUNK_SIZE,
+                                        keep_file_open=INDEX_STREAM_BUFFER_ALWAYS_OPEN,
+                                        string_converter_callback=create_output_erg_line,
+                                        pre_chunk_write_callback=_on_index_streamer_pre_chunk_write,
+                                        post_chunk_write_callback=_on_index_streamer_post_chunk_write)
+
+
+# =============================================================================
+# 4. COMPUTE CONSUMER LOOP
+# =============================================================================
+frame_queue: queue.Queue = queue.Queue(maxsize=QUEUE_BUFFER_SIZE)
+to_kcal = unit.kilocalorie_per_mole
+to_kcal_A = unit.kilocalorie_per_mole / unit.angstrom
+
+# Start reading frames
+io_thread = threading.Thread(target=master_producer, args=(frame_queue,))
+io_thread.start()
+
+# ---------------- COMPUTE START ----------------
+# selection index trackers in dynamic mode
+prev_idx_se11_set: set = set()
+prev_idx_sel2_set: set = set()
+
+frames_processed = 0
+t_compute_start = time.perf_counter()
+log_info(f"Compute Engine [{platform_name}] is consuming frames...")
+
+# --- MANUAL GC SETUP ---
+next_manual_gc_frames = MANUAL_GC_INTERVAL_FRAMES
+
+# --- PROGRESS TRACKER SETUP ---
+next_progress_report_frames = PROGRESS_REPORT_INTERVAL_FRAMES
+t_last_progress_report = time.perf_counter()
+
+while not SHUTDOWN_REQUESTED:
+    t0_wait = time.perf_counter()
+    try:
+        payload = frame_queue.get(timeout=1.0)
+        t_io_wait_total += (time.perf_counter() - t0_wait)
+    except queue.Empty:
+        t_io_wait_total += (time.perf_counter() - t0_wait)
+        continue
+
+    if payload is None: break
+
+    abs_f, coords_nm, box_nm, arr_sel1, arr_sel2 = payload
+    n1, n2 = len(arr_sel1), len(arr_sel2) if not is_self_interaction else 0
+    if n1 == 0:
+        log_warn(f"SELECTION-1 Atom count 0 at frame {abs_f}")
+        continue
+
+    context.setPositions(coords_nm)
+    if PERIODIC:
+        context.setPeriodicBoxVectors(box_nm[0], box_nm[1], box_nm[2])
+
+    idx_set1_set: set = None
+    idx_set2_set: set = None
+    if IS_DYNAMIC:
+        idx_set1_set: set = set(arr_sel1)
+        idx_set2_set: set = idx_set1_set if is_self_interaction else (set(arr_sel2) - idx_set1_set)
+
+        union_idx_sel1: set = idx_set1_set ^ prev_idx_se11_set
+        union_idx_sel2: set = idx_set2_set ^ prev_idx_sel2_set
+
+        for i in union_idx_sel1:
+            val = 1.0 if i in idx_set1_set else 0.0
+            q = float(dynamic_elec_q_cache_np[i])
+            vdw_tup = (dynamic_vdw_type_cache[i], val) if nbfix_force else (dynamic_vdw_sig_eps_cache[i, 0], dynamic_vdw_sig_eps_cache[i, 1], val)
+
+            if is_self_interaction:
+                vdw_force.setParticleParameters(i, vdw_tup)
+                elec_force.setParticleParameters(i, (q, val))
+                if PERIODIC and PME_ENABLED:
+                    pme_recip_force.setParticleParameters(i, q * val, 1.0, 0.0)
+            else:
+                s2_val = 1.0 if i in idx_set2_set else 0.0
+                vdw_force.setParticleParameters(i, vdw_tup + (s2_val, ))
+                elec_force.setParticleParameters(i, (q, val, s2_val))
+                if PERIODIC and PME_ENABLED:
+                    pme_recip_force.setParticleParameters(i, q * max(val, s2_val), 1.0, 0.0)
+
+        if not is_self_interaction:
+            for i in union_idx_sel2.difference(union_idx_sel1):
+                q = float(dynamic_elec_q_cache_np[i])
+                s2_val = 1.0 if i in idx_set2_set else 0.0
+                s1_val = 1.0 if i in idx_set1_set else 0.0
+
+                vdw_tup = (dynamic_vdw_type_cache[i], s1_val, s2_val) if nbfix_force else (dynamic_vdw_sig_eps_cache[i, 0], dynamic_vdw_sig_eps_cache[i, 1], s1_val, s2_val)
+                vdw_force.setParticleParameters(i, vdw_tup)
+                elec_force.setParticleParameters(i, (q, s1_val, s2_val))
+                if PERIODIC and PME_ENABLED:
+                    pme_recip_force.setParticleParameters(i, q * max(s1_val, s2_val), 1.0, 0.0)
+
+        vdw_force.updateParametersInContext(context)
+        elec_force.updateParametersInContext(context)
+        if PERIODIC and PME_ENABLED:
+            pme_recip_force.updateParametersInContext(context)
+
+        prev_idx_se11_set = idx_set1_set
+        prev_idx_sel2_set = idx_set2_set
+
+    # Query Energies
+    erg_raw = np.zeros(len(group_map), dtype=np.float64)      # 6
+    for mask, idx in active_fetches:
+        erg_raw[idx] = context.getState(getEnergy=True, groups=mask).getPotentialEnergy().value_in_unit(to_kcal)
+
+    # --- PME Reciprocal Space 3-Pass Subtraction ---
+    f_pme_cross_raw = None
+    if PERIODIC and PME_ENABLED and is_elec_raw_requested:
+        if is_self_interaction:
+            state_recip = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+            e_recip = state_recip.getPotentialEnergy().value_in_unit(to_kcal)
+
+            if is_dynamic_elec_q_cache_needed:  # if we have cache
+                sel1_q_sq_sum = np.sum(dynamic_elec_q_cache_np[arr_sel1] ** 2)
+            else:
+                sel1_q_sq_sum = 0
+                for i in arr_sel1:
+                    sel1_q_sq_sum += nb_base.getParticleParameters(i)[0].value_in_unit(unit.elementary_charge) ** 2
+
+            pme_self = - (138.935456 / DIELECTRIC) * (ewald_beta / math.sqrt(math.pi)) * sel1_q_sq_sum
+            erg_raw[comp_idx["elec"]] += (e_recip + pme_self)
+            if OUT_FORCE:
+                f_pme_cross_raw = state_recip.getForces(asNumpy=True).value_in_unit(to_kcal_A)
+        else:
+            if IS_DYNAMIC:
+                st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+                only_sel1 = idx_set1_set - idx_set2_set
+                only_sel2 = idx_set2_set - idx_set1_set
+
+                # Pass A:
+                for i in only_sel2:
+                    pme_recip_force.setParticleParameters(i, 0.0, 1.0, 0.0)
+                pme_recip_force.updateParametersInContext(context)
+                st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+
+                # Pass B:
+                for i in only_sel2:
+                    pme_recip_force.setParticleParameters(i, dynamic_elec_q_cache_np[i], 1.0, 0.0)
+                for i in only_sel1:
+                    pme_recip_force.setParticleParameters(i, 0.0, 1.0, 0.0)
+                pme_recip_force.updateParametersInContext(context)
+                st_B = context.getState(getEnergy=True, groups=(1 << 7))
+
+                # Restore XOR AB state for next frame:
+                for i in only_sel1:
+                    pme_recip_force.setParticleParameters(i, dynamic_elec_q_cache_np[i], 1.0, 0.0)
+                pme_recip_force.updateParametersInContext(context)
+            else:
+                context.setParameter("lambda_1", 1.0)
+                context.setParameter("lambda_2", 1.0)
+                st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+                context.setParameter("lambda_1", 1.0)
+                context.setParameter("lambda_2", 0.0)
+                st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+                context.setParameter("lambda_1", 0.0)
+                context.setParameter("lambda_2", 1.0)
+                st_B = context.getState(getEnergy=True, groups=(1 << 7))
+
+            e_AB = st_AB.getPotentialEnergy().value_in_unit(to_kcal)
+            e_A = st_A.getPotentialEnergy().value_in_unit(to_kcal)
+            e_B = st_B.getPotentialEnergy().value_in_unit(to_kcal)
+            erg_raw[comp_idx["elec"]] += (e_AB - e_A - e_B)  # PME self-energy perfectly cancels algebraically here!
+
+            if OUT_FORCE:
+                f_pme_cross_raw = st_AB.getForces(asNumpy=True).value_in_unit(to_kcal_A) - st_A.getForces(
+                    asNumpy=True).value_in_unit(to_kcal_A)
+
+    # Query Forces
+    force_components = None  # [elec_force_components, vdw_force_components]  # [elec_force_components, vdw_force_components]
+    force_mags = None  # [mag(elec_force), mag(vdw_force), mag(total_force)]
+    if OUT_FORCE:
+        f_ele_raw = context.getState(getForces=True, groups=(1 << 2)).getForces(asNumpy=True).value_in_unit(to_kcal_A)
+        f_vdw_raw = context.getState(getForces=True, groups=(1 << 1)).getForces(asNumpy=True).value_in_unit(to_kcal_A)
+        if f_pme_cross_raw is not None:
+            f_ele_raw += f_pme_cross_raw
+        f_ele_comp = np.sum(f_ele_raw[arr_sel1], axis=0)
+        f_vdw_comp = np.sum(f_vdw_raw[arr_sel1], axis=0)
+
+        f_ele_mag = np.linalg.norm(f_ele_comp)
+        f_vdw_mag = np.linalg.norm(f_vdw_comp)
+        if TOTAL_FORCE_VECTOR_SUM:
+            # vector sum. PHYSICALLY ACCURATE
+            f_tot_mag = np.linalg.norm(f_ele_comp + f_vdw_comp)
+        else:
+            # NOTE: sum of magnitudes. NOT PHYSICALLY ACCURATE
+            f_tot_mag = f_ele_mag + f_vdw_mag
+
+        force_mags = [f_ele_mag, f_vdw_mag, f_tot_mag]
+        if OUT_FORCE_COMPONENTS:
+            force_components = [f_ele_comp, f_vdw_comp]
+
+    # final data
+    index_stream_buffer.insert(index=int(abs_f / FRAME_STEP),
+                               value=(abs_f,
+                                    n1 if UPDATE_SELECTION1 else None,
+                                    n2 if UPDATE_SELECTION2 else None,
+                                    erg_raw,
+                                    force_mags,
+                                    force_components)
+                               )
+
+    # ------------------ Finalize ------------------------
+    frames_processed += 1
+
+    # SWIG PROXY FLUSH (DYNAMIC MEMORY STABILIZATION)
+    if MANUAL_GC_ENABLED and IS_DYNAMIC and frames_processed == next_manual_gc_frames:
+        gc.collect()
+        next_manual_gc_frames += MANUAL_GC_INTERVAL_FRAMES
+
+    # PROGRESS TRACKER EXECUTION
+    if frames_processed == next_progress_report_frames:
+        t_now = time.perf_counter()
+        fps_current = PROGRESS_REPORT_INTERVAL_FRAMES / max(0.001, t_now - t_last_progress_report)
+        log_info(
+            f"Progress: Processed {frames_processed} frames  |  Speed: {fps_current:.1f} fps  |  Queued Frames: {frame_queue.qsize()}")
+        next_progress_report_frames += PROGRESS_REPORT_INTERVAL_FRAMES
+        t_last_progress_report = t_now
+
+t_compute_total = time.perf_counter() - t_compute_start
+io_thread.join()
+
 
 # =============================================================================
 # 6. EXECUTION REPORT
@@ -1457,7 +1665,7 @@ print(f" Status               : {status_str}")
 print(f" Frames Processed     : {frames_processed}")
 print(f" Processing Speed     : {fps:.1f} frames/sec")
 print(f" Compute Engine       : {platform_name}")
-print(f" Final Output File    : {output_file}")
+print(f" Final Output File    : {out_file_path}")
 print("-" * 60)
 print(f" Total Wall Time      : {t_total:.1f} s")
 print(f"   ├─ catdcd/RAM I/O  : {t_ram_load_total:.1f} s")
