@@ -147,10 +147,10 @@ COMMENT_TOKEN = "#"
 # ==============================================
 # FRAME LOADING and PERFORMANCE
 # ==============================================
-QUEUE_BUFFER_SIZE = 1000 if USE_GPU else 200       # Max allowed pending frames in queue. Frame Reading will stop if queue is full
+QUEUE_FRAME_COUNT = 1000 if USE_GPU else 200       # Max allowed pending frames in queue. Frame Reading will stop if queue is full
 
 RAM_DISK_PATH = "/tmp/namd_energy.openmm"          # ram disk path to use
-RAM_LOADING_ENABLED: bool = False     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
+RAM_LOADING_ENABLED: bool = True     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
 RAM_READER_COUNT = 1                  # TEST Concurrent readers for RAM chunks
 
 # Chunking to RAM (requires catdcd))
@@ -464,6 +464,7 @@ def unregister_ram_file(filepath):
             ACTIVE_RAM_FILES.remove(filepath)
             if os.path.exists(filepath):
                 try:
+                    log_debug(f"Removing file from RAM DISK: {filepath}")
                     os.remove(filepath)
                 except:
                     pass
@@ -477,6 +478,7 @@ def cleanup_ramdisk():
         for f in list(ACTIVE_RAM_FILES):
             if os.path.exists(f):
                 try:
+                    log_debug(f"Removing file from RAM DISK: {f}")
                     os.remove(f)
                 except:
                     pass
@@ -523,9 +525,9 @@ except AttributeError:
 # =============================================================================
 # VALIDATION AND PRECONDITIONS
 # =============================================================================
-print("\n" + "=" * 50)
+print("\n\n" + "=" * 60)
 log_info(f"Starting Pair Interaction Analysis ({LABEL})")
-print("=" * 50)
+print("=" * 60)
 log_info(f"Thread Setup: OpenMM CPU={assigned_openmm_threads} ({openmm_alloc_mode}) | MDA OpenMP={assigned_mda_threads}/reader ({mda_alloc_mode})")
 
 if not SELECTION1.strip():
@@ -734,6 +736,7 @@ else:
     n2_count = len(static_sel2_idx_set) if not is_self_interaction else n1_count
     pair_count = n1_count * n2_count
 
+    # if pairs cannot fit in RAM, use masks [SLOW but uses almost NO RAM]
     USE_MASK = pair_count > MAX_INTERACTION_PAIRS_IN_RAM
 
     # APPROX memory usage (only for logging)
@@ -1116,6 +1119,10 @@ def parallel_reader_worker(q_main, psf, dcd, start, stop, global_offset, step):
         sel1 = u.select_atoms(SELECTION1, updating=UPDATE_SELECTION1)
         sel2 = sel1 if is_self_interaction else u.select_atoms(SELECTION2, updating=UPDATE_SELECTION2)
 
+        # TODO TEST : benchmark frame load times
+        t_start = time.perf_counter()
+        i_start = start
+
         for i in range(start, stop, step):
             if SHUTDOWN_REQUESTED: break
 
@@ -1134,6 +1141,13 @@ def parallel_reader_worker(q_main, psf, dcd, start, stop, global_offset, step):
                     break
                 except queue.Full:
                     continue
+
+            # TODO TEST benchmark
+            if DEBUG and (i - i_start) > 0 and (i - i_start) % PROGRESS_REPORT_INTERVAL_FRAMES == 0:
+                t_end = time.perf_counter()
+                log_debug(f"FRAME_READER {start // (stop - start)}: {(t_end - t_start) / round(float(i - i_start) / step) * 1000:.2f} ms/frame")
+                t_start = t_end
+                i_start = i
     finally:
         # Guarantee closure of internal C-level file descriptors
         if u is not None:
@@ -1472,7 +1486,7 @@ index_stream_buffer = IndexStreamBuffer(output_file_path=out_file_path,
 # =============================================================================
 # COMPUTE CONSUMER LOOP
 # =============================================================================
-frame_queue: queue.Queue = queue.Queue(maxsize=QUEUE_BUFFER_SIZE)
+frame_queue: queue.Queue = queue.Queue(maxsize=QUEUE_FRAME_COUNT)
 to_kcal = unit.kilocalorie_per_mole
 to_kcal_A = unit.kilocalorie_per_mole / unit.angstrom
 
