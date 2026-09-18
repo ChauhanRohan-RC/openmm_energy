@@ -8,8 +8,6 @@
 # Exit on error
 #set -e
 
-#module load namd3 vmd
-
 run_openmm() {
 	./namd_energy_openmm.py
 }
@@ -29,7 +27,7 @@ export selection_water_hydration="water and around 4.25 protein"
 export selection_water_bulk="water and not around 5.0 protein"
 
 # TEST
-OUT_FILE_SUFFIX="4"
+OUT_FILE_SUFFIX="2"
 
 
 # Run 1: Protein Self
@@ -44,7 +42,7 @@ run_openmm_static
 export NAMD_ENERGY_LABEL="Water Self-Interaction Energy"
 export NAMD_ENERGY_SELECTION1="water"
 export NAMD_ENERGY_SELECTION2=""
-export NAMD_ENERGY_OUT_PREFIX="water_self"
+export NAMD_ENERGY_OUT_PREFIX="water_self${OUT_FILE_SUFFIX}"
 export NAMD_ENERGY_OUT_ENERGIES="-nonb -pote"
 run_openmm_static
 #

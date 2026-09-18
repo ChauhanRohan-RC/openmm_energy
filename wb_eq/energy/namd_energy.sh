@@ -8,7 +8,7 @@
 # Exit on error
 #set -e
 
-#module load namd3 vmd
+module load namd3 vmd
 
 # For STATIC SELECTIONS (that do not change with time)
 run_namd_energy_static() {

@@ -15,8 +15,8 @@
 
 """
 TODO TEST:
-1. IndexStreamBuffer: output data buffer periodically dump to file
-2. Ram cache mode thread contention while reading, especially when update selection is ON
+0. UPDATE_SELECTION is very slow in MDAnalysis
+1. if RAM_READER_COUNT > 1, very high bottleneck (thread contention), especially with UPDATE_SELECTION
 """
 
 ## USAGE --------------------------------------------------
@@ -124,7 +124,7 @@ PME_ENABLED: bool = True        # [ONLY PERIODIC] PME for long-range electrostat
 TIMESTEP_FIRST: int = 0         # only for bookkeeping
 FRAME_FREQ: int = 100           # TODO: timesteps between frames (=dcd_freq). only for bookkeeping
 
-# Skip Frames, faster calculation   # TODO: TEST
+# Skip Frames, faster calculation
 FRAME_SKIP: int = 0             # TODO: frame_step = frame_skip + 1
 
 # ==================================
@@ -134,7 +134,7 @@ FRAME_SKIP: int = 0             # TODO: frame_step = frame_skip + 1
 ## Force Output	(ONLY APPLICABLE when SEL-2 is defined)
 # -> Calculates force on SEL-1 due to SEL-2
 OUT_FORCE: bool = True
-OUT_FORCE_COMPONENTS: bool = False  # output force XYZ components
+OUT_FORCE_COMPONENTS: bool = False       # output force XYZ components
 
 # total force will be the VECTOR SUM: mag(total_force) = mag(vdw_force + elec_force vectors) [true physical behaviour].
 # Else, mag(total_force) = mag(vdw_force) + mag(elec_force)    [NO CANCELLATIONS, PHYSICALLY INACCURATE]
@@ -147,11 +147,11 @@ COMMENT_TOKEN = "#"
 # ==============================================
 # FRAME LOADING and PERFORMANCE
 # ==============================================
-QUEUE_BUFFER_SIZE = 1000 if USE_GPU else 100     # Max allowed pending frames in queue. Frame Reading will stop if queue is full
+QUEUE_BUFFER_SIZE = 2000 if USE_GPU else 200     # Max allowed pending frames in queue. Frame Reading will stop if queue is full
 
-RAM_LOADING_ENABLED: bool = False     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
 RAM_DISK_PATH = "/tmp/namd_energy.openmm"          # ram disk path to use
-RAM_READER_COUNT = 2                  # Concurrent readers for RAM chunks
+RAM_LOADING_ENABLED: bool = False     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
+RAM_READER_COUNT = 1                  # TEST Concurrent readers for RAM chunks
 
 # Chunking to RAM (requires catdcd))
 RAM_CHUNK_MODE: bool = True           # Loads big DCD files to RAM_DISK in chunks
@@ -159,8 +159,8 @@ RAM_CHUNK_DYNAMIC: bool = True        # Automatically shrink chunk if RAM is con
 RAM_CHUNK_FRAMES: int = 10000         # Max frames per chunk
 RAM_CHUNK_MIN_FRAMES: int = 2000      # Fallback to disk streaming if chunks cannot meet this size
 
-RAM_SAFETY_MARGIN_GB = 1.0          # Base free RAM margin required (GiB)
-RAM_EXTRA_MARGIN_GB = 0.1           # Extra buffer headroom (GiB)
+RAM_SAFETY_MARGIN_GB = 1.0            # Base free RAM margin required (GiB)
+RAM_EXTRA_MARGIN_GB = 0.1             # Extra buffer headroom (GiB)
 
 ## Thread controls
 # 0 = Smart Auto-Allocation, >0 = Override
@@ -173,21 +173,20 @@ OPENMM_CPU_THREADS = 0          # Compute threads for OpenMM (applies only if ru
 # Other Flags
 # -----------------------------------
 DEBUG: bool = True
-PROGRESS_REPORT_INTERVAL_FRAMES: int = 100  # num frames  TODO: TEST
+PROGRESS_REPORT_INTERVAL_FRAMES: int = 1000      # num frames
 
 MANUAL_GC_ENABLED: bool = True
-MANUAL_GC_INTERVAL_FRAMES: int = 5000   # num frames
+MANUAL_GC_INTERVAL_FRAMES: int = 5000            # num frames
 
-# TODO: TEST
-INDEX_STREAM_BUFFER_CHUNK_SIZE: int = 100       # num of frames to hold the computed energy data in RAM
-INDEX_STREAM_BUFFER_ALWAYS_OPEN: bool = True    # keep output file open
+INDEX_STREAM_BUFFER_CHUNK_SIZE: int = 5000       # num of frames to hold the computed energy data in RAM
+INDEX_STREAM_BUFFER_ALWAYS_OPEN: bool = True     # keep output file open
 
 ## Experimental Features -----------
 ## experimental flag to tun off erfc(ewald_beta * r) factor in short range direct electrostatics
 # if true: multiplies short range raw coulomb energy with erfc(ewald_beta * r) (very fast decaying factor)
 # else: uses raw coulomb energy expression for short range electrostatics with sharp discontinuity at the cutoff
 PME_SHORT_RANGE_USE_EWALD_BETA: bool = True
-PME_TOLERANCE: float = 1e-6     # NAMD default PME error tolerance (unitless factor)
+PME_TOLERANCE: float = 1e-6                      # NAMD default PME error tolerance (unitless factor)
 
 
 
@@ -493,7 +492,8 @@ def handle_exit():
     global SHUTDOWN_REQUESTED
     SHUTDOWN_REQUESTED = True
 
-    log_info(f"\nExiting...")
+    print("")
+    log_info(f"Exiting...")
     cleanup()
 
 def handle_os_signal(signum, frame):
@@ -1420,7 +1420,7 @@ def _on_index_streamer_pre_chunk_write(chunk_index: int) -> str | None:
 
 
 def _on_index_streamer_post_chunk_write(chunk_index: int, chunk_size: int):
-    log_debug(f"INDEX_STREAM_BUFFER: Post chunk write {chunk_index} (chunk size: {chunk_size})")
+    # log_debug(f"INDEX_STREAM_BUFFER: Post chunk write {chunk_index} (chunk size: {chunk_size})")
     pass
 
 
