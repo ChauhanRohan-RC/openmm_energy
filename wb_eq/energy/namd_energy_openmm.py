@@ -15,8 +15,8 @@
 
 """
 TODO TEST: (seach for TEST)
-0. UPDATE_SELECTION is very slow in MDAnalysis
 1. if RAM_READER_COUNT > 1, very high bottleneck (thread contention), especially with UPDATE_SELECTION
+2. severe PICe bottlenecks when USE_MASK = true (DYANMIC selections or high interaction pair count exceeding memory limit)
 """
 
 ## USAGE --------------------------------------------------
@@ -80,7 +80,7 @@ PARAM_FILES = [
     "../../common/ff/toppar_water_ions.prot.str"
 ]
 PSF_FILE = "../../common/amyl_wb.psf"       # TODO : input structure file
-DCD_FILES = find_files("..", "amyl_wb_eq", ".dcd", 2, 2)          # TODO : trajectory dcd files
+DCD_FILES = find_files("..", "amyl_wb_eq", ".dcd")          # TODO : trajectory dcd files
 
 ## Selections (MDAnalysis selection syntax)
 # -> hydration shell: water and around 4.25 protein
@@ -90,7 +90,7 @@ SELECTION2: str = os.getenv("NAMD_ENERGY_SELECTION2", "")   # TODO: or set ENV V
 # Dynamic Selections (update every frame)
 UPDATE_SELECTION1: str = str(os.getenv("NAMD_ENERGY_UPDATE_SELECTION1", 0))
 UPDATE_SELECTION2: str = str(os.getenv("NAMD_ENERGY_UPDATE_SELECTION2", 0))
-FAST_DYNAMIC_SELECTION: bool = True   # TODO: TEST Bypasses slow MDAnalysis 'updating=True' and manually update selection using FastDynamicSelector
+FAST_DYNAMIC_SELECTION: bool = True   # Bypasses slow MDAnalysis 'updating=True' and manually update selection using FastDynamicSelector
 
 ## Output file names
 OUT_FILE_PREFIX: str = os.getenv("NAMD_ENERGY_OUT_PREFIX", "interaction")    # TODO: or set ENV VAR: NAMD_ENERGY_OUT_PREFIX
@@ -148,11 +148,11 @@ COMMENT_TOKEN = "#"
 # ==============================================
 # FRAME LOADING and PERFORMANCE
 # ==============================================
-QUEUE_FRAME_COUNT = 1000 if USE_GPU else 200       # Max allowed pending frames in queue. Frame Reading will stop if queue is full
+QUEUE_FRAME_COUNT = 500 if USE_GPU else 200       # Max allowed pending frames in queue. Frame Reading will stop if queue is full
 
 RAM_DISK_PATH = "/tmp/namd_energy.openmm"          # ram disk path to use
 RAM_LOADING_ENABLED: bool = False     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
-RAM_READER_COUNT = 1                  # TODO TEST Concurrent readers for RAM chunks
+RAM_READER_COUNT = 1                  # Concurrent readers for RAM chunks
 
 # Chunking to RAM (requires catdcd))
 RAM_CHUNK_MODE: bool = True           # Loads big DCD files to RAM_DISK in chunks
@@ -174,7 +174,7 @@ OPENMM_CPU_THREADS = 0          # Compute threads for OpenMM (applies only if ru
 # Other Flags
 # -----------------------------------
 DEBUG: bool = True
-PROGRESS_REPORT_INTERVAL_FRAMES: int = 100      # TEST num frames
+PROGRESS_REPORT_INTERVAL_FRAMES: int = 1000      # num frames
 
 INDEX_STREAM_BUFFER_CHUNK_SIZE: int = 5000       # num of frames to hold the computed energy data in RAM
 INDEX_STREAM_BUFFER_ALWAYS_OPEN: bool = True     # keep output file open
@@ -856,11 +856,9 @@ else:
 is_elec_raw_requested = "elec" in raw_erg_requested
 elec_base_main = f"({138.935456 / DIELECTRIC} * (charge1 * charge2 / r))"
 pme_recip_force = None
-ewald_beta = None
+ewald_beta = math.sqrt(-math.log(PME_TOLERANCE)) / (CUTOFF / 10.0)
 
 if PERIODIC and PME_ENABLED:
-    ewald_beta = math.sqrt(-math.log(PME_TOLERANCE)) / (CUTOFF / 10.0)
-
     if PME_SHORT_RANGE_USE_EWALD_BETA:
         # Direct Space uses erfc() to perfectly blend with the Reciprocal Mesh boundary
         elec_base = f"({elec_base_main} * erfc({ewald_beta} * r))"
@@ -1278,7 +1276,7 @@ def parallel_reader_worker(q_main, psf, dcd, start, stop, global_offset, step):
         if not is_self_interaction and (not FAST_DYNAMIC_SELECTION or not UPDATE_SELECTION2):
             sel2 = sel1 if is_self_interaction else u.select_atoms(SELECTION2, updating=UPDATE_SELECTION2)
 
-        # TODO TEST : benchmark frame load times
+        # DEBUG : benchmark frame load times
         t_start = time.perf_counter()
         i_start = start
 
@@ -1315,10 +1313,10 @@ def parallel_reader_worker(q_main, psf, dcd, start, stop, global_offset, step):
                 except queue.Full:
                     continue
 
-            # TODO TEST benchmark
+            # DEBUG : benchmark frame load times (includes Queue Wait times)
             if DEBUG and (i - i_start) > 0 and (i - i_start) % PROGRESS_REPORT_INTERVAL_FRAMES == 0:
                 t_end = time.perf_counter()
-                log_debug(f"FRAME_READER {start // (stop - start)}: {(t_end - t_start) / round(float(i - i_start) / step) * 1000:.2f} ms/frame")
+                log_debug(f"FRAME_READER {start // (stop - start)}: {round(float(i - i_start) / step) / (t_end - t_start):.2f} fps")
                 t_start = t_end
                 i_start = i
     finally:
@@ -1696,6 +1694,8 @@ vdw_set = vdw_force.setParticleParameters
 elec_set = elec_force.setParticleParameters
 pme_set = pme_recip_force.setParticleParameters if (PERIODIC and PME_ENABLED) else None
 
+pme_self_prefactor = - (138.935456 / DIELECTRIC) * (ewald_beta / math.sqrt(math.pi))
+
 while not SHUTDOWN_REQUESTED:
     t0_wait = time.perf_counter()
     try:
@@ -1782,7 +1782,7 @@ while not SHUTDOWN_REQUESTED:
                 for i in arr_sel1:
                     sel1_q_sq_sum += nb_base.getParticleParameters(i)[0].value_in_unit(unit.elementary_charge) ** 2
 
-            pme_self = - (138.935456 / DIELECTRIC) * (ewald_beta / math.sqrt(math.pi)) * sel1_q_sq_sum
+            pme_self = - pme_self_prefactor * sel1_q_sq_sum
             erg_raw[comp_idx["elec"]] += (e_recip + pme_self)
             if OUT_FORCE:
                 f_pme_cross_raw = state_recip.getForces(asNumpy=True).value_in_unit(to_kcal_A)

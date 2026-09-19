@@ -12,16 +12,20 @@ module load namd3 vmd
 
 # For STATIC SELECTIONS (that do not change with time)
 run_namd_energy_static() {
+	export NAMD_ENERGY_PROCESSES=$NAMD_ENERGY_PROCESSES_STATIC
 	export VMDNOCUDA="on"
 	vmd -dispdev text -e namd_energy.static.tcl
 	unset VMDNOCUDA
+	unset NAMD_ENERGY_PROCESSES
 }
 
 # For DYNAMIC SELECTIONS (that change with time)
 run_namd_energy_dynamic() {
+	export NAMD_ENERGY_PROCESSES=$NAMD_ENERGY_PROCESSES_DYNAMIC
 	export VMDNOCUDA="on"
 	vmd -dispdev text -e namd_energy.dynamic.tcl
 	unset VMDNOCUDA
+	unset NAMD_ENERGY_PROCESSES
 }
 
 
@@ -29,7 +33,8 @@ run_namd_energy_dynamic() {
 export selection_water_hydration="water and (within 4.25 of protein)"
 export selection_water_bulk="water and not (within 5.0 of protein)"
 
-export NAMD_ENERGY_PROCESSES=6
+export NAMD_ENERGY_PROCESSES_STATIC=6
+export NAMD_ENERGY_PROCESSES_DYNAMIC=6
 
 # Run 1: Protein Self
 export NAMD_ENERGY_LABEL="Protein Self-Interaction Energy"
