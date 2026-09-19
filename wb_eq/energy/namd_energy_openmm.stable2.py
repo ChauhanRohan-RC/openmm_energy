@@ -14,8 +14,9 @@
 # ------------------------------------------------------------------------
 
 """
-TODO TEST: SLOPPY IMPLEMENTATION OF MULTIPROCESSING COMPUTE LOOP
-1. Extensive testing is needed
+TODO TEST: (seach for TEST)
+1. if RAM_READER_COUNT > 1, very high bottleneck (thread contention), especially with UPDATE_SELECTION
+2. severe PICe bottlenecks when USE_MASK = true (DYANMIC selections or high interaction pair count exceeding memory limit)
 """
 
 ## USAGE --------------------------------------------------
@@ -147,8 +148,7 @@ COMMENT_TOKEN = "#"
 # ==============================================
 # FRAME LOADING and PERFORMANCE
 # ==============================================
-NUM_COMPUTE_WORKERS = 4               # TODO TEST Number of parallel OpenMM Context processes (Scale up for dynamic modes)
-QUEUE_FRAME_COUNT = 50                # TODO TEST Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
+QUEUE_FRAME_COUNT = 500 if USE_GPU else 200       # Max allowed pending frames in queue. Frame Reading will stop if queue is full
 
 RAM_DISK_PATH = "/tmp/namd_energy.openmm"          # ram disk path to use
 RAM_LOADING_ENABLED: bool = False     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
@@ -249,13 +249,6 @@ import MDAnalysis as mda
 import openmm as mm
 from openmm import app, unit
 from scipy.spatial import cKDTree
-import multiprocessing as mp
-try:
-    # Force 'fork' to prevent catastrophic script re-execution on macOS/Windows spawn defaults
-    mp.set_start_method('fork', force=True)
-except Exception:
-    pass
-from multiprocessing import shared_memory
 
 # Logging ------------------------------
 def log_info(msg): print(f"\033[92m[INFO]\033[0m {msg}")
@@ -391,112 +384,6 @@ class FastDynamicSelector:
 
         return selected_actual_idx
 
-
-# =======================================================
-# ZERO-COPY SHARED MEMORY RING BUFFER (IPC Architecture)
-# =======================================================
-class SharedFrameBuffer:
-    """
-    Zero-Copy Inter-Process Communication (IPC) ring buffer.
-    Allocates contiguous RAM blocks to share coordinate and index arrays
-    across independent Python processes without Pickling/Serialization overhead.
-    """
-    TAG = "SharedFrameBuffer"
-
-    def __init__(self, num_slots: int, n_atoms: int, has_dyn_sel1: bool, has_dyn_sel2: bool, is_creator: bool = False):
-        self.num_slots = num_slots
-        self.n_atoms = n_atoms
-        self.has_dyn_sel1 = has_dyn_sel1
-        self.has_dyn_sel2 = has_dyn_sel2
-        self.is_creator = is_creator
-
-        self.shm_blocks = {}
-        self.arrays = {}
-
-        # Memory Optimization: Use float32 for coords and int32 for indices.
-        self.specs = {
-            'coords': ((num_slots, n_atoms, 3), np.float32),
-            'box': ((num_slots, 6), np.float32),
-            'meta': ((num_slots, 3), np.int64)  # Format: [abs_f, n1, n2]
-        }
-
-        # Memory Optimization: Only allocate arrays for selections that dynamically change
-        if self.has_dyn_sel1:
-            self.specs['sel1'] = ((num_slots, n_atoms), np.int32)
-        if self.has_dyn_sel2:
-            self.specs['sel2'] = ((num_slots, n_atoms), np.int32)
-
-        for name, (shape, dtype) in self.specs.items():
-            nbytes = math.prod(shape) * np.dtype(dtype).itemsize
-            shm_name = f"namd_energy_shm_{name}"
-
-            if self.is_creator:
-                try:
-                    # Clean up dangling shared memory from previous crashed runs
-                    shared_memory.SharedMemory(name=shm_name).unlink()
-                except FileNotFoundError:
-                    pass
-
-                log_debug(f"{self.TAG}: Allocating Shared RAM '{shm_name}' ({nbytes / (1024 ** 2):.2f} MB)")
-                shm = shared_memory.SharedMemory(create=True, name=shm_name, size=nbytes)
-            else:
-                shm = shared_memory.SharedMemory(name=shm_name)
-
-            self.shm_blocks[name] = shm
-            # Bind a NumPy view directly to the physical RAM block
-            self.arrays[name] = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
-
-        if self.is_creator:
-            # Token rings for safe concurrent access
-            self.free_slots = mp.Queue(maxsize=num_slots)
-            self.ready_slots = mp.Queue(maxsize=num_slots)
-            for i in range(num_slots):
-                self.free_slots.put(i)
-
-    def write_frame(self, slot_idx: int, abs_f: int, coords_nm: np.ndarray, box_nm: np.ndarray, arr_sel1: np.ndarray,
-                    arr_sel2: np.ndarray):
-        """Called by Reader Processes: Dumps extracted data directly into the shared RAM slot."""
-        n1 = len(arr_sel1) if arr_sel1 is not None else 0
-        n2 = len(arr_sel2) if arr_sel2 is not None else 0
-
-        self.arrays['meta'][slot_idx, 0] = abs_f
-        self.arrays['meta'][slot_idx, 1] = n1
-        self.arrays['meta'][slot_idx, 2] = n2
-
-        # Implicitly casts float64 coordinates to float32 natively
-        self.arrays['coords'][slot_idx] = coords_nm
-
-        if box_nm is not None:
-            self.arrays['box'][slot_idx, :len(box_nm)] = box_nm
-
-        if self.has_dyn_sel1 and n1 > 0:
-            self.arrays['sel1'][slot_idx, :n1] = arr_sel1
-        if self.has_dyn_sel2 and n2 > 0:
-            self.arrays['sel2'][slot_idx, :n2] = arr_sel2
-
-    def read_frame(self, slot_idx: int):
-        """Called by Compute Workers: Returns NumPy views sliced exactly to the dynamic selection lengths."""
-        abs_f = int(self.arrays['meta'][slot_idx, 0])
-        n1 = int(self.arrays['meta'][slot_idx, 1])
-        n2 = int(self.arrays['meta'][slot_idx, 2])
-
-        coords_nm = self.arrays['coords'][slot_idx]
-        box_nm = self.arrays['box'][slot_idx]
-
-        arr_sel1 = self.arrays['sel1'][slot_idx, :n1] if self.has_dyn_sel1 else None
-        arr_sel2 = self.arrays['sel2'][slot_idx, :n2] if self.has_dyn_sel2 else None
-
-        return abs_f, coords_nm, box_nm, arr_sel1, arr_sel2, n1, n2
-
-    def cleanup(self):
-        for name, shm in self.shm_blocks.items():
-            shm.close()
-            if self.is_creator:
-                try:
-                    shm.unlink()
-                    log_debug(f"{self.TAG}: Unlinked Shared RAM '{shm.name}'")
-                except Exception:
-                    pass
 
 
 # =======================================================
@@ -663,14 +550,11 @@ class IndexStreamBuffer:
 # ------------------------------------------------------------------------
 # GLOBAL VARIABLES
 # ------------------------------------------------------------------------
-shutdown_event: mp.Event = mp.Event()       # MAIN SHUTDOWN EVENT. use .is_set() and .set()
-SHUTDOWN_REQUESTED = True       # Only for reporting purposes
-
+SHUTDOWN_REQUESTED = False
 ACTIVE_RAM_FILES = set()
 RAM_FILES_LOCK = threading.Lock()
 
 index_stream_buffer: IndexStreamBuffer = None    # will initialize later
-shm_buffer_main: SharedFrameBuffer = None        # will initialize later
 
 # Time benchmarks
 t_app_start = time.perf_counter()
@@ -713,11 +597,6 @@ def cleanup_ramdisk():
 
 
 def cleanup():
-    # Safe fallback for Shared Memory cleanup if the script crashed early
-    shm_buf = shm_buffer_main
-    if shm_buf is not None:
-        shm_buf.cleanup()
-
     idx_streamer = index_stream_buffer
     if idx_streamer is not None and isinstance(idx_streamer, IndexStreamBuffer):
         log_info("Closing output file...")
@@ -730,12 +609,6 @@ def cleanup():
 # called on exit
 def handle_exit():
     global SHUTDOWN_REQUESTED
-
-    # CRITICAL: Prevent child processes from executing parent cleanup routines!
-    if mp.current_process().name != 'MainProcess':
-        return
-
-    shutdown_event.set()
     SHUTDOWN_REQUESTED = True
 
     print("")
@@ -744,17 +617,12 @@ def handle_exit():
 
 def handle_os_signal(signum, frame):
     global SHUTDOWN_REQUESTED
-
-    # CRITICAL: Prevent child processes from executing parent cleanup routines!
-    if mp.current_process().name != 'MainProcess':
-        return
-
-    shutdown_event.set()
     SHUTDOWN_REQUESTED = True
 
     sig_name = signal.Signals(signum).name
     print("")
     log_warn(f"Received OS Signal: {sig_name}. Initiating clean shutdown...")
+
 
 
 atexit.register(handle_exit)
@@ -1363,24 +1231,31 @@ if USE_GPU:
 
 
 # ------------------------------------------------------------------------
-# PRE-FORK MEMORY OPTIMIZATION & SYSTEM SERIALIZATION
+# OPENMM CONTEXT CREATION  (Memory intensive)
 # ------------------------------------------------------------------------
-log_info("Serializing OpenMM System for independent Worker deep-copies...\n")
-system_xml = mm.XmlSerializer.serialize(pair_system)
 
-log_info("Flushing parsed topology databases before forking Compute Workers...\n")
+# --- MEMORY OPTIMIZATION: PRE-CONTEXT FLUSH ---
+log_info("Flushing parsed topology databases to free RAM for Context allocation...\n")
 del base_system
 del psf
 del params
-del pair_system
-del vdw_force
-del elec_force
-del pme_recip_force
 
 u_init.trajectory.close()
 del u_init
 del u_init_ts
+# del u_init_coords; del u_init_dimensions
 gc.collect()  # force python gc
+
+log_info("Creating OpenMM Context...")
+if platform is None:
+    platform = mm.Platform.getPlatformByName('CPU')
+    properties = {'Threads': str(assigned_openmm_threads)}
+    platform_name = f"CPU ({assigned_openmm_threads} Threads)"
+    context = mm.Context(pair_system, mm.VerletIntegrator(1.0 * unit.femtoseconds), platform, properties)
+else:
+    context = mm.Context(pair_system, mm.VerletIntegrator(1.0 * unit.femtoseconds), platform)
+
+log_info(f"Initialized OpenMM Context on [{platform_name}]")
 
 # Extended Group Mapping
 group_map = {"vdw": 1, "elec": 2, "bond": 3, "angl": 4, "dihe": 5, "impr": 6}
@@ -1391,7 +1266,7 @@ active_fetches = [(1 << group_map[c], comp_idx[c]) for c in final_erg_components
 # =============================================================================
 # BACKGROUND PRODUCER PIPELINE
 # =============================================================================
-def parallel_reader_worker(shm_buffer, psf, dcd, start, stop, global_offset, step, shutdown_event):
+def parallel_reader_worker(q_main, psf, dcd, start, stop, global_offset, step):
     u, sel1, sel2 = None, None, None
     try:
         u = mda.Universe(psf, dcd)
@@ -1406,7 +1281,7 @@ def parallel_reader_worker(shm_buffer, psf, dcd, start, stop, global_offset, ste
         i_start = start
 
         for i in range(start, stop, step):
-            if shutdown_event.is_set(): break
+            if SHUTDOWN_REQUESTED: break
 
             ts = u.trajectory[i]
             abs_f = global_offset + ts.frame
@@ -1416,7 +1291,7 @@ def parallel_reader_worker(shm_buffer, psf, dcd, start, stop, global_offset, ste
             if FAST_DYNAMIC_SELECTION and UPDATE_SELECTION1:
                 arr1 = FAST_SEL1_OBJ.eval(u, PERIODIC)
             else:
-                arr1 = sel1.indices.copy()  # MDAnalysis updates it automatically when accessing indices
+                arr1 = sel1.indices.copy()      # MDAnalysis updates it automatically when accessing indices
 
             if not is_self_interaction:
                 if FAST_DYNAMIC_SELECTION and UPDATE_SELECTION2:
@@ -1431,31 +1306,17 @@ def parallel_reader_worker(shm_buffer, psf, dcd, start, stop, global_offset, ste
             coords_nm = u.atoms.positions / 10.0  # convert to nm for OpenMM
             box_nm = ts.triclinic_dimensions / 10.0 if PERIODIC else None  # convert to nm for OpenMM
 
-            # --- PHASE 2: ZERO-COPY SHARED MEMORY WRITE ---
-            slot_idx = None
-            while not shutdown_event.is_set():
+            while not SHUTDOWN_REQUESTED:
                 try:
-                    # Lease a free memory block from the ring buffer
-                    slot_idx = shm_buffer.free_slots.get(timeout=1.0)
+                    q_main.put((abs_f, coords_nm, box_nm, arr1, arr2), timeout=1.0)
                     break
-                except queue.Empty:
+                except queue.Full:
                     continue
-
-            if shutdown_event.is_set() or slot_idx is None:
-                break
-
-            # Dump data directly into raw RAM
-            shm_buffer.write_frame(slot_idx, abs_f, coords_nm, box_nm, arr1, arr2)
-
-            # Notify Compute Workers that this memory block is ready
-            shm_buffer.ready_slots.put(slot_idx)
-            # ----------------------------------------------
 
             # DEBUG : benchmark frame load times (includes Queue Wait times)
             if DEBUG and (i - i_start) > 0 and (i - i_start) % PROGRESS_REPORT_INTERVAL_FRAMES == 0:
                 t_end = time.perf_counter()
-                log_debug(
-                    f"FRAME_READER {start // (stop - start)}: {round(float(i - i_start) / step) / (t_end - t_start):.2f} fps")
+                log_debug(f"FRAME_READER {start // (stop - start)}: {round(float(i - i_start) / step) / (t_end - t_start):.2f} fps")
                 t_start = t_end
                 i_start = i
     finally:
@@ -1469,7 +1330,7 @@ def parallel_reader_worker(shm_buffer, psf, dcd, start, stop, global_offset, ste
         gc.collect()
 
 
-def catdcd_chunk_loader(dcd_file, total_frames, chunk_frames, q_chunks, shutdown_event):
+def catdcd_chunk_loader(dcd_file, total_frames, chunk_frames, q_chunks):
     global t_ram_load_total
     file_size = os.path.getsize(dcd_file)
     bytes_per_frame = file_size / total_frames if total_frames > 0 else 0
@@ -1477,18 +1338,18 @@ def catdcd_chunk_loader(dcd_file, total_frames, chunk_frames, q_chunks, shutdown
     current_start = 1
     base_name = os.path.splitext(os.path.basename(dcd_file))[0]
 
-    while frames_remaining > 0 and not shutdown_event.is_set():
+    while frames_remaining > 0 and not SHUTDOWN_REQUESTED:
         this_chunk_frames = min(chunk_frames, frames_remaining)
         current_last = current_start + this_chunk_frames - 1
         est_bytes = this_chunk_frames * bytes_per_frame
         margin_bytes = (RAM_SAFETY_MARGIN_GB + RAM_EXTRA_MARGIN_GB) * 1024 ** 3
 
-        while not shutdown_event.is_set():
+        while not SHUTDOWN_REQUESTED:
             free_space = shutil.disk_usage(RAM_DISK_PATH).free
             if free_space > (est_bytes + margin_bytes): break
             time.sleep(1.0)
 
-        if shutdown_event.is_set(): break
+        if SHUTDOWN_REQUESTED: break
 
         unique_suffix = uuid.uuid4().hex[:8]
         temp_name = os.path.join(RAM_DISK_PATH, f"{base_name}_chunk_{unique_suffix}.dcd")
@@ -1499,12 +1360,12 @@ def catdcd_chunk_loader(dcd_file, total_frames, chunk_frames, q_chunks, shutdown
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         while proc.poll() is None:
-            if shutdown_event.is_set():
+            if SHUTDOWN_REQUESTED:
                 proc.terminate()
                 break
             time.sleep(0.5)
 
-        if shutdown_event.is_set():
+        if SHUTDOWN_REQUESTED:
             if os.path.exists(temp_name): os.remove(temp_name)
             break
 
@@ -1521,12 +1382,11 @@ def catdcd_chunk_loader(dcd_file, total_frames, chunk_frames, q_chunks, shutdown
     q_chunks.put(None)
 
 
-def disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event):
-    parallel_reader_worker(shm_buffer, PSF_FILE, dcd_file, 0, total_frames, global_frame_offset, FRAME_STEP,
-                           shutdown_event)
+def disk_stream_blocking(q_main, dcd_file, total_frames, global_frame_offset):
+    parallel_reader_worker(q_main, PSF_FILE, dcd_file, 0, total_frames, global_frame_offset, FRAME_STEP)
 
 
-def ramdisk_read_blocking(shm_buffer, temp_dcd, num_frames, global_frame_offset, shutdown_event):
+def ramdisk_read_blocking(q_main, temp_dcd, num_frames, global_frame_offset):
     threads = []
     c_size = math.ceil(num_frames / actual_ram_reader_threads)
     for i in range(actual_ram_reader_threads):
@@ -1534,8 +1394,7 @@ def ramdisk_read_blocking(shm_buffer, temp_dcd, num_frames, global_frame_offset,
         stop = min((i + 1) * c_size, num_frames)
         if start >= stop: continue
         t = threading.Thread(target=parallel_reader_worker,
-                             args=(shm_buffer, PSF_FILE, temp_dcd, start, stop, global_frame_offset, FRAME_STEP,
-                                   shutdown_event))
+                             args=(q_main, PSF_FILE, temp_dcd, start, stop, global_frame_offset, FRAME_STEP))
         t.daemon = True
         threads.append(t)
         t.start()
@@ -1543,13 +1402,14 @@ def ramdisk_read_blocking(shm_buffer, temp_dcd, num_frames, global_frame_offset,
     for t in threads: t.join()
 
 
-def master_producer(shm_buffer, shutdown_event):
+def master_producer(q_main):
     global t_ram_load_total
+    global SHUTDOWN_REQUESTED
 
     try:
         global_frame_offset = 0
         for dcd_file in DCD_FILES:
-            if shutdown_event.is_set():
+            if SHUTDOWN_REQUESTED:
                 break
 
             base_name = os.path.splitext(os.path.basename(dcd_file))[0]
@@ -1566,7 +1426,7 @@ def master_producer(shm_buffer, shutdown_event):
             # Logic for determining Loader Strategy
             if not RAM_LOADING_ENABLED:
                 log_info(f"RAM Loading Disabled. Streaming {base_name} from Disk...")
-                disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
+                disk_stream_blocking(q_main, dcd_file, total_frames, global_frame_offset)
                 global_frame_offset += total_frames
                 continue
 
@@ -1586,12 +1446,12 @@ def master_producer(shm_buffer, shutdown_event):
                     t_ram_load_total += (time.perf_counter() - t0)
 
                     register_ram_file(temp_dcd)
-                    ramdisk_read_blocking(shm_buffer, temp_dcd, total_frames, global_frame_offset, shutdown_event)
+                    ramdisk_read_blocking(q_main, temp_dcd, total_frames, global_frame_offset)
                     unregister_ram_file(temp_dcd)
                 elif not RAM_CHUNK_MODE:
                     log_warn(
                         f"Insufficient RAM for direct copy of {os.path.basename(dcd_file)}. Falling back to disk streaming.")
-                    disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
+                    disk_stream_blocking(q_main, dcd_file, total_frames, global_frame_offset)
 
                 global_frame_offset += total_frames
                 continue
@@ -1604,7 +1464,7 @@ def master_producer(shm_buffer, shutdown_event):
                 if not RAM_CHUNK_DYNAMIC:
                     log_warn(
                         f"Insufficient RAM and Dynamic Chunking is disabled. Falling back to Disk Streaming for {os.path.basename(dcd_file)}.")
-                    disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
+                    disk_stream_blocking(q_main, dcd_file, total_frames, global_frame_offset)
                     global_frame_offset += total_frames
                     continue
 
@@ -1615,7 +1475,7 @@ def master_producer(shm_buffer, shutdown_event):
                 if resized_frames < RAM_CHUNK_MIN_FRAMES:
                     log_warn(f"Dynamic chunk size ({resized_frames}) below MIN_CHUNK_FRAMES ({RAM_CHUNK_MIN_FRAMES}).")
                     log_warn(f"Falling back to Disk Streaming for {os.path.basename(dcd_file)}.")
-                    disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
+                    disk_stream_blocking(q_main, dcd_file, total_frames, global_frame_offset)
                     global_frame_offset += total_frames
                     continue
 
@@ -1625,19 +1485,17 @@ def master_producer(shm_buffer, shutdown_event):
             log_info(f"Mode: LOADER 2 (catdcd Chunking with {active_chunk_frames} frames/chunk)")
             q_chunks = queue.Queue(maxsize=2)
             chunk_mgr_thread = threading.Thread(target=catdcd_chunk_loader,
-                                                args=(
-                                                dcd_file, total_frames, active_chunk_frames, q_chunks, shutdown_event))
+                                                args=(dcd_file, total_frames, active_chunk_frames, q_chunks))
             chunk_mgr_thread.daemon = True
             chunk_mgr_thread.start()
 
             chunk_frame_offset = 0
-            while not shutdown_event.is_set():
+            while not SHUTDOWN_REQUESTED:
                 chunk_data = q_chunks.get()
                 if chunk_data is None: break
                 temp_dcd, n_frames = chunk_data
 
-                ramdisk_read_blocking(shm_buffer, temp_dcd, n_frames, global_frame_offset + chunk_frame_offset,
-                                      shutdown_event)
+                ramdisk_read_blocking(q_main, temp_dcd, n_frames, global_frame_offset + chunk_frame_offset)
                 chunk_frame_offset += n_frames
                 unregister_ram_file(temp_dcd)
 
@@ -1645,16 +1503,16 @@ def master_producer(shm_buffer, shutdown_event):
             global_frame_offset += total_frames
 
     except Exception as e:
-        shutdown_event.set()
+        SHUTDOWN_REQUESTED = True
         traceback.print_exc()
         log_error(f"Producer thread crashed: {e}")
     finally:
-        # Push EOF termination tokens downstream to gracefully halt all Compute Workers
-        for _ in range(NUM_COMPUTE_WORKERS):
+        while not SHUTDOWN_REQUESTED:
             try:
-                shm_buffer.ready_slots.put(None, timeout=1.0)
-            except Exception:
-                pass
+                q_main.put(None, timeout=1.0)
+                break
+            except queue.Full:
+                continue
 
 
 
@@ -1778,255 +1636,6 @@ def create_output_erg_line(erg_row) -> str:
     return OUT_DELIMITER.join(out_row) + "\n"
 
 
-# =============================================================================
-# INDEPENDENT COMPUTE WORKER (Multiprocessed)
-# =============================================================================
-def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_xml):
-    """
-    Standalone Compute Worker Process.
-    Instantiates its own OpenMM Context and reads Zero-Copy frames from shared memory.
-    """
-    # Ignore OS signals in child processes; let the parent handle them cleanly
-    import signal
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-
-    # 1. Deep-copy the C++ System to prevent SWIG pointer race conditions!
-    local_pair_system = mm.XmlSerializer.deserialize(system_xml)
-
-    # Extract independent force pointers from the local system
-    local_vdw_force, local_elec_force, local_pme_force = None, None, None
-    for f in local_pair_system.getForces():
-        if f.getForceGroup() == 1:
-            local_vdw_force = f
-        elif f.getForceGroup() == 2:
-            local_elec_force = f
-        elif f.getForceGroup() == 7:
-            local_pme_force = f
-
-    # Localize platform initialization to prevent CUDA Fork crashes
-    platform = None
-    properties = {}
-    if USE_GPU:
-        for plat_name in ['CUDA', 'HIP', 'OpenCL']:
-            try:
-                platform = mm.Platform.getPlatformByName(plat_name)
-                break
-            except Exception:
-                continue
-
-    if platform is None:
-        platform = mm.Platform.getPlatformByName('CPU')
-        properties = {'Threads': str(assigned_openmm_threads)}
-
-    try:
-        context = mm.Context(local_pair_system, mm.VerletIntegrator(1.0 * unit.femtoseconds), platform, properties)
-    except Exception as e:
-        log_error(f"Worker {worker_id} failed to initialize OpenMM Context: {e}")
-        shutdown_event.set()
-        return
-
-    log_info(f"Worker {worker_id} initialized OpenMM Context on [{platform.getName()}]")
-
-    to_kcal = unit.kilocalorie_per_mole
-    to_kcal_A = unit.kilocalorie_per_mole / unit.angstrom
-
-    # SWIG ACCELERATOR
-    vdw_set = local_vdw_force.setParticleParameters
-    elec_set = local_elec_force.setParticleParameters
-    pme_set = local_pme_force.setParticleParameters if local_pme_force else None
-
-    pme_self_prefactor = 0.0
-    if PERIODIC and PME_ENABLED and is_elec_raw_requested and is_self_interaction:
-        pme_self_prefactor = - (138.935456 / DIELECTRIC) * (
-                    math.sqrt(-math.log(PME_TOLERANCE)) / (CUTOFF / 10.0) / math.sqrt(math.pi))
-
-    # HOT-LOOP OPTIMIZATION: Pre-cast static sets to NumPy arrays to bypass list() casting inside the loop
-    static_arr1 = np.array(list(static_sel1_idx_set), dtype=np.int32) if static_sel1_idx_set else np.array([],
-                                                                                                           dtype=np.int32)
-    static_arr2 = np.array(list(static_sel2_idx_set), dtype=np.int32) if static_sel2_idx_set else np.array([],
-                                                                                                           dtype=np.int32)
-
-    prev_idx_se11_set: set = set(static_sel1_idx_set) if IS_DYNAMIC else set()
-    prev_idx_sel2_set: set = set(static_sel2_idx_set) if (IS_DYNAMIC and not is_self_interaction) else set()
-    frames_processed = 0
-
-    while not shutdown_event.is_set():
-        try:
-            slot_idx = shm_buffer.ready_slots.get(timeout=1.0)
-        except queue.Empty:
-            continue
-
-        if slot_idx is None:
-            break  # EOF termination token received
-
-        # Zero-Copy Read from Shared RAM
-        abs_f, coords_nm, box_nm, arr_sel1, arr_sel2, n1, n2 = shm_buffer.read_frame(slot_idx)
-
-        # Fallback to baked global static NumPy arrays if a specific selection wasn't dynamic
-        curr_arr1 = arr_sel1 if arr_sel1 is not None else static_arr1
-        curr_arr2 = arr_sel2 if arr_sel2 is not None else static_arr2
-
-        if len(curr_arr1) == 0:
-            log_warn(f"Worker {worker_id}: SELECTION-1 Atom count 0 at frame {abs_f}")
-            shm_buffer.free_slots.put(slot_idx)
-            continue
-
-        context.setPositions(coords_nm)
-        if PERIODIC and box_nm is not None:
-            context.setPeriodicBoxVectors(box_nm[0], box_nm[1], box_nm[2])
-
-        if IS_DYNAMIC:
-            idx_set1_set = set(curr_arr1) if UPDATE_SELECTION1 else static_sel1_idx_set
-            idx_set2_set = idx_set1_set if is_self_interaction else (set(curr_arr2) - idx_set1_set) if UPDATE_SELECTION2 else static_sel2_idx_set
-
-            union_idx_sel1 = idx_set1_set ^ prev_idx_se11_set
-            union_idx_sel2 = idx_set2_set ^ prev_idx_sel2_set
-
-            # Prevent SWIG pointer corruption by strictly casting to native Python floats
-            for i in union_idx_sel1:
-                val = float(1.0 if i in idx_set1_set else 0.0)
-                q = float(dynamic_elec_q_cache_np[i])
-                vdw_tup = (float(dynamic_vdw_type_cache[i]), val) if nbfix_force else (
-                float(dynamic_vdw_sig_eps_cache[i, 0]), float(dynamic_vdw_sig_eps_cache[i, 1]), val)
-
-                if is_self_interaction:
-                    vdw_set(i, vdw_tup)
-                    elec_set(i, (q, val))
-                    if pme_set: pme_set(i, float(q * val), 1.0, 0.0)
-                else:
-                    s2_val = float(1.0 if i in idx_set2_set else 0.0)
-                    vdw_set(i, vdw_tup + (s2_val,))
-                    elec_set(i, (q, val, s2_val))
-                    if pme_set: pme_set(i, float(q * max(val, s2_val)), 1.0, 0.0)
-
-            if not is_self_interaction:
-                for i in union_idx_sel2.difference(union_idx_sel1):
-                    q = float(dynamic_elec_q_cache_np[i])
-                    s2_val = float(1.0 if i in idx_set2_set else 0.0)
-                    s1_val = float(1.0 if i in idx_set1_set else 0.0)
-
-                    vdw_tup = (float(dynamic_vdw_type_cache[i]), s1_val, s2_val) if nbfix_force else (
-                    float(dynamic_vdw_sig_eps_cache[i, 0]), float(dynamic_vdw_sig_eps_cache[i, 1]), s1_val, s2_val)
-                    vdw_set(i, vdw_tup)
-                    elec_set(i, (q, s1_val, s2_val))
-                    if pme_set: pme_set(i, float(q * max(s1_val, s2_val)), 1.0, 0.0)
-
-            local_vdw_force.updateParametersInContext(context)
-            local_elec_force.updateParametersInContext(context)
-            if local_pme_force:
-                local_pme_force.updateParametersInContext(context)
-
-            prev_idx_se11_set = idx_set1_set
-            prev_idx_sel2_set = idx_set2_set
-
-        # Query Energies
-        erg_raw = np.zeros(len(group_map), dtype=np.float64)
-        for mask, idx in active_fetches:
-            erg_raw[idx] = context.getState(getEnergy=True, groups=mask).getPotentialEnergy().value_in_unit(to_kcal)
-
-        # PME Subtraction block
-        f_pme_cross_raw = None
-        if PERIODIC and PME_ENABLED and is_elec_raw_requested:
-            if is_self_interaction:
-                state_recip = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
-                e_recip = state_recip.getPotentialEnergy().value_in_unit(to_kcal)
-
-                if is_dynamic_elec_q_cache_needed:
-                    sel1_q_sq_sum = np.sum(dynamic_elec_q_cache_np[curr_arr1] ** 2)
-                else:
-                    sel1_q_sq_sum = sum(float(dynamic_elec_q_cache_np[i]) ** 2 for i in curr_arr1)
-
-                pme_self = - pme_self_prefactor * sel1_q_sq_sum
-                erg_raw[comp_idx["elec"]] += (e_recip + pme_self)
-                if OUT_FORCE:
-                    f_pme_cross_raw = state_recip.getForces(asNumpy=True).value_in_unit(to_kcal_A)
-            else:
-                if IS_DYNAMIC:
-                    st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
-                    only_sel1 = idx_set1_set - idx_set2_set
-                    only_sel2 = idx_set2_set - idx_set1_set
-
-                    for i in only_sel2: pme_set(i, 0.0, 1.0, 0.0)
-                    local_pme_force.updateParametersInContext(context)
-                    st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
-
-                    for i in only_sel2: pme_set(i, float(dynamic_elec_q_cache_np[i]), 1.0, 0.0)
-                    for i in only_sel1: pme_set(i, 0.0, 1.0, 0.0)
-                    local_pme_force.updateParametersInContext(context)
-                    st_B = context.getState(getEnergy=True, groups=(1 << 7))
-
-                    for i in only_sel1: pme_set(i, float(dynamic_elec_q_cache_np[i]), 1.0, 0.0)
-                    local_pme_force.updateParametersInContext(context)
-                else:
-                    context.setParameter("lambda_1", 1.0)
-                    context.setParameter("lambda_2", 1.0)
-                    st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
-                    context.setParameter("lambda_1", 1.0)
-                    context.setParameter("lambda_2", 0.0)
-                    st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
-                    context.setParameter("lambda_1", 0.0)
-                    context.setParameter("lambda_2", 1.0)
-                    st_B = context.getState(getEnergy=True, groups=(1 << 7))
-
-                e_AB = st_AB.getPotentialEnergy().value_in_unit(to_kcal)
-                e_A = st_A.getPotentialEnergy().value_in_unit(to_kcal)
-                e_B = st_B.getPotentialEnergy().value_in_unit(to_kcal)
-                erg_raw[comp_idx["elec"]] += (e_AB - e_A - e_B)
-
-                if OUT_FORCE:
-                    f_pme_cross_raw = st_AB.getForces(asNumpy=True).value_in_unit(to_kcal_A) - st_A.getForces(
-                        asNumpy=True).value_in_unit(to_kcal_A)
-
-        force_components = None
-        force_mags = None
-        if OUT_FORCE:
-            f_ele_raw = context.getState(getForces=True, groups=(1 << 2)).getForces(asNumpy=True).value_in_unit(
-                to_kcal_A)
-            f_vdw_raw = context.getState(getForces=True, groups=(1 << 1)).getForces(asNumpy=True).value_in_unit(
-                to_kcal_A)
-            if f_pme_cross_raw is not None:
-                f_ele_raw += f_pme_cross_raw
-            f_ele_comp = np.sum(f_ele_raw[curr_arr1], axis=0)
-            f_vdw_comp = np.sum(f_vdw_raw[curr_arr1], axis=0)
-
-            f_ele_mag = np.linalg.norm(f_ele_comp)
-            f_vdw_mag = np.linalg.norm(f_vdw_comp)
-            if TOTAL_FORCE_VECTOR_SUM:
-                f_tot_mag = np.linalg.norm(f_ele_comp + f_vdw_comp)
-            else:
-                f_tot_mag = f_ele_mag + f_vdw_mag
-
-            force_mags = [f_ele_mag, f_vdw_mag, f_tot_mag]
-            if OUT_FORCE_COMPONENTS:
-                force_components = [f_ele_comp, f_vdw_comp]
-
-        # Format the output string instantly to offload string concat CPU overhead
-        out_str = create_output_erg_line((abs_f, n1 if UPDATE_SELECTION1 else None, n2 if UPDATE_SELECTION2 else None,
-                                          erg_raw, force_mags, force_components))
-
-        # Push formatted string to lightweight output queue
-        try:
-            out_q.put((abs_f, out_str))
-        except Exception:
-            pass
-
-        # Release the slot back to the Reader Pool
-        shm_buffer.free_slots.put(slot_idx)
-
-        frames_processed += 1
-        if MANUAL_GC_ENABLED and IS_DYNAMIC and frames_processed % MANUAL_GC_INTERVAL_FRAMES == 0:
-            gc.collect()
-
-    # Tell the Main Orchestrator this worker has gracefully terminated
-    try: out_q.put(None)
-    except Exception: pass
-
-    # Worker shutdown cleanup
-    try: del context
-    except Exception: pass
-
-
 # -----------------------------------------------------------------------------
 # OUTPUT file and IndexStreamBuffer Setup
 # -----------------------------------------------------------------------------
@@ -2047,88 +1656,233 @@ out_file_path = f"{OUT_FILE_PREFIX}.energy.csv"
 index_stream_buffer = IndexStreamBuffer(output_file_path=out_file_path,
                                         chunk_size=INDEX_STREAM_BUFFER_CHUNK_SIZE,
                                         keep_file_open=INDEX_STREAM_BUFFER_ALWAYS_OPEN,
-                                        string_converter_callback=lambda x: x,  # already a string
+                                        string_converter_callback=create_output_erg_line,
                                         pre_chunk_write_callback=_on_index_streamer_pre_chunk_write,
                                         post_chunk_write_callback=_on_index_streamer_post_chunk_write)
 
+
 # =============================================================================
-# MAIN ORCHESTRATOR & IPC CONSUMER LOOP (Phase 4)
+# COMPUTE CONSUMER LOOP
 # =============================================================================
-log_info(f"Allocating Zero-Copy Shared Memory Ring Buffer ({QUEUE_FRAME_COUNT} slots)...")
+frame_queue: queue.Queue = queue.Queue(maxsize=QUEUE_FRAME_COUNT)
+to_kcal = unit.kilocalorie_per_mole
+to_kcal_A = unit.kilocalorie_per_mole / unit.angstrom
 
-# Creator allocates the physical RAM. Forked children inherit handles instantly.
-shm_buffer_main = SharedFrameBuffer(
-    num_slots=QUEUE_FRAME_COUNT,
-    n_atoms=total_atom_count,
-    has_dyn_sel1=UPDATE_SELECTION1,
-    has_dyn_sel2=not is_self_interaction and UPDATE_SELECTION2,
-    is_creator=True
-)
+# Start reading frames
+io_thread = threading.Thread(target=master_producer, args=(frame_queue,))
+io_thread.daemon = True
+io_thread.start()
 
-out_q = mp.Queue()
+# ---------------- COMPUTE START ----------------
+# selection index trackers in dynamic mode
+prev_idx_se11_set: set = set()
+prev_idx_sel2_set: set = set()
 
-log_info(f"Spawning {NUM_COMPUTE_WORKERS} Independent Compute Workers...")
-workers = []
-for i in range(NUM_COMPUTE_WORKERS):
-    p = mp.Process(target=compute_worker_process, args=(i + 1, shm_buffer_main, out_q, shutdown_event, system_xml))
-    p.start()
-    workers.append(p)
-
-log_info("Starting Background Frame Reader Pipeline...")
-producer_process = mp.Process(target=master_producer, args=(shm_buffer_main, shutdown_event))
-producer_process.start()
-
-# ---------------- MAIN THREAD STRING CONSUMER ----------------
 frames_processed = 0
 t_compute_start = time.perf_counter()
+log_info(f"Compute Engine [{platform_name}] is consuming frames...")
+
+# --- MANUAL GC SETUP ---
+next_manual_gc_frames = MANUAL_GC_INTERVAL_FRAMES
+
+# --- PROGRESS TRACKER SETUP ---
 next_progress_report_frames = PROGRESS_REPORT_INTERVAL_FRAMES
 t_last_progress_report = time.perf_counter()
 
-log_info("Main Orchestrator is listening for computed frames...")
+# SWIG ACCELERATOR: Localize method pointers to bypass Python object dictionary lookups inside the hot loop
+vdw_set = vdw_force.setParticleParameters
+elec_set = elec_force.setParticleParameters
+pme_set = pme_recip_force.setParticleParameters if (PERIODIC and PME_ENABLED) else None
 
-active_workers = NUM_COMPUTE_WORKERS
-while active_workers > 0 and not shutdown_event.is_set():
+pme_self_prefactor = - (138.935456 / DIELECTRIC) * (ewald_beta / math.sqrt(math.pi))
+
+while not SHUTDOWN_REQUESTED:
+    t0_wait = time.perf_counter()
     try:
-        # Poll the lightweight string queue
-        msg = out_q.get(timeout=1.0)
+        payload = frame_queue.get(timeout=1.0)
+        t_io_wait_total += (time.perf_counter() - t0_wait)
     except queue.Empty:
-        # Safely catch deadlocks if producer/workers crash
-        if not producer_process.is_alive() and shm_buffer_main.ready_slots.empty() and out_q.empty():
-            log_warn("Producer or Workers died unexpectedly. Initiating shutdown.")
-            shutdown_event.set()
-            SHUTDOWN_REQUESTED = True
+        t_io_wait_total += (time.perf_counter() - t0_wait)
         continue
 
-    if msg is None:
-        active_workers -= 1
+    if payload is None: break
+
+    abs_f, coords_nm, box_nm, arr_sel1, arr_sel2 = payload
+    n1, n2 = len(arr_sel1), len(arr_sel2) if not is_self_interaction else 0
+    if n1 == 0:
+        log_warn(f"SELECTION-1 Atom count 0 at frame {abs_f}")
         continue
 
-    abs_f, out_str = msg
+    context.setPositions(coords_nm)
+    if PERIODIC:
+        context.setPeriodicBoxVectors(box_nm[0], box_nm[1], box_nm[2])
 
-    # Inject directly into the ordered buffer
-    index_stream_buffer.insert(index=int(abs_f / FRAME_STEP), value=out_str)
+    idx_set1_set: set = None
+    idx_set2_set: set = None
+    if IS_DYNAMIC:
+        idx_set1_set: set = set(arr_sel1)
+        idx_set2_set: set = idx_set1_set if is_self_interaction else (set(arr_sel2) - idx_set1_set)
+
+        union_idx_sel1: set = idx_set1_set ^ prev_idx_se11_set
+        union_idx_sel2: set = idx_set2_set ^ prev_idx_sel2_set
+
+        for i in union_idx_sel1:
+            val = 1.0 if i in idx_set1_set else 0.0
+            q = float(dynamic_elec_q_cache_np[i])
+            vdw_tup = (dynamic_vdw_type_cache[i], val) if nbfix_force else (dynamic_vdw_sig_eps_cache[i, 0], dynamic_vdw_sig_eps_cache[i, 1], val)
+
+            if is_self_interaction:
+                vdw_set(i, vdw_tup)
+                elec_set(i, (q, val))
+                if pme_set:
+                    pme_set(i, q * val, 1.0, 0.0)
+            else:
+                s2_val = 1.0 if i in idx_set2_set else 0.0
+                vdw_set(i, vdw_tup + (s2_val, ))
+                elec_set(i, (q, val, s2_val))
+                if pme_set:
+                    pme_set(i, q * max(val, s2_val), 1.0, 0.0)
+
+        if not is_self_interaction:
+            for i in union_idx_sel2.difference(union_idx_sel1):
+                q = float(dynamic_elec_q_cache_np[i])
+                s2_val = 1.0 if i in idx_set2_set else 0.0
+                s1_val = 1.0 if i in idx_set1_set else 0.0
+
+                vdw_tup = (dynamic_vdw_type_cache[i], s1_val, s2_val) if nbfix_force else (dynamic_vdw_sig_eps_cache[i, 0], dynamic_vdw_sig_eps_cache[i, 1], s1_val, s2_val)
+                vdw_set(i, vdw_tup)
+                elec_set(i, (q, s1_val, s2_val))
+                if pme_set:
+                    pme_set(i, q * max(s1_val, s2_val), 1.0, 0.0)
+
+        vdw_force.updateParametersInContext(context)
+        elec_force.updateParametersInContext(context)
+        if PERIODIC and PME_ENABLED:
+            pme_recip_force.updateParametersInContext(context)
+
+        prev_idx_se11_set = idx_set1_set
+        prev_idx_sel2_set = idx_set2_set
+
+    # Query Energies
+    erg_raw = np.zeros(len(group_map), dtype=np.float64)      # 6
+    for mask, idx in active_fetches:
+        erg_raw[idx] = context.getState(getEnergy=True, groups=mask).getPotentialEnergy().value_in_unit(to_kcal)
+
+    # --- PME Reciprocal Space 3-Pass Subtraction ---
+    f_pme_cross_raw = None
+    if PERIODIC and PME_ENABLED and is_elec_raw_requested:
+        if is_self_interaction:
+            state_recip = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+            e_recip = state_recip.getPotentialEnergy().value_in_unit(to_kcal)
+
+            if is_dynamic_elec_q_cache_needed:  # if we have cache
+                sel1_q_sq_sum = np.sum(dynamic_elec_q_cache_np[arr_sel1] ** 2)
+            else:
+                sel1_q_sq_sum = 0
+                for i in arr_sel1:
+                    sel1_q_sq_sum += nb_base.getParticleParameters(i)[0].value_in_unit(unit.elementary_charge) ** 2
+
+            pme_self = - pme_self_prefactor * sel1_q_sq_sum
+            erg_raw[comp_idx["elec"]] += (e_recip + pme_self)
+            if OUT_FORCE:
+                f_pme_cross_raw = state_recip.getForces(asNumpy=True).value_in_unit(to_kcal_A)
+        else:
+            if IS_DYNAMIC:
+                st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+                only_sel1 = idx_set1_set - idx_set2_set
+                only_sel2 = idx_set2_set - idx_set1_set
+
+                # Pass A:
+                for i in only_sel2:
+                    pme_set(i, 0.0, 1.0, 0.0)
+                pme_recip_force.updateParametersInContext(context)
+                st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+
+                # Pass B:
+                for i in only_sel2:
+                    pme_set(i, dynamic_elec_q_cache_np[i], 1.0, 0.0)
+                for i in only_sel1:
+                    pme_set(i, 0.0, 1.0, 0.0)
+                pme_recip_force.updateParametersInContext(context)
+                st_B = context.getState(getEnergy=True, groups=(1 << 7))
+
+                # Restore XOR AB state for next frame:
+                for i in only_sel1:
+                    pme_set(i, dynamic_elec_q_cache_np[i], 1.0, 0.0)
+                pme_recip_force.updateParametersInContext(context)
+            else:
+                context.setParameter("lambda_1", 1.0)
+                context.setParameter("lambda_2", 1.0)
+                st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+                context.setParameter("lambda_1", 1.0)
+                context.setParameter("lambda_2", 0.0)
+                st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+                context.setParameter("lambda_1", 0.0)
+                context.setParameter("lambda_2", 1.0)
+                st_B = context.getState(getEnergy=True, groups=(1 << 7))
+
+            e_AB = st_AB.getPotentialEnergy().value_in_unit(to_kcal)
+            e_A = st_A.getPotentialEnergy().value_in_unit(to_kcal)
+            e_B = st_B.getPotentialEnergy().value_in_unit(to_kcal)
+            erg_raw[comp_idx["elec"]] += (e_AB - e_A - e_B)  # PME self-energy perfectly cancels algebraically here!
+
+            if OUT_FORCE:
+                f_pme_cross_raw = st_AB.getForces(asNumpy=True).value_in_unit(to_kcal_A) - st_A.getForces(
+                    asNumpy=True).value_in_unit(to_kcal_A)
+
+    # Query Forces
+    force_components = None  # [elec_force_components, vdw_force_components]  # [elec_force_components, vdw_force_components]
+    force_mags = None  # [mag(elec_force), mag(vdw_force), mag(total_force)]
+    if OUT_FORCE:
+        f_ele_raw = context.getState(getForces=True, groups=(1 << 2)).getForces(asNumpy=True).value_in_unit(to_kcal_A)
+        f_vdw_raw = context.getState(getForces=True, groups=(1 << 1)).getForces(asNumpy=True).value_in_unit(to_kcal_A)
+        if f_pme_cross_raw is not None:
+            f_ele_raw += f_pme_cross_raw
+        f_ele_comp = np.sum(f_ele_raw[arr_sel1], axis=0)
+        f_vdw_comp = np.sum(f_vdw_raw[arr_sel1], axis=0)
+
+        f_ele_mag = np.linalg.norm(f_ele_comp)
+        f_vdw_mag = np.linalg.norm(f_vdw_comp)
+        if TOTAL_FORCE_VECTOR_SUM:
+            # vector sum. PHYSICALLY ACCURATE
+            f_tot_mag = np.linalg.norm(f_ele_comp + f_vdw_comp)
+        else:
+            # NOTE: sum of magnitudes. NOT PHYSICALLY ACCURATE
+            f_tot_mag = f_ele_mag + f_vdw_mag
+
+        force_mags = [f_ele_mag, f_vdw_mag, f_tot_mag]
+        if OUT_FORCE_COMPONENTS:
+            force_components = [f_ele_comp, f_vdw_comp]
+
+    # final data
+    index_stream_buffer.insert(index=int(abs_f / FRAME_STEP),
+                               value=(abs_f,
+                                    n1 if UPDATE_SELECTION1 else None,
+                                    n2 if UPDATE_SELECTION2 else None,
+                                    erg_raw,
+                                    force_mags,
+                                    force_components)
+                               )
+
+    # ------------------ Finalize ------------------------
     frames_processed += 1
+
+    # SWIG PROXY FLUSH (DYNAMIC MEMORY STABILIZATION)
+    if MANUAL_GC_ENABLED and IS_DYNAMIC and frames_processed == next_manual_gc_frames:
+        gc.collect()
+        next_manual_gc_frames += MANUAL_GC_INTERVAL_FRAMES
 
     # PROGRESS TRACKER EXECUTION
     if frames_processed == next_progress_report_frames:
         t_now = time.perf_counter()
         fps_current = PROGRESS_REPORT_INTERVAL_FRAMES / max(0.001, t_now - t_last_progress_report)
-        log_info(f"Progress: Processed {frames_processed} frames  |  Speed: {fps_current:.1f} fps")
+        log_info(
+            f"Progress: Processed {frames_processed} frames  |  Speed: {fps_current:.1f} fps  |  Queued Frames: {frame_queue.qsize()}")
         next_progress_report_frames += PROGRESS_REPORT_INTERVAL_FRAMES
         t_last_progress_report = t_now
 
 t_compute_total = time.perf_counter() - t_compute_start
-
-log_info("Shutting down IPC pipeline...")
-shutdown_event.set()
-
-# Safely join processes
-producer_process.join(timeout=5)
-for w in workers:
-    w.join(timeout=5)
-
-shm_buffer_main.cleanup()
-
+io_thread.join()
 
 
 # =============================================================================
