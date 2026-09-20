@@ -14,9 +14,9 @@
 # ------------------------------------------------------------------------
 
 """
-TODO TEST: SLOPPY IMPLEMENTATION OF MULTIPROCESSING COMPUTE LOOP
-1. Extensive testing is needed
-2. Stats (IO wait, init ... etc) needs to be reimplemented
+TODO TEST: ALMOST STABLE IMPLEMENTATION OF MULTIPROCESSING COMPUTE LOOP
+1. DONE: Extensive testing is needed
+2. TODO: Stats (IO wait, init ... etc) needs to be reimplemented around parallel Workers
 """
 
 ## USAGE --------------------------------------------------
@@ -73,7 +73,7 @@ def find_files(dir_path, prefix, suffix, min_num=None, max_num=None, sort_natura
 # =============================================================================
 # INPUT
 # =============================================================================
-USE_GPU = True  # Keep it True, Auto-fallback to CPU
+USE_GPU = True  # Keep it True, Auto-fallbacks to CPU
 
 PARAM_FILES = [
     "../../common/ff/par_all36m_prot.prm",
@@ -148,10 +148,9 @@ COMMENT_TOKEN = "#"
 # ==============================================
 # FRAME LOADING and PERFORMANCE
 # ==============================================
-# TODO TEST NUM_OPENMM_CONTEXTS: Number of OpenMM workers processes in parallel
 # -> Consume RAM and VRAM. Scale up for DYNAMIC Selections based on VRAM
 NUM_COMPUTE_WORKERS = 4
-QUEUE_FRAME_COUNT = 50                # TODO TEST Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
+QUEUE_FRAME_COUNT = 50                # Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
 
 RAM_DISK_PATH = "/tmp/namd_energy.openmm"          # ram disk path to use
 RAM_LOADING_ENABLED: bool = True     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
@@ -179,15 +178,15 @@ OPENMM_THREADS_PER_CONTEXT = 0        # Compute threads for each OpenMM context 
 DEBUG: bool = True
 PROGRESS_REPORT_INTERVAL_FRAMES: int = 100      # TEST num frames
 
-INDEX_STREAM_BUFFER_CHUNK_SIZE: int = 5000       # num of frames to hold the computed energy data in RAM
+INDEX_STREAM_BUFFER_CHUNK_SIZE: int = 2000       # num of frames to hold the computed energy data in RAM
 INDEX_STREAM_BUFFER_ALWAYS_OPEN: bool = True     # keep output file open
 
 # Optimize Memory: Force masking for large interaction pair count to avoid OOM crashes
 MAX_INTERACTION_PAIRS_IN_RAM = 250_000_000      # consumes 4-8 bytes per interaction pair
 INTERACTION_PAIR_MEMORY_MB = 8.0 / (1024 ** 2)  # memory (MiB) per interaction pair
 
-MANUAL_GC_ENABLED: bool = True
-MANUAL_GC_INTERVAL_FRAMES: int = 5000            # num frames
+MANUAL_GC_ENABLED: bool = True                  # Manual GC (DYNAMIC MODE ONLY)
+MANUAL_GC_INTERVAL_FRAMES: int = 5000           # num frames
 
 ## Experimental Features -----------
 ## experimental flag to tun off erfc(ewald_beta * r) factor in short range direct electrostatics
@@ -203,6 +202,8 @@ PME_TOLERANCE: float = 1e-6                      # NAMD default PME error tolera
 # MAIN
 # ==========================================================================
 
+print("\n\n")
+
 # Logging ------------------------------
 def log_info(msg): print(f"\033[92m[INFO]\033[0m {msg}")
 
@@ -214,7 +215,12 @@ def log_debug(msg):
     if DEBUG: print(f"\033[93m[DEBUG]\033[0m {msg}")
 
 
-def log_error(msg): print(f"\033[91m[ERROR]\033[0m {msg}"); sys.exit(1)
+def log_error(msg, exc=None):
+    if exc is not None:
+        import traceback
+        traceback.print_exception(exc)
+    print(f"\033[91m[ERROR]\033[0m {msg}")
+    sys.exit(1)
 
 
 # --------------------------------------------
@@ -223,15 +229,16 @@ def log_error(msg): print(f"\033[91m[ERROR]\033[0m {msg}"); sys.exit(1)
 # OpenMM Hardware Initialization (CUDA -> HIP -> OpenCL -> CPU)
 from openmm import Platform
 
-OMM_PLATFORM_NAME = "CPU"
-OMM_PLATFORM_DISPLAY_NAME = "CPU"
+OPENMM_PLATFORM_NAME = "CPU"
+OPENMM_PLATFORM_DISPLAY_NAME = "CPU"
+OPENMM_PLATFORM_PROPERTIES = {}
 if USE_GPU:
     _platform = None
     for gpu_plat_name in ['CUDA', 'HIP', 'OpenCL']:
         try:
             _platform = Platform.getPlatformByName(gpu_plat_name)
-            OMM_PLATFORM_NAME = gpu_plat_name
-            OMM_PLATFORM_DISPLAY_NAME = f"{gpu_plat_name} (GPU)"
+            OPENMM_PLATFORM_NAME = gpu_plat_name
+            OPENMM_PLATFORM_DISPLAY_NAME = f"{gpu_plat_name} (GPU)"
             break
         except Exception:
             continue
@@ -241,7 +248,7 @@ if USE_GPU:
     del _platform        # GC
     # gc.collect()
 
-log_info(f"Auto-detected OPENMM PLATFORM: {OMM_PLATFORM_DISPLAY_NAME}  |  USE_GPU={USE_GPU}")
+log_info(f"Auto-detected OPENMM PLATFORM: {OPENMM_PLATFORM_DISPLAY_NAME}  |  USE_GPU={USE_GPU}")
 
 if NUM_COMPUTE_WORKERS < 1:
     log_warn("Number of OpenMM contexts (compute workers) must be >= 1. Resetting to 1 context")
@@ -283,6 +290,11 @@ else:
     assigned_mda_threads = max(1, remaining_cores // actual_ram_reader_count)
     mda_alloc_mode = "Smart Auto"
 
+## FINALIZE THREAD ALLOCATION --------------
+# set OpenMM CPU mode Threads
+if OPENMM_PLATFORM_NAME == "CPU":
+    OPENMM_PLATFORM_PROPERTIES['Threads'] = str(assigned_openmm_threads)
+
 # Set OpenMP thread limit prior to loading C-extensions of MDAnalysis
 os.environ["OMP_NUM_THREADS"] = str(assigned_mda_threads)
 
@@ -291,7 +303,7 @@ os.environ["OMP_NUM_THREADS"] = str(assigned_mda_threads)
 if __name__ == '__main__':
     print("-" * 60)
     log_info(f"OPENMM CONFIGURATION (Compute Engine)")
-    log_info(f" => Platform    : {OMM_PLATFORM_DISPLAY_NAME}")
+    log_info(f" => Platform    : {OPENMM_PLATFORM_DISPLAY_NAME}")
     log_info(f" => Contexts    : {NUM_COMPUTE_WORKERS} (compute workers)")
     log_info(f" => CPU Threads : {assigned_openmm_threads}/context  ({openmm_alloc_mode})")
     print("-" * 60)
@@ -869,8 +881,7 @@ else:
 if not OUT_FORCE: OUT_FORCE_COMPONENTS = False
 
 if SWITCHDIST >= CUTOFF:
-    log_error(
-        f"Switching distance must be less than CUTOFF. Given Cutoff: {CUTOFF} Å, Switch dist: {SWITCHDIST} Å. Disabling switching")
+    log_error(f"Switching distance must be less than CUTOFF. Given Cutoff: {CUTOFF} Å, Switch dist: {SWITCHDIST} Å. Disabling switching")
     SWITCHDIST = 0.0  # disable switching
 
 HAS_SWITCHING = SWITCHDIST > 0 and SWITCHDIST < CUTOFF
@@ -975,7 +986,7 @@ if UPDATE_SELECTION1:
         try:
             FAST_SEL1_OBJ = FastDynamicSelector(SELECTION1, u_init)
         except ValueError as e:
-            log_error(str(e))
+            log_error(str(e), e)
 
 if not is_self_interaction and UPDATE_SELECTION2:
     if "around" not in SELECTION2.lower():
@@ -986,7 +997,7 @@ if not is_self_interaction and UPDATE_SELECTION2:
         try:
             FAST_SEL2_OBJ = FastDynamicSelector(SELECTION2, u_init)
         except ValueError as e:
-            log_error(str(e))
+            log_error(str(e), e)
 
 # Must reset this flag now
 IS_DYNAMIC = UPDATE_SELECTION1 or (not is_self_interaction and UPDATE_SELECTION2)
@@ -1728,12 +1739,9 @@ def master_producer(shm_buffer, shutdown_event):
             chunk_mgr_thread.join()
             global_frame_offset += total_frames
 
-    except Exception as e:
+    except Exception as exc:
         shutdown_event.set()
-
-        import traceback
-        traceback.print_exception(e)
-        log_error(f"Producer thread crashed: {e}")
+        log_error(f"Producer thread crashed: {exc}", exc)
     finally:
         # Push EOF termination tokens downstream to gracefully halt all Compute Workers
         for _ in range(NUM_COMPUTE_WORKERS):
@@ -1877,6 +1885,8 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
+    # log_info(f"WORKER {worker_id}: Initializing OpenMM Context on [{OPENMM_PLATFORM_DISPLAY_NAME}] ....")
+
     # Deep-copy the C++ System to prevent SWIG pointer race conditions!
     local_pair_system = mm.XmlSerializer.deserialize(system_xml)
 
@@ -1890,29 +1900,32 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
         elif f.getForceGroup() == FORCE_GROUP_PME_RECIP and isinstance(f, mm.NonbondedForce):
             local_pme_force = f
 
-    # Localize platform initialization to prevent CUDA Fork crashes
-    platform = None
-    properties = {}
-    if USE_GPU:
-        for plat_name in ['CUDA', 'HIP', 'OpenCL']:
-            try:
-                platform = mm.Platform.getPlatformByName(plat_name)
-                break
-            except Exception:
-                continue
+    ## Localize platform initialization to prevent CUDA Fork crashes
 
-    if platform is None:
-        platform = mm.Platform.getPlatformByName('CPU')
-        properties = {'Threads': str(assigned_openmm_threads)}
+    # platform = OMM_PLATFORM_NAME
+    # properties = {}
+    # if USE_GPU:
+    #     for plat_name in ['CUDA', 'HIP', 'OpenCL']:
+    #         try:
+    #             platform = mm.Platform.getPlatformByName(plat_name)
+    #             break
+    #         except Exception:
+    #             continue
+
+    # if platform is None or platform == 'CPU':
+    #     platform = mm.Platform.getPlatformByName('CPU')
+    #     properties = {'Threads': str(assigned_openmm_threads)}
 
     try:
-        context = mm.Context(local_pair_system, mm.VerletIntegrator(1.0 * unit.femtoseconds), platform, properties)
-    except Exception as e:
-        log_error(f"Worker {worker_id} failed to initialize OpenMM Context: {e}")
+        ## Just initialize previously detected platform
+        platform = mm.Platform.getPlatformByName(OPENMM_PLATFORM_NAME)
+        context = mm.Context(local_pair_system, mm.VerletIntegrator(1.0 * unit.femtoseconds), platform, OPENMM_PLATFORM_PROPERTIES)
+    except Exception as exc:
+        log_error(f"WORKER {worker_id}: Failed to initialize OpenMM Context on [{OPENMM_PLATFORM_DISPLAY_NAME}]: {exc}", exc)
         shutdown_event.set()
         return
 
-    log_info(f"Worker {worker_id} initialized OpenMM Context on [{platform.getName()}]")
+    log_info(f"WORKER {worker_id}: Initialized OpenMM Context on [{OPENMM_PLATFORM_DISPLAY_NAME}]")
 
     # Units
     to_kcal = unit.kilocalorie_per_mole
@@ -2064,7 +2077,7 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
                     f_pme_cross_raw = state_recip.getForces(asNumpy=True).value_in_unit(to_kcal_A)
             else:
                 if IS_DYNAMIC:
-                    st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+                    st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << FORCE_GROUP_PME_RECIP))
                     # only_sel1 = curr_arr1[~mask2[curr_arr1]]
                     only_sel1 = curr_arr1
                     # only_sel2 = actual_curr_arr2[~mask1[actual_curr_arr2]]
@@ -2143,6 +2156,7 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
 
         # SWIG PROXY FLUSH (DYNAMIC MEMORY STABILIZATION)
         if MANUAL_GC_ENABLED and IS_DYNAMIC and frames_processed == next_manual_gc_frames:
+            log_debug(f"WORKER {worker_id}: Manual garbage collection at frame {frames_processed}")
             gc.collect()
             next_manual_gc_frames += MANUAL_GC_INTERVAL_FRAMES
 
@@ -2232,11 +2246,26 @@ if __name__ == '__main__':
             # Poll the lightweight string queue
             msg = out_queue.get(timeout=1.0)
         except queue.Empty:
-            # Safely catch deadlocks if producer/workers crash
-            if not producer_process.is_alive() and shm_buffer_main.ready_slots.empty() and out_queue.empty():
-                log_warn("Producer or Workers died unexpectedly. Initiating shutdown.")
+            # Safely catch Worker crashes (e.g., OOM, Segfault)
+            # If a worker dies, it won't send its 'None' token, so active_omm_workers won't decrement.
+            alive_workers = sum(1 for w in workers if w.is_alive())
+            if alive_workers < active_omm_workers:
+                log_warn("One or more Compute Workers crashed unexpectedly. Initiating shutdown.")
                 shutdown_event.set()
                 SHUTDOWN_REQUESTED = True
+
+            # Safely catch Producer crashes
+            # If producer exits normally, exitcode is 0. Anything else means it crashed.
+            if not producer_process.is_alive() and producer_process.exitcode not in (0, None):
+                log_warn(f"Frame Producer crashed (Exit Code: {producer_process.exitcode}). Initiating shutdown.")
+                shutdown_event.set()
+                SHUTDOWN_REQUESTED = True
+
+            # # Safely catch deadlocks if producer/workers crash
+            # if not producer_process.is_alive() and shm_buffer_main.ready_slots.empty() and out_queue.empty():
+            #     log_warn("Producer or Workers died unexpectedly. Initiating shutdown.")
+            #     shutdown_event.set()
+            #     SHUTDOWN_REQUESTED = True
             continue
 
         if msg is None:
@@ -2284,7 +2313,7 @@ if __name__ == '__main__':
     print(f" Status               : {status_str}")
     print(f" Frames Processed     : {frames_processed}")
     print(f" Processing Speed     : {fps:.1f} frames/sec")
-    print(f" Compute Engine       : {OMM_PLATFORM_DISPLAY_NAME}")
+    print(f" Compute Engine       : {OPENMM_PLATFORM_DISPLAY_NAME}")
     print(f" Final Output File    : {out_file_path}")
     print("-" * 60)
     print(f" Total Wall Time      : {t_total:.1f} s")

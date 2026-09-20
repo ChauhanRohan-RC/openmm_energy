@@ -97,8 +97,8 @@ class IndexStreamBuffer:
             raise ValueError(f"{self.__class__.TAG}: Index must be greater than or equal to 0, given: {index}")
 
         with self._lock:
-            if DEBUG and index in self._data:
-                log_warn(f"{self.__class__.TAG}: INDEX {index} already present !!!")
+            # if DEBUG and index in self._data:
+            #     log_warn(f"{self.__class__.TAG}: INDEX {index} already present !!!")
 
             self._data[index] = value
             self._consider_flush_unsafe()
@@ -192,13 +192,13 @@ if __name__ == '__main__':
 
     idx_stream_buffer = IndexStreamBuffer(output_file_path="test_index_streamer.txt",
                                           chunk_size=9,
-                                          keep_file_open=True,
+                                          keep_file_open=False,
                                           # string_converter_callback=convert_to_str,
                                           pre_chunk_write_callback=on_pre_chunk_write,
                                           post_chunk_write_callback=on_post_chunk_write)
 
     import random
-    indices = list(range(0, 93))
+    indices = list(range(0, 9300))
     random.shuffle(indices)     # in place shuffle
     for i in indices:
         idx_stream_buffer.insert(i, f"VALUE LINE {i}\n")
