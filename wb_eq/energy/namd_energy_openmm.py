@@ -154,8 +154,8 @@ NUM_COMPUTE_WORKERS = 4
 QUEUE_FRAME_COUNT = 50                # TODO TEST Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
 
 RAM_DISK_PATH = "/tmp/namd_energy.openmm"          # ram disk path to use
-RAM_LOADING_ENABLED: bool = False     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
-RAM_READER_COUNT = 2                  # Concurrent readers for RAM chunks
+RAM_LOADING_ENABLED: bool = True     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
+RAM_READER_COUNT = 3                  # Concurrent readers for RAM chunks
 
 # Chunking to RAM (requires catdcd))
 RAM_CHUNK_MODE: bool = True           # Loads big DCD files to RAM_DISK in chunks
@@ -435,7 +435,7 @@ class FastDynamicSelector:
             # k=1 (only find the single nearest atom).
             # distance_upper_bound early-exits math if further than cutoff.
             # workers=-1 automatically multithreads across all CPU cores.
-            dists, _ = tree.query(pos_base, k=1, distance_upper_bound=self.cutoff, workers=-1)
+            dists, _ = tree.query(pos_base, k=1, distance_upper_bound=self.cutoff, workers=1)
 
             # 3. Create boolean mask (values > cutoff are returned as 'inf' by SciPy)
             valid_mask = dists <= self.cutoff
@@ -1220,12 +1220,8 @@ for i in range(N_ATOMS):
         dynamic_elec_q_cache_np[i] = c_val
 
     if USE_MASK:
-        if IS_DYNAMIC:
-            val1, val2 = 0.0, 0.0
-        else:
-            # Static Selections (self or cross): initializes valid masks permanently right here
-            val1 = 1.0 if i in static_sel1_idx_set else 0.0
-            val2 = 1.0 if (not is_self_interaction and i in static_sel2_idx_set) else 0.0
+        val1 = 1.0 if i in static_sel1_idx_set else 0.0
+        val2 = 1.0 if (not is_self_interaction and i in static_sel2_idx_set) else 0.0
 
         if is_self_interaction:
             vdw_force.addParticle((*vdw_params, val1))
@@ -1922,9 +1918,9 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
     to_kcal = unit.kilocalorie_per_mole
     to_kcal_A = unit.kilocalorie_per_mole / unit.angstrom
 
-    # Constants
-    NP_EMPTY_ARR_INT32 = np.array([], dtype=np.int32)
-    NP_EMPTY_ARR_INT32.setflags(write=False)    # immutable
+    # # Constants
+    # NP_EMPTY_ARR_INT32 = np.array([], dtype=np.int32)
+    # NP_EMPTY_ARR_INT32.setflags(write=False)    # immutable
 
     # Zero output cache
     zero_erg_arr = np.zeros(len(force_group_map), dtype=np.float64)
@@ -1941,18 +1937,18 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
         pme_self_prefactor = -(138.935456 / DIELECTRIC) * (math.sqrt(-math.log(PME_TOLERANCE)) / (CUTOFF / 10.0) / math.sqrt(math.pi))
 
     # HOT-LOOP OPTIMIZATION: Pre-cast static sets to NumPy arrays to bypass list() casting inside the loop
-    static_arr1 = np.array(list(static_sel1_idx_set), dtype=np.int32) if static_sel1_idx_set else NP_EMPTY_ARR_INT32
-    static_arr2 = np.array(list(static_sel2_idx_set), dtype=np.int32) if static_sel2_idx_set else NP_EMPTY_ARR_INT32
+    static_arr1 = np.array(list(static_sel1_idx_set), dtype=np.int32)
+    static_arr2 = np.array(list(static_sel2_idx_set), dtype=np.int32)
 
-    # prev_arr1 = static_arr1.copy() if IS_DYNAMIC else NP_EMPTY_ARR_INT32
-    # prev_arr2 = static_arr2.copy() if (IS_DYNAMIC and not is_self_interaction) else NP_EMPTY_ARR_INT32
-    prev_arr1 = NP_EMPTY_ARR_INT32
-    prev_arr2 = NP_EMPTY_ARR_INT32
+    prev_arr1 = static_arr1.copy() if IS_DYNAMIC else np.array([], dtype=np.int32)
+    prev_arr2 = static_arr2.copy() if IS_DYNAMIC else np.array([], dtype=np.int32)
+    # prev_arr1 = np.array([], dtype=np.int32)
+    # prev_arr2 = np.array([], dtype=np.int32)
 
     # O(1) Lookup Masks
     mask1 = np.array([], dtype=bool)
     mask2 = np.array([], dtype=bool)
-    if USE_MASK:
+    if IS_DYNAMIC:
         mask1 = np.zeros(N_ATOMS, dtype=bool)
         mask2 = np.zeros(N_ATOMS, dtype=bool)
 
@@ -1995,8 +1991,9 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
 
         actual_curr_arr2 = curr_arr2
         if IS_DYNAMIC:
-            if not is_self_interaction and UPDATE_SELECTION2:
-                # Mathematically preserve the non-overlap rule safely using NumPy
+            if not is_self_interaction:
+                # Mathematically preserve the non-overlap rule safely using NumPy.
+                # Even if sel2 is strictly static, it MUST dynamically shrink if a dynamic sel1 expands into it!
                 actual_curr_arr2 = np.setdiff1d(curr_arr2, curr_arr1, assume_unique=True)
 
             # Update O(1) Boolean Masks instantly
@@ -2006,8 +2003,9 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
                 mask2.fill(False)
                 mask2[actual_curr_arr2] = True
 
-            # Use C-optimized XOR to find exactly which atoms changed boundary states
-            changed1 = np.setxor1d(curr_arr1, prev_arr1, assume_unique=True) if UPDATE_SELECTION1 else NP_EMPTY_ARR_INT32
+            # Use C-optimized XOR to find exactly which atoms changed boundary states.
+            # If an array is static, its XOR against the previous frame will naturally be empty [].
+            changed1 = np.setxor1d(curr_arr1, prev_arr1, assume_unique=True)
 
             if is_self_interaction:
                 for i in changed1:
@@ -2021,7 +2019,7 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
                     elec_set(idx, (q, val))
                     if pme_set: pme_set(idx, q * val, 1.0, 0.0)
             else:
-                changed2 = np.setxor1d(actual_curr_arr2, prev_arr2, assume_unique=True) if UPDATE_SELECTION2 else NP_EMPTY_ARR_INT32
+                changed2 = np.setxor1d(actual_curr_arr2, prev_arr2, assume_unique=True)
                 all_changed = np.union1d(changed1, changed2)
 
                 for i in all_changed:
@@ -2041,11 +2039,11 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
             if local_pme_force:
                 local_pme_force.updateParametersInContext(context)
 
-            prev_arr1 = curr_arr1.copy()
-            # prev_arr1 = curr_arr1
+            # prev_arr1 = curr_arr1.copy()
+            prev_arr1 = curr_arr1
             if not is_self_interaction:
-                prev_arr2 = actual_curr_arr2.copy()
-                # prev_arr2 = actual_curr_arr2
+                # prev_arr2 = actual_curr_arr2.copy()
+                prev_arr2 = actual_curr_arr2
 
         # Query Energies
         erg_raw = np.zeros(len(force_group_map), dtype=np.float64)
@@ -2056,7 +2054,7 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
         f_pme_cross_raw = None
         if PERIODIC and PME_ENABLED and is_elec_raw_requested:
             if is_self_interaction:
-                state_recip = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+                state_recip = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << FORCE_GROUP_PME_RECIP))
                 e_recip = state_recip.getPotentialEnergy().value_in_unit(to_kcal)
 
                 sel1_q_sq_sum = np.sum(dynamic_elec_q_cache_np[curr_arr1] ** 2)
@@ -2067,31 +2065,32 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
             else:
                 if IS_DYNAMIC:
                     st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
-                    only_sel1 = curr_arr1[~mask2[curr_arr1]]
+                    # only_sel1 = curr_arr1[~mask2[curr_arr1]]
+                    only_sel1 = curr_arr1
                     # only_sel2 = actual_curr_arr2[~mask1[actual_curr_arr2]]
                     only_sel2 = actual_curr_arr2
 
                     for i in only_sel2: pme_set(int(i), 0.0, 1.0, 0.0)
                     local_pme_force.updateParametersInContext(context)
-                    st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+                    st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << FORCE_GROUP_PME_RECIP))
 
                     for i in only_sel2: pme_set(int(i), float(dynamic_elec_q_cache_np[i]), 1.0, 0.0)
                     for i in only_sel1: pme_set(int(i), 0.0, 1.0, 0.0)
                     local_pme_force.updateParametersInContext(context)
-                    st_B = context.getState(getEnergy=True, groups=(1 << 7))
+                    st_B = context.getState(getEnergy=True, groups=(1 << FORCE_GROUP_PME_RECIP))
 
                     for i in only_sel1: pme_set(int(i), float(dynamic_elec_q_cache_np[i]), 1.0, 0.0)
                     local_pme_force.updateParametersInContext(context)
                 else:
                     context.setParameter("lambda_1", 1.0)
                     context.setParameter("lambda_2", 1.0)
-                    st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+                    st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << FORCE_GROUP_PME_RECIP))
                     context.setParameter("lambda_1", 1.0)
                     context.setParameter("lambda_2", 0.0)
-                    st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
+                    st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << FORCE_GROUP_PME_RECIP))
                     context.setParameter("lambda_1", 0.0)
                     context.setParameter("lambda_2", 1.0)
-                    st_B = context.getState(getEnergy=True, groups=(1 << 7))
+                    st_B = context.getState(getEnergy=True, groups=(1 << FORCE_GROUP_PME_RECIP))
 
                 e_AB = st_AB.getPotentialEnergy().value_in_unit(to_kcal)
                 e_A = st_A.getPotentialEnergy().value_in_unit(to_kcal)
@@ -2105,8 +2104,8 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
         force_components = None
         force_mags = None
         if OUT_FORCE:
-            f_ele_raw = context.getState(getForces=True, groups=(1 << 2)).getForces(asNumpy=True).value_in_unit(to_kcal_A)
-            f_vdw_raw = context.getState(getForces=True, groups=(1 << 1)).getForces(asNumpy=True).value_in_unit(to_kcal_A)
+            f_ele_raw = context.getState(getForces=True, groups=(1 << FORCE_GROUP_ELEC)).getForces(asNumpy=True).value_in_unit(to_kcal_A)
+            f_vdw_raw = context.getState(getForces=True, groups=(1 << FORCE_GROUP_VDW)).getForces(asNumpy=True).value_in_unit(to_kcal_A)
             if f_pme_cross_raw is not None:
                 f_ele_raw += f_pme_cross_raw
 
