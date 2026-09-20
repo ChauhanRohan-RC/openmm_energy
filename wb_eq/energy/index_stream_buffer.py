@@ -2,14 +2,25 @@ import os
 import threading
 
 
+# =======================================================
+# IndexStreamBuffer
+# =======================================================
 class IndexStreamBuffer:
     """
     A data structure to write the values in order of indices
-    Since energy values can come in any order due to asynchronous namd calls
+
+    Data can come in any order asynchronously, and the job of this class is to look of
+    consecutive chunk of indices, and if found, write them to the output file and release memory
+
+    It is thread-safe, but not process safe (for that, replace threading.Lock with mp.Lock, will be slow)
+    .close() must be called to flush remaining indices safely.
 
     -> It stores mappings of index -> value in a dict
-    -> checks if a contiguous block of consecutive indices exists
-    -> dumps the block to file, and free up memory
+    -> checks if a contiguous chunk of consecutive indices exists
+    -> dumps the block to output file, and free up memory
+
+    See .insert(index: int, value: object)
+        .close()
     """
 
     TAG = "IndexStreamBuffer"
@@ -85,8 +96,12 @@ class IndexStreamBuffer:
         if index < 0:
             raise ValueError(f"{self.__class__.TAG}: Index must be greater than or equal to 0, given: {index}")
 
-        self._data[index] = value
-        self._consider_flush()
+        with self._lock:
+            if DEBUG and index in self._data:
+                log_warn(f"{self.__class__.TAG}: INDEX {index} already present !!!")
+
+            self._data[index] = value
+            self._consider_flush_unsafe()
 
     def __write_indices_to_fd(self, fd, indices_sorted, pre_string = None):
         # Pre string
@@ -120,7 +135,8 @@ class IndexStreamBuffer:
         if self.post_chunk_write_callback is not None:
             self.post_chunk_write_callback(chunk_index, indices_size)
 
-    def _consider_flush(self):
+    # NOT THREAD SAFE
+    def _consider_flush_unsafe(self):
         self._check_closed()
 
         while len(self._data) >= self.chunk_size:
@@ -129,10 +145,9 @@ class IndexStreamBuffer:
             if not range_exists:
                 return
 
-            with self._lock:
-                # write chunk to file
-                indices = range(self._next_index, self._next_index + self.chunk_size)
-                self._write_chunk_indices(indices, indices_size=self.chunk_size)
+            # write chunk to file
+            indices = range(self._next_index, self._next_index + self.chunk_size)
+            self._write_chunk_indices(indices, indices_size=self.chunk_size)
 
     def close(self):
         if self._is_closed:
@@ -141,7 +156,6 @@ class IndexStreamBuffer:
         with self._lock:
             if self._is_closed:
                 return
-
             self._is_closed = True
 
             # force flush remaining indices in order

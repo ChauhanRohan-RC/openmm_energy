@@ -165,8 +165,8 @@ RAM_EXTRA_MARGIN_GB = 0.1             # Extra buffer headroom (GiB)
 
 ## Thread controls
 # 0 = Smart Auto-Allocation, >0 = Override
-MDA_THREADS = 0                 # Threads per MDAnalysis reader instance (OpenMP)
-OPENMM_CPU_THREADS = 0          # Compute threads for OpenMM (applies only if running on CPU)
+MDA_THREADS_PER_READER = 0          # Threads per MDAnalysis reader instance (OpenMP)
+OPENMM_CPU_THREADS = 0              # Compute threads for each OpenMM context (applies only if running on CPU)
 
 
 
@@ -200,63 +200,6 @@ PME_TOLERANCE: float = 1e-6                      # NAMD default PME error tolera
 # MAIN
 # ==========================================================================
 
-# Thread Allocation -------------------------------------------------
-# Must be before all major imports
-sys_cores = os.cpu_count() or 4
-actual_ram_reader_threads = min(RAM_READER_COUNT, sys_cores)
-
-# Smart Thread Allocation Logic
-if OPENMM_CPU_THREADS > 0:
-    assigned_openmm_threads = OPENMM_CPU_THREADS
-    openmm_alloc_mode = "User Override"
-else:
-    if USE_GPU:
-        assigned_openmm_threads = 1
-    else:
-        assigned_openmm_threads = max(1, int(sys_cores * 0.75))
-    openmm_alloc_mode = "Smart Auto"
-
-if MDA_THREADS > 0:
-    assigned_mda_threads = MDA_THREADS
-    mda_alloc_mode = "User Override"
-else:
-    remaining_cores = max(1, sys_cores - assigned_openmm_threads)
-    assigned_mda_threads = max(1, remaining_cores // actual_ram_reader_threads)
-    mda_alloc_mode = "Smart Auto"
-
-# Set OpenMP thread limit prior to loading C-extensions
-os.environ["OMP_NUM_THREADS"] = str(assigned_mda_threads)
-# ---------------------------------------------------------------------
-
-# Imports (must be after thread allocation)
-import warnings
-warnings.filterwarnings("ignore", message=r".*DCDReader currently makes independent timesteps.*")
-import gc
-import time
-import queue
-import math
-import re
-import uuid
-import shutil
-import signal
-import atexit
-import threading
-import traceback
-from itertools import chain
-import subprocess
-import numpy as np
-import MDAnalysis as mda
-import openmm as mm
-from openmm import app, unit
-from scipy.spatial import cKDTree
-import multiprocessing as mp
-try:
-    # Force 'fork' to prevent catastrophic script re-execution on macOS/Windows spawn defaults
-    mp.set_start_method('fork', force=True)
-except Exception:
-    pass
-from multiprocessing import shared_memory
-
 # Logging ------------------------------
 def log_info(msg): print(f"\033[92m[INFO]\033[0m {msg}")
 
@@ -269,6 +212,123 @@ def log_debug(msg):
 
 
 def log_error(msg): print(f"\033[91m[ERROR]\033[0m {msg}"); sys.exit(1)
+
+
+# --------------------------------------------
+# HARDWARE INIT and CHECKS
+# --------------------------------------------
+# OpenMM Hardware Initialization (CUDA -> HIP -> OpenCL -> CPU)
+from openmm import Platform
+
+OMM_PLATFORM_NAME = "CPU"
+OMM_PLATFORM_DISPLAY_NAME = "CPU"
+if USE_GPU:
+    _platform = None
+    for gpu_plat_name in ['CUDA', 'HIP', 'OpenCL']:
+        try:
+            _platform = Platform.getPlatformByName(gpu_plat_name)
+            OMM_PLATFORM_NAME = gpu_plat_name
+            OMM_PLATFORM_DISPLAY_NAME = f"{gpu_plat_name} (GPU)"
+            break
+        except Exception:
+            continue
+    if _platform is None:
+        USE_GPU = False
+        log_warn("GPU requested but CUDA, HIP, and OpenCL are unavailable. Falling back to CPU.")
+    del _platform        # GC
+    # gc.collect()
+
+log_info(f"Auto-detected OPENMM PLATFORM: {OMM_PLATFORM_DISPLAY_NAME}  |  USE_GPU={USE_GPU}")
+
+if NUM_COMPUTE_WORKERS < 1:
+    log_warn("Number of OpenMM contexts (compute workers) must be >= 1. Resetting to 1 context")
+    NUM_COMPUTE_WORKERS = 1
+elif not USE_GPU and NUM_COMPUTE_WORKERS > 1:
+    log_warn("Multiple OpenMM contexts (compute workers) on CPU will severally stall. Resetting to 1 context")
+    NUM_COMPUTE_WORKERS = 1
+
+if USE_GPU and NUM_COMPUTE_WORKERS == 1:
+    log_warn("STALL_WARNING: GPU may stall with only 1 OpenMM context (compute worker). You may want to increase NUM_COMPUTE_WORKERS")
+
+
+# Thread Allocation ----------------------------------
+# Must be before all major imports
+SYS_CORES = os.cpu_count() or 4
+actual_ram_reader_count = max(min(RAM_READER_COUNT, SYS_CORES - 1), 1) if RAM_LOADING_ENABLED else 1
+
+# OpenMM Thread allocator (CPU only)
+openmm_alloc_mode = "Smart Auto"
+if USE_GPU:
+    assigned_openmm_threads = 1
+    if OPENMM_CPU_THREADS > 1:
+        log_info(f"Running OpenMM on GPU, IGNORING OPENMM_CPU_THREADS={OPENMM_CPU_THREADS}")
+else:
+    if OPENMM_CPU_THREADS > 0:
+        assigned_openmm_threads = OPENMM_CPU_THREADS
+        openmm_alloc_mode = "User Override"
+        if (assigned_openmm_threads * NUM_COMPUTE_WORKERS) > SYS_CORES:
+            log_warn(f"STALL WARNING: Running {NUM_COMPUTE_WORKERS} OpenMM context (compute workers) on CPU with {assigned_openmm_threads} threads/context, but system only has {SYS_CORES} threads")
+    else:
+        assigned_openmm_threads = max(1, int(SYS_CORES * 0.80 / NUM_COMPUTE_WORKERS))
+
+# MDA Thread Allocator
+if MDA_THREADS_PER_READER > 0:
+    assigned_mda_threads = MDA_THREADS_PER_READER
+    mda_alloc_mode = "User Override"
+else:
+    remaining_cores = max(1, SYS_CORES - assigned_openmm_threads)
+    assigned_mda_threads = max(1, remaining_cores // actual_ram_reader_count)
+    mda_alloc_mode = "Smart Auto"
+
+# Set OpenMP thread limit prior to loading C-extensions of MDAnalysis
+os.environ["OMP_NUM_THREADS"] = str(assigned_mda_threads)
+
+
+# Logging
+if __name__ == '__main__':
+    print("-" * 40)
+    log_info(f"OPENMM CONFIGURATION (Compute Engine)")
+    log_info(f" => Platform    : {OMM_PLATFORM_DISPLAY_NAME}")
+    log_info(f" => Contexts    : {NUM_COMPUTE_WORKERS} (compute workers)")
+    log_info(f" => CPU Threads : {assigned_openmm_threads}/context  ({openmm_alloc_mode})")
+    print("-" * 20)
+    log_info(f"MDAnalysis CONFIGURATION (Frame Reader)")
+    log_info(f" => RAM Loading : {f'ON  (Chunking: {RAM_CHUNK_MODE})' if RAM_LOADING_ENABLED else 'OFF'}")
+    log_info(f" => Readers     : {f'{actual_ram_reader_count} (RAM cached mode) |' if RAM_LOADING_ENABLED else ''} 1 (DISK stream)")
+    log_info(f" => CPU Threads : {assigned_mda_threads}/reader ({mda_alloc_mode})  [OMP_NUM_THREADS]")
+    print("-" * 40)
+# ---------------------------------------------------------------------
+
+# Imports (must be after thread allocation)
+import gc
+import time
+import queue
+import math
+import re
+import uuid
+import shutil
+import signal
+import atexit
+import threading
+
+from itertools import chain
+import subprocess
+import numpy as np
+import openmm as mm
+from openmm import app, unit
+
+import warnings
+warnings.filterwarnings("ignore", message=r".*DCDReader currently makes independent timesteps.*")
+import MDAnalysis as mda
+
+import multiprocessing as mp
+try:
+    # Force 'fork' to prevent catastrophic script re-execution on macOS/Windows spawn defaults
+    mp.set_start_method('fork', force=True)
+except Exception:
+    pass
+from multiprocessing import shared_memory
+
 
 
 # Helper functions and classes ------------------------------
@@ -330,7 +390,7 @@ class FastDynamicSelector:
 
     def eval(self, u: mda.Universe, is_periodic: bool) -> np.ndarray:
         if len(self.base_indices) == 0 or len(self.ref_indices) == 0:
-            return np.array([], dtype=int) if not self.invert else self.base_indices
+            return np.array([], dtype=np.int64) if not self.invert else self.base_indices
 
         # Fetch raw C-level coordinates instantly
         coords = u.trajectory.ts.positions
@@ -365,6 +425,7 @@ class FastDynamicSelector:
                 pos_base[pos_base >= boxsize] = 0.0
 
             # 1. Build C++ spatial grid on the reference (Protein)
+            from scipy.spatial import cKDTree
             tree = cKDTree(pos_ref, boxsize=boxsize)
 
             # 2. Query with base (Water).
@@ -384,7 +445,7 @@ class FastDynamicSelector:
                 unique_base_idx = np.unique(pairs[:, 0])
                 selected_actual_idx = self.base_indices[unique_base_idx]
             else:
-                selected_actual_idx = np.array([], dtype=int)
+                selected_actual_idx = np.array([], dtype=np.int64)
 
         if self.invert:
             selected_actual_idx = np.setdiff1d(self.base_indices, selected_actual_idx)
@@ -505,11 +566,19 @@ class SharedFrameBuffer:
 class IndexStreamBuffer:
     """
     A data structure to write the values in order of indices
-    Since energy values can come in any order due to asynchronous namd calls
+
+    Data can come in any order asynchronously, and the job of this class is to look of
+    consecutive chunk of indices, and if found, write them to the output file and release memory
+
+    It is thread-safe, but not process safe (for that, replace threading.Lock with mp.Lock, will be slow)
+    .close() must be called to flush remaining indices safely.
 
     -> It stores mappings of index -> value in a dict
-    -> checks if a contiguous block of consecutive indices exists
-    -> dumps the block to file, and free up memory
+    -> checks if a contiguous chunk of consecutive indices exists
+    -> dumps the block to output file, and free up memory
+
+    See .insert(index: int, value: object)
+        .close()
     """
 
     TAG = "IndexStreamBuffer"
@@ -585,11 +654,12 @@ class IndexStreamBuffer:
         if index < 0:
             raise ValueError(f"{self.__class__.TAG}: Index must be greater than or equal to 0, given: {index}")
 
-        if DEBUG and index in self._data:
-            log_warn(f"{self.__class__.TAG}: INDEX {index} already present !!!")
+        with self._lock:
+            if DEBUG and index in self._data:
+                log_warn(f"{self.__class__.TAG}: INDEX {index} already present !!!")
 
-        self._data[index] = value
-        self._consider_flush()
+            self._data[index] = value
+            self._consider_flush_unsafe()
 
     def __write_indices_to_fd(self, fd, indices_sorted, pre_string = None):
         # Pre string
@@ -623,7 +693,8 @@ class IndexStreamBuffer:
         if self.post_chunk_write_callback is not None:
             self.post_chunk_write_callback(chunk_index, indices_size)
 
-    def _consider_flush(self):
+    # NOT THREAD SAFE
+    def _consider_flush_unsafe(self):
         self._check_closed()
 
         while len(self._data) >= self.chunk_size:
@@ -632,10 +703,9 @@ class IndexStreamBuffer:
             if not range_exists:
                 return
 
-            with self._lock:
-                # write chunk to file
-                indices = range(self._next_index, self._next_index + self.chunk_size)
-                self._write_chunk_indices(indices, indices_size=self.chunk_size)
+            # write chunk to file
+            indices = range(self._next_index, self._next_index + self.chunk_size)
+            self._write_chunk_indices(indices, indices_size=self.chunk_size)
 
     def close(self):
         if self._is_closed:
@@ -674,9 +744,10 @@ shm_buffer_main: SharedFrameBuffer = None        # will initialize later
 
 # Time benchmarks
 t_app_start = time.perf_counter()
+t_init_total = 0.0      # TODO: TEST implement this
 t_ram_load_total = 0.0
 t_compute_total = 0.0
-t_io_wait_total = 0.0
+t_io_wait_total = 0.0    # TODO: TEST implement this
 
 # --------------------------------------------------------------------
 # Cleanup Handlers
@@ -757,22 +828,10 @@ def handle_os_signal(signum, frame):
     log_warn(f"Received OS Signal: {sig_name}. Initiating clean shutdown...")
 
 
-atexit.register(handle_exit)
-signal.signal(signal.SIGINT, handle_os_signal)
-signal.signal(signal.SIGTERM, handle_os_signal)
-try:
-    signal.signal(signal.SIGHUP, handle_os_signal)
-except AttributeError:
-    pass
-
 # =============================================================================
 # VALIDATION AND PRECONDITIONS
 # =============================================================================
-print("\n\n" + "=" * 60)
 log_info(f"Starting Pair Interaction Analysis ({LABEL})")
-print("=" * 60)
-log_info(f"Thread Setup: OpenMM CPU={assigned_openmm_threads} ({openmm_alloc_mode}) | MDA OpenMP={assigned_mda_threads}/reader ({mda_alloc_mode})")
-
 if not SELECTION1.strip():
     log_error("SELECTION1 cannot be empty. Please define a valid atom selection.")
 
@@ -790,6 +849,8 @@ else:
     is_self_interaction: bool = True
     UPDATE_SELECTION2: bool = False
     OUT_FORCE = False
+
+if not OUT_FORCE: OUT_FORCE_COMPONENTS = False
 
 if SWITCHDIST >= CUTOFF:
     log_error(
@@ -947,9 +1008,11 @@ print("------------------------------------------------------\n")
 # VDW NBFIX Detection and Cloning
 # ------------------------------------------------------------------------
 nbfix_force = None
+HAS_NBFIX = False
 for f in base_system.getForces():
     if isinstance(f, mm.CustomNonbondedForce) and "acoef" in f.getEnergyFunction():
         nbfix_force = f
+        HAS_NBFIX = True
         break
 
 # ------------------------------------------------------------------------
@@ -977,7 +1040,7 @@ else:
     S_elec = "1.0"
 
 # VDW definition
-if nbfix_force:
+if HAS_NBFIX:
     log_info("CHARMM NBFIX detected. Cloning 2D lookup tables for exact VDW.")
     vdw_base = f"(((acoef(type1, type2)/r6)^2 - bcoef(type1, type2)/r6) * {S_vdw}); r6=r^6"
 else:
@@ -1043,7 +1106,7 @@ if USE_MASK:
     vdw_force = mm.CustomNonbondedForce(vdw_expr)
     elec_force = mm.CustomNonbondedForce(elec_expr)
 
-    if nbfix_force:
+    if HAS_NBFIX:
         vdw_force.addPerParticleParameter("type")
     else:
         vdw_force.addPerParticleParameter("sigma")
@@ -1061,7 +1124,7 @@ else:
     vdw_force = mm.CustomNonbondedForce(vdw_base)
     elec_force = mm.CustomNonbondedForce(elec_base)
 
-    if nbfix_force:
+    if HAS_NBFIX:
         vdw_force.addPerParticleParameter("type")
     else:
         vdw_force.addPerParticleParameter("sigma")
@@ -1070,7 +1133,7 @@ else:
     elec_force.addPerParticleParameter("charge")
 
 # Duplicate Discrete2D Tabulated Functions if NBFIX is active
-if nbfix_force:
+if HAS_NBFIX:
     for i in range(nbfix_force.getNumTabulatedFunctions()):
         name = nbfix_force.getTabulatedFunctionName(i)
         func = nbfix_force.getTabulatedFunction(i)
@@ -1092,7 +1155,7 @@ dynamic_elec_q_cache_np: np.ndarray = None  # charges of all atoms, numpy type f
 dynamic_vdw_type_cache: np.ndarray = None       # vdw type values of each particle
 dynamic_vdw_sig_eps_cache: np.ndarray = None    # vdw sigma and epsilon of each particle. 2D array [[s1,e1], [s2,e2]...]
 if IS_DYNAMIC:
-    if nbfix_force:
+    if HAS_NBFIX:
         dynamic_vdw_type_cache = np.zeros(N_ATOMS, dtype=np.float64)
     else:
         dynamic_vdw_sig_eps_cache = np.zeros((N_ATOMS, 2), dtype=np.float64)
@@ -1105,7 +1168,7 @@ for i in range(N_ATOMS):
     c, s, e = nb_base.getParticleParameters(i)
     c_val = c.value_in_unit(unit.elementary_charge)
 
-    if nbfix_force:
+    if HAS_NBFIX:
         type_val = nbfix_force.getParticleParameters(i)[0]
         vdw_params = (type_val,)
         if IS_DYNAMIC:
@@ -1342,31 +1405,12 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
     print("")
 
 
-# ------------------------------------------------------------------------
-# HARDWARE INIT
-# ------------------------------------------------------------------------
-# Hardware Initialization (CUDA -> HIP -> OpenCL -> CPU)
-platform = None
-platform_name = "CPU"
-properties = {}
-
-if USE_GPU:
-    for plat_name in ['CUDA', 'HIP', 'OpenCL']:
-        try:
-            platform = mm.Platform.getPlatformByName(plat_name)
-            platform_name = f"{plat_name} (GPU)"
-            break
-        except Exception:
-            continue
-    if platform is None:
-        log_warn("GPU requested but CUDA, HIP, and OpenCL are unavailable. Falling back to CPU.")
-
 
 # ------------------------------------------------------------------------
 # PRE-FORK MEMORY OPTIMIZATION & SYSTEM SERIALIZATION
 # ------------------------------------------------------------------------
 log_info("Serializing OpenMM System for independent Worker deep-copies...\n")
-system_xml = mm.XmlSerializer.serialize(pair_system)
+system_serialized_xml = mm.XmlSerializer.serialize(pair_system)
 
 log_info("Flushing parsed topology databases before forking Compute Workers...\n")
 del base_system
@@ -1376,6 +1420,7 @@ del pair_system
 del vdw_force
 del elec_force
 del pme_recip_force
+if HAS_NBFIX: del nbfix_force
 
 u_init.trajectory.close()
 del u_init
@@ -1528,8 +1573,8 @@ def disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset
 
 def ramdisk_read_blocking(shm_buffer, temp_dcd, num_frames, global_frame_offset, shutdown_event):
     threads = []
-    c_size = math.ceil(num_frames / actual_ram_reader_threads)
-    for i in range(actual_ram_reader_threads):
+    c_size = math.ceil(num_frames / actual_ram_reader_count)
+    for i in range(actual_ram_reader_count):
         start = i * c_size
         stop = min((i + 1) * c_size, num_frames)
         if start >= stop: continue
@@ -1646,8 +1691,10 @@ def master_producer(shm_buffer, shutdown_event):
 
     except Exception as e:
         shutdown_event.set()
-        traceback.print_exc()
         log_error(f"Producer thread crashed: {e}")
+
+        import traceback
+        traceback.print_exception(e)
     finally:
         # Push EOF termination tokens downstream to gracefully halt all Compute Workers
         for _ in range(NUM_COMPUTE_WORKERS):
@@ -1779,7 +1826,7 @@ def create_output_erg_line(erg_row) -> str:
 
 
 # =============================================================================
-# INDEPENDENT COMPUTE WORKER (Multiprocessed)
+# INDEPENDENT COMPUTE WORKER PROCESS (Multi-processed)
 # =============================================================================
 def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_xml):
     """
@@ -1791,7 +1838,7 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
-    # 1. Deep-copy the C++ System to prevent SWIG pointer race conditions!
+    # Deep-copy the C++ System to prevent SWIG pointer race conditions!
     local_pair_system = mm.XmlSerializer.deserialize(system_xml)
 
     # Extract independent force pointers from the local system
@@ -1828,8 +1875,18 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
 
     log_info(f"Worker {worker_id} initialized OpenMM Context on [{platform.getName()}]")
 
+    # Units
     to_kcal = unit.kilocalorie_per_mole
     to_kcal_A = unit.kilocalorie_per_mole / unit.angstrom
+
+    # Constants
+    NP_EMPTY_ARR_INT32 = np.array([], dtype=np.int32)
+    NP_EMPTY_ARR_INT32.setflags(write=False)    # immutable
+
+    # Zero output cache
+    zero_erg_arr = np.zeros(len(group_map), dtype=np.float64)
+    zero_force_mags = [0.0, 0.0, 0.0] if OUT_FORCE else None
+    zero_force_comps = [np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64)] if OUT_FORCE_COMPONENTS else None
 
     # SWIG ACCELERATOR
     vdw_set = local_vdw_force.setParticleParameters
@@ -1842,14 +1899,26 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
                     math.sqrt(-math.log(PME_TOLERANCE)) / (CUTOFF / 10.0) / math.sqrt(math.pi))
 
     # HOT-LOOP OPTIMIZATION: Pre-cast static sets to NumPy arrays to bypass list() casting inside the loop
-    static_arr1 = np.array(list(static_sel1_idx_set), dtype=np.int32) if static_sel1_idx_set else np.array([],
-                                                                                                           dtype=np.int32)
-    static_arr2 = np.array(list(static_sel2_idx_set), dtype=np.int32) if static_sel2_idx_set else np.array([],
-                                                                                                           dtype=np.int32)
+    static_arr1 = np.array(list(static_sel1_idx_set), dtype=np.int32) if static_sel1_idx_set else NP_EMPTY_ARR_INT32
+    static_arr2 = np.array(list(static_sel2_idx_set), dtype=np.int32) if static_sel2_idx_set else NP_EMPTY_ARR_INT32
 
-    prev_idx_se11_set: set = set(static_sel1_idx_set) if IS_DYNAMIC else set()
-    prev_idx_sel2_set: set = set(static_sel2_idx_set) if (IS_DYNAMIC and not is_self_interaction) else set()
+    # prev_arr1 = static_arr1.copy() if IS_DYNAMIC else NP_EMPTY_ARR_INT32
+    # prev_arr2 = static_arr2.copy() if (IS_DYNAMIC and not is_self_interaction) else NP_EMPTY_ARR_INT32
+    prev_arr1 =NP_EMPTY_ARR_INT32
+    prev_arr2 = NP_EMPTY_ARR_INT32
+
+    # O(1) Lookup Masks
+    mask1 = np.array([], dtype=bool)
+    mask2 = np.array([], dtype=bool)
+    if USE_MASK:
+        mask1 = np.zeros(N_ATOMS, dtype=bool)
+        mask2 = np.zeros(N_ATOMS, dtype=bool)
+
+    # Counters
     frames_processed = 0
+    next_manual_gc_frames = MANUAL_GC_INTERVAL_FRAMES
+
+    gc.collect()        # pre run GC
 
     while not shutdown_event.is_set():
         try:
@@ -1857,8 +1926,7 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
         except queue.Empty:
             continue
 
-        if slot_idx is None:
-            break  # EOF termination token received
+        if slot_idx is None: break
 
         # Zero-Copy Read from Shared RAM
         abs_f, coords_nm, box_nm, arr_sel1, arr_sel2, n1, n2 = shm_buffer.read_frame(slot_idx)
@@ -1868,57 +1936,74 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
         curr_arr2 = arr_sel2 if arr_sel2 is not None else static_arr2
 
         if len(curr_arr1) == 0:
-            log_warn(f"Worker {worker_id}: SELECTION-1 Atom count 0 at frame {abs_f}")
+            log_warn(f"Worker {worker_id}: SELECTION-1 Atom count 0 at frame {abs_f}. Emitting zero-energy frame.")
             shm_buffer.free_slots.put(slot_idx)
+
+            # Emit zero-energy string to IndexStreamBuffer to prevent contiguous deadlocks
+            zero_out_str = create_output_erg_line((abs_f, 0, n2 if UPDATE_SELECTION2 else None, zero_erg_arr, zero_force_mags, zero_force_comps))
+
+            try: out_q.put((abs_f, zero_out_str))
+            except Exception: pass
+            frames_processed += 1
             continue
 
         context.setPositions(coords_nm)
         if PERIODIC and box_nm is not None:
             context.setPeriodicBoxVectors(box_nm[0], box_nm[1], box_nm[2])
 
+        actual_curr_arr2 = curr_arr2
         if IS_DYNAMIC:
-            idx_set1_set = set(curr_arr1) if UPDATE_SELECTION1 else static_sel1_idx_set
-            idx_set2_set = idx_set1_set if is_self_interaction else (set(curr_arr2) - idx_set1_set) if UPDATE_SELECTION2 else static_sel2_idx_set
+            if not is_self_interaction and UPDATE_SELECTION2:
+                # Mathematically preserve the non-overlap rule safely using NumPy
+                actual_curr_arr2 = np.setdiff1d(curr_arr2, curr_arr1, assume_unique=True)
 
-            union_idx_sel1 = idx_set1_set ^ prev_idx_se11_set
-            union_idx_sel2 = idx_set2_set ^ prev_idx_sel2_set
-
-            # Prevent SWIG pointer corruption by strictly casting to native Python floats
-            for i in union_idx_sel1:
-                val = float(1.0 if i in idx_set1_set else 0.0)
-                q = float(dynamic_elec_q_cache_np[i])
-                vdw_tup = (float(dynamic_vdw_type_cache[i]), val) if nbfix_force else (
-                float(dynamic_vdw_sig_eps_cache[i, 0]), float(dynamic_vdw_sig_eps_cache[i, 1]), val)
-
-                if is_self_interaction:
-                    vdw_set(i, vdw_tup)
-                    elec_set(i, (q, val))
-                    if pme_set: pme_set(i, float(q * val), 1.0, 0.0)
-                else:
-                    s2_val = float(1.0 if i in idx_set2_set else 0.0)
-                    vdw_set(i, vdw_tup + (s2_val,))
-                    elec_set(i, (q, val, s2_val))
-                    if pme_set: pme_set(i, float(q * max(val, s2_val)), 1.0, 0.0)
-
+            # Update O(1) Boolean Masks instantly
+            mask1.fill(False)
+            mask1[curr_arr1] = True
             if not is_self_interaction:
-                for i in union_idx_sel2.difference(union_idx_sel1):
-                    q = float(dynamic_elec_q_cache_np[i])
-                    s2_val = float(1.0 if i in idx_set2_set else 0.0)
-                    s1_val = float(1.0 if i in idx_set1_set else 0.0)
+                mask2.fill(False)
+                mask2[actual_curr_arr2] = True
 
-                    vdw_tup = (float(dynamic_vdw_type_cache[i]), s1_val, s2_val) if nbfix_force else (
-                    float(dynamic_vdw_sig_eps_cache[i, 0]), float(dynamic_vdw_sig_eps_cache[i, 1]), s1_val, s2_val)
-                    vdw_set(i, vdw_tup)
-                    elec_set(i, (q, s1_val, s2_val))
-                    if pme_set: pme_set(i, float(q * max(s1_val, s2_val)), 1.0, 0.0)
+            # Use C-optimized XOR to find exactly which atoms changed boundary states
+            changed1 = np.setxor1d(curr_arr1, prev_arr1, assume_unique=True) if UPDATE_SELECTION1 else NP_EMPTY_ARR_INT32
+
+            if is_self_interaction:
+                for i in changed1:
+                    idx = int(i)
+                    val = 1.0 if mask1[idx] else 0.0
+                    q = float(dynamic_elec_q_cache_np[idx])
+                    vdw_tup = (float(dynamic_vdw_type_cache[idx]), val) if HAS_NBFIX else (
+                        float(dynamic_vdw_sig_eps_cache[idx, 0]), float(dynamic_vdw_sig_eps_cache[idx, 1]), val)
+
+                    vdw_set(idx, vdw_tup)
+                    elec_set(idx, (q, val))
+                    if pme_set: pme_set(idx, q * val, 1.0, 0.0)
+            else:
+                changed2 = np.setxor1d(actual_curr_arr2, prev_arr2, assume_unique=True) if UPDATE_SELECTION2 else NP_EMPTY_ARR_INT32
+                all_changed = np.union1d(changed1, changed2)
+
+                for i in all_changed:
+                    idx = int(i)
+                    val = 1.0 if mask1[idx] else 0.0
+                    s2_val = 1.0 if mask2[idx] else 0.0
+                    q = float(dynamic_elec_q_cache_np[idx])
+
+                    vdw_tup = (float(dynamic_vdw_type_cache[idx]), val, s2_val) if HAS_NBFIX else (
+                        float(dynamic_vdw_sig_eps_cache[idx, 0]), float(dynamic_vdw_sig_eps_cache[idx, 1]), val, s2_val)
+                    vdw_set(idx, vdw_tup)
+                    elec_set(idx, (q, val, s2_val))
+                    if pme_set: pme_set(idx, q * max(val, s2_val), 1.0, 0.0)
 
             local_vdw_force.updateParametersInContext(context)
             local_elec_force.updateParametersInContext(context)
             if local_pme_force:
                 local_pme_force.updateParametersInContext(context)
 
-            prev_idx_se11_set = idx_set1_set
-            prev_idx_sel2_set = idx_set2_set
+            # prev_arr1 = curr_arr1.copy()
+            prev_arr1 = curr_arr1
+            if not is_self_interaction:
+                # prev_arr2 = actual_curr_arr2.copy()
+                prev_arr2 = actual_curr_arr2
 
         # Query Energies
         erg_raw = np.zeros(len(group_map), dtype=np.float64)
@@ -1932,11 +2017,7 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
                 state_recip = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
                 e_recip = state_recip.getPotentialEnergy().value_in_unit(to_kcal)
 
-                if is_dynamic_elec_q_cache_needed:
-                    sel1_q_sq_sum = np.sum(dynamic_elec_q_cache_np[curr_arr1] ** 2)
-                else:
-                    sel1_q_sq_sum = sum(float(dynamic_elec_q_cache_np[i]) ** 2 for i in curr_arr1)
-
+                sel1_q_sq_sum = np.sum(dynamic_elec_q_cache_np[curr_arr1] ** 2)
                 pme_self = - pme_self_prefactor * sel1_q_sq_sum
                 erg_raw[comp_idx["elec"]] += (e_recip + pme_self)
                 if OUT_FORCE:
@@ -1944,19 +2025,20 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
             else:
                 if IS_DYNAMIC:
                     st_AB = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
-                    only_sel1 = idx_set1_set - idx_set2_set
-                    only_sel2 = idx_set2_set - idx_set1_set
+                    only_sel1 = curr_arr1[~mask2[curr_arr1]]
+                    # only_sel2 = actual_curr_arr2[~mask1[actual_curr_arr2]]
+                    only_sel2 = actual_curr_arr2
 
-                    for i in only_sel2: pme_set(i, 0.0, 1.0, 0.0)
+                    for i in only_sel2: pme_set(int(i), 0.0, 1.0, 0.0)
                     local_pme_force.updateParametersInContext(context)
                     st_A = context.getState(getEnergy=True, getForces=OUT_FORCE, groups=(1 << 7))
 
-                    for i in only_sel2: pme_set(i, float(dynamic_elec_q_cache_np[i]), 1.0, 0.0)
-                    for i in only_sel1: pme_set(i, 0.0, 1.0, 0.0)
+                    for i in only_sel2: pme_set(int(i), float(dynamic_elec_q_cache_np[i]), 1.0, 0.0)
+                    for i in only_sel1: pme_set(int(i), 0.0, 1.0, 0.0)
                     local_pme_force.updateParametersInContext(context)
                     st_B = context.getState(getEnergy=True, groups=(1 << 7))
 
-                    for i in only_sel1: pme_set(i, float(dynamic_elec_q_cache_np[i]), 1.0, 0.0)
+                    for i in only_sel1: pme_set(int(i), float(dynamic_elec_q_cache_np[i]), 1.0, 0.0)
                     local_pme_force.updateParametersInContext(context)
                 else:
                     context.setParameter("lambda_1", 1.0)
@@ -1981,12 +2063,11 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
         force_components = None
         force_mags = None
         if OUT_FORCE:
-            f_ele_raw = context.getState(getForces=True, groups=(1 << 2)).getForces(asNumpy=True).value_in_unit(
-                to_kcal_A)
-            f_vdw_raw = context.getState(getForces=True, groups=(1 << 1)).getForces(asNumpy=True).value_in_unit(
-                to_kcal_A)
+            f_ele_raw = context.getState(getForces=True, groups=(1 << 2)).getForces(asNumpy=True).value_in_unit(to_kcal_A)
+            f_vdw_raw = context.getState(getForces=True, groups=(1 << 1)).getForces(asNumpy=True).value_in_unit(to_kcal_A)
             if f_pme_cross_raw is not None:
                 f_ele_raw += f_pme_cross_raw
+
             f_ele_comp = np.sum(f_ele_raw[curr_arr1], axis=0)
             f_vdw_comp = np.sum(f_vdw_raw[curr_arr1], axis=0)
 
@@ -2002,7 +2083,9 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
                 force_components = [f_ele_comp, f_vdw_comp]
 
         # Format the output string instantly to offload string concat CPU overhead
-        out_str = create_output_erg_line((abs_f, n1 if UPDATE_SELECTION1 else None, n2 if UPDATE_SELECTION2 else None,
+        out_str = create_output_erg_line((abs_f,
+                                          n1 if UPDATE_SELECTION1 else None,
+                                          n2 if UPDATE_SELECTION2 else None,
                                           erg_raw, force_mags, force_components))
 
         # Push formatted string to lightweight output queue
@@ -2014,9 +2097,13 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
         # Release the slot back to the Reader Pool
         shm_buffer.free_slots.put(slot_idx)
 
+        # ------------------ Finalize ------------------------
         frames_processed += 1
-        if MANUAL_GC_ENABLED and IS_DYNAMIC and frames_processed % MANUAL_GC_INTERVAL_FRAMES == 0:
+
+        # SWIG PROXY FLUSH (DYNAMIC MEMORY STABILIZATION)
+        if MANUAL_GC_ENABLED and IS_DYNAMIC and frames_processed == next_manual_gc_frames:
             gc.collect()
+            next_manual_gc_frames += MANUAL_GC_INTERVAL_FRAMES
 
     # Tell the Main Orchestrator this worker has gracefully terminated
     try: out_q.put(None)
@@ -2028,7 +2115,7 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
 
 
 # -----------------------------------------------------------------------------
-# OUTPUT file and IndexStreamBuffer Setup
+# IndexStreamBuffer Callbacks
 # -----------------------------------------------------------------------------
 
 def _on_index_streamer_pre_chunk_write(chunk_index: int) -> str | None:
@@ -2043,115 +2130,125 @@ def _on_index_streamer_post_chunk_write(chunk_index: int, chunk_size: int):
     pass
 
 
-out_file_path = f"{OUT_FILE_PREFIX}.energy.csv"
-index_stream_buffer = IndexStreamBuffer(output_file_path=out_file_path,
-                                        chunk_size=INDEX_STREAM_BUFFER_CHUNK_SIZE,
-                                        keep_file_open=INDEX_STREAM_BUFFER_ALWAYS_OPEN,
-                                        string_converter_callback=lambda x: x,  # already a string
-                                        pre_chunk_write_callback=_on_index_streamer_pre_chunk_write,
-                                        post_chunk_write_callback=_on_index_streamer_post_chunk_write)
-
-# =============================================================================
-# MAIN ORCHESTRATOR & IPC CONSUMER LOOP (Phase 4)
-# =============================================================================
-log_info(f"Allocating Zero-Copy Shared Memory Ring Buffer ({QUEUE_FRAME_COUNT} slots)...")
-
-# Creator allocates the physical RAM. Forked children inherit handles instantly.
-shm_buffer_main = SharedFrameBuffer(
-    num_slots=QUEUE_FRAME_COUNT,
-    n_atoms=total_atom_count,
-    has_dyn_sel1=UPDATE_SELECTION1,
-    has_dyn_sel2=not is_self_interaction and UPDATE_SELECTION2,
-    is_creator=True
-)
-
-out_q = mp.Queue()
-
-log_info(f"Spawning {NUM_COMPUTE_WORKERS} Independent Compute Workers...")
-workers = []
-for i in range(NUM_COMPUTE_WORKERS):
-    p = mp.Process(target=compute_worker_process, args=(i + 1, shm_buffer_main, out_q, shutdown_event, system_xml))
-    p.start()
-    workers.append(p)
-
-log_info("Starting Background Frame Reader Pipeline...")
-producer_process = mp.Process(target=master_producer, args=(shm_buffer_main, shutdown_event))
-producer_process.start()
-
-# ---------------- MAIN THREAD STRING CONSUMER ----------------
-frames_processed = 0
-t_compute_start = time.perf_counter()
-next_progress_report_frames = PROGRESS_REPORT_INTERVAL_FRAMES
-t_last_progress_report = time.perf_counter()
-
-log_info("Main Orchestrator is listening for computed frames...")
-
-active_workers = NUM_COMPUTE_WORKERS
-while active_workers > 0 and not shutdown_event.is_set():
+if __name__ == '__main__':
+    # Register Signal Handlers only in main process
+    atexit.register(handle_exit)
+    signal.signal(signal.SIGINT, handle_os_signal)
+    signal.signal(signal.SIGTERM, handle_os_signal)
     try:
-        # Poll the lightweight string queue
-        msg = out_q.get(timeout=1.0)
-    except queue.Empty:
-        # Safely catch deadlocks if producer/workers crash
-        if not producer_process.is_alive() and shm_buffer_main.ready_slots.empty() and out_q.empty():
-            log_warn("Producer or Workers died unexpectedly. Initiating shutdown.")
-            shutdown_event.set()
-            SHUTDOWN_REQUESTED = True
-        continue
+        signal.signal(signal.SIGHUP, handle_os_signal)
+    except AttributeError:
+        pass
 
-    if msg is None:
-        active_workers -= 1
-        continue
+    # Output file configuration
+    out_file_path = f"{OUT_FILE_PREFIX}.energy.csv"
+    index_stream_buffer = IndexStreamBuffer(output_file_path=out_file_path,
+                                            chunk_size=INDEX_STREAM_BUFFER_CHUNK_SIZE,
+                                            keep_file_open=INDEX_STREAM_BUFFER_ALWAYS_OPEN,
+                                            string_converter_callback=lambda x: x,  # already a string
+                                            pre_chunk_write_callback=_on_index_streamer_pre_chunk_write,
+                                            post_chunk_write_callback=_on_index_streamer_post_chunk_write)
 
-    abs_f, out_str = msg
+    # =============================================================================
+    # MAIN ORCHESTRATOR & IPC CONSUMER LOOP
+    # =============================================================================
+    log_info(f"Allocating Zero-Copy Shared Memory Ring Buffer ({QUEUE_FRAME_COUNT} slots)...")
 
-    # Inject directly into the ordered buffer
-    index_stream_buffer.insert(index=int(abs_f / FRAME_STEP), value=out_str)
-    frames_processed += 1
+    # Creator allocates the physical RAM. Forked children inherit handles instantly.
+    shm_buffer_main = SharedFrameBuffer(
+        num_slots=QUEUE_FRAME_COUNT,
+        n_atoms=total_atom_count,
+        has_dyn_sel1=UPDATE_SELECTION1,
+        has_dyn_sel2=not is_self_interaction and UPDATE_SELECTION2,
+        is_creator=True
+    )
 
-    # PROGRESS TRACKER EXECUTION
-    if frames_processed == next_progress_report_frames:
-        t_now = time.perf_counter()
-        fps_current = PROGRESS_REPORT_INTERVAL_FRAMES / max(0.001, t_now - t_last_progress_report)
-        log_info(f"Progress: Processed {frames_processed} frames  |  Speed: {fps_current:.1f} fps")
-        next_progress_report_frames += PROGRESS_REPORT_INTERVAL_FRAMES
-        t_last_progress_report = t_now
+    out_queue = mp.Queue()
 
-t_compute_total = time.perf_counter() - t_compute_start
+    log_info(f"Spawning {NUM_COMPUTE_WORKERS} OpenMM Contexts (compute workers)...")
+    workers = []
+    for i in range(NUM_COMPUTE_WORKERS):
+        p = mp.Process(target=compute_worker_process,
+                       args=(i + 1, shm_buffer_main, out_queue, shutdown_event, system_serialized_xml))
+        p.start()
+        workers.append(p)
 
-log_info("Shutting down IPC pipeline...")
-shutdown_event.set()
+    log_info("Starting Background Frame Reader Pipeline...")
+    producer_process = mp.Process(target=master_producer, args=(shm_buffer_main, shutdown_event))
+    producer_process.start()
 
-# Safely join processes
-producer_process.join(timeout=5)
-for w in workers:
-    w.join(timeout=5)
+    # ---------------- MAIN THREAD STRING CONSUMER ----------------
+    t_compute_start = time.perf_counter()
 
-shm_buffer_main.cleanup()
+    frames_processed = 0
+    next_progress_report_frames = PROGRESS_REPORT_INTERVAL_FRAMES
+    t_last_progress_report = time.perf_counter()
 
+    active_omm_workers = NUM_COMPUTE_WORKERS
+    log_info("Main Process is listening for computed frames...")
+    while active_omm_workers > 0 and not shutdown_event.is_set():
+        try:
+            # Poll the lightweight string queue
+            msg = out_queue.get(timeout=1.0)
+        except queue.Empty:
+            # Safely catch deadlocks if producer/workers crash
+            if not producer_process.is_alive() and shm_buffer_main.ready_slots.empty() and out_queue.empty():
+                log_warn("Producer or Workers died unexpectedly. Initiating shutdown.")
+                shutdown_event.set()
+                SHUTDOWN_REQUESTED = True
+            continue
 
+        if msg is None:
+            active_omm_workers -= 1
+            continue
 
-# =============================================================================
-# EXECUTION REPORT
-# =============================================================================
-t_total = time.perf_counter() - t_app_start
-compute_active_time = max(0.0, t_compute_total - t_io_wait_total)
-fps = frames_processed / max(0.001, t_compute_total)
-status_str = "\033[91mABORTED (Early Exit)\033[0m" if SHUTDOWN_REQUESTED else "\033[92mSUCCESS\033[0m"
+        abs_f, out_str = msg
 
-print(f"\n{get_cur_datetime_formatted()}")
-print("=" * 60)
-print(f"               EXECUTION SUMMARY")
-print("=" * 60)
-print(f" Status               : {status_str}")
-print(f" Frames Processed     : {frames_processed}")
-print(f" Processing Speed     : {fps:.1f} frames/sec")
-print(f" Compute Engine       : {platform_name}")
-print(f" Final Output File    : {out_file_path}")
-print("-" * 60)
-print(f" Total Wall Time      : {t_total:.1f} s")
-print(f"   ├─ catdcd/RAM I/O  : {t_ram_load_total:.1f} s")
-print(f"   ├─ Compute Loop    : {t_compute_total:.1f} s")
-print(f"   │    ├─ Active     : {compute_active_time:.1f} s")
-print(f"   │    └─ I/O Wait   : {t_io_wait_total:.1f} s")
-print("=" * 60 + "\n")
+        # Inject directly into the ordered buffer
+        index_stream_buffer.insert(index=int(abs_f / FRAME_STEP), value=out_str)
+        frames_processed += 1
+
+        # PROGRESS TRACKER EXECUTION
+        if frames_processed == next_progress_report_frames:
+            t_now = time.perf_counter()
+            fps_current = PROGRESS_REPORT_INTERVAL_FRAMES / max(0.001, t_now - t_last_progress_report)
+            log_info(f"Progress: Processed {frames_processed} frames  |  Speed: {fps_current:.1f} fps")
+            next_progress_report_frames += PROGRESS_REPORT_INTERVAL_FRAMES
+            t_last_progress_report = t_now
+
+    t_compute_total = time.perf_counter() - t_compute_start
+
+    log_info("Shutting down IPC pipeline...")
+    shutdown_event.set()
+
+    # Safely join processes
+    producer_process.join(timeout=5)
+    for w in workers:
+        w.join(timeout=5)
+
+    shm_buffer_main.cleanup()
+
+    # =============================================================================
+    # EXECUTION REPORT
+    # =============================================================================
+    t_total = time.perf_counter() - t_app_start
+    compute_active_time = max(0.0, t_compute_total - t_io_wait_total)
+    fps = frames_processed / max(0.001, t_compute_total)
+    status_str = "\033[91mABORTED (Early Exit)\033[0m" if SHUTDOWN_REQUESTED else "\033[92mSUCCESS\033[0m"
+
+    print(f"\n{get_cur_datetime_formatted()}")
+    print("=" * 60)
+    print(f"               EXECUTION SUMMARY")
+    print("=" * 60)
+    print(f" Status               : {status_str}")
+    print(f" Frames Processed     : {frames_processed}")
+    print(f" Processing Speed     : {fps:.1f} frames/sec")
+    print(f" Compute Engine       : {OMM_PLATFORM_DISPLAY_NAME}")
+    print(f" Final Output File    : {out_file_path}")
+    print("-" * 60)
+    print(f" Total Wall Time      : {t_total:.1f} s")
+    print(f"   ├─ catdcd/RAM I/O  : {t_ram_load_total:.1f} s")
+    print(f"   ├─ Compute Loop    : {t_compute_total:.1f} s")
+    print(f"   │    ├─ Active     : {compute_active_time:.1f} s")
+    print(f"   │    └─ I/O Wait   : {t_io_wait_total:.1f} s")
+    print("=" * 60 + "\n")
