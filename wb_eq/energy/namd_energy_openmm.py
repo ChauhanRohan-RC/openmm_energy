@@ -253,7 +253,7 @@ log_info(f"Auto-detected OPENMM PLATFORM: {OPENMM_PLATFORM_DISPLAY_NAME}  |  USE
 if NUM_COMPUTE_WORKERS < 1:
     log_warn("Number of OpenMM contexts (compute workers) must be >= 1. Resetting to 1 context")
     NUM_COMPUTE_WORKERS = 1
-elif not USE_GPU and NUM_COMPUTE_WORKERS > 1:
+elif NUM_COMPUTE_WORKERS > 1 and not USE_GPU:
     log_warn("Multiple OpenMM contexts (compute workers) on CPU will severally stall. Resetting to 1 context")
     NUM_COMPUTE_WORKERS = 1
 
@@ -271,13 +271,13 @@ openmm_alloc_mode = "Smart Auto"
 if USE_GPU:
     assigned_openmm_threads = 1
     if OPENMM_THREADS_PER_CONTEXT > 1:
-        log_info(f"Running OpenMM on GPU, IGNORING OPENMM_CPU_THREADS={OPENMM_THREADS_PER_CONTEXT}")
+        log_info(f"Running OpenMM on GPU, IGNORING OPENMM_THREADS_PER_CONTEXT={OPENMM_THREADS_PER_CONTEXT}")
 else:
     if OPENMM_THREADS_PER_CONTEXT > 0:
         assigned_openmm_threads = OPENMM_THREADS_PER_CONTEXT
         openmm_alloc_mode = "User Override"
         if (assigned_openmm_threads * NUM_COMPUTE_WORKERS) > SYS_CORES:
-            log_warn(f"STALL WARNING: Running {NUM_COMPUTE_WORKERS} OpenMM context (compute workers) on CPU with {assigned_openmm_threads} threads/context, but system only has {SYS_CORES} threads")
+            log_warn(f"STALL WARNING: Running {NUM_COMPUTE_WORKERS} OpenMM CPU context (compute workers) with {assigned_openmm_threads} threads/context, but system only has {SYS_CORES} threads")
     else:
         assigned_openmm_threads = max(1, int(SYS_CORES * 0.80 / NUM_COMPUTE_WORKERS))
 
@@ -286,7 +286,7 @@ if MDA_THREADS_PER_READER > 0:
     assigned_mda_threads = MDA_THREADS_PER_READER
     mda_alloc_mode = "User Override"
 else:
-    remaining_cores = max(1, SYS_CORES - assigned_openmm_threads)
+    remaining_cores = max(1, SYS_CORES - (assigned_openmm_threads * NUM_COMPUTE_WORKERS))
     assigned_mda_threads = max(1, remaining_cores // actual_ram_reader_count)
     mda_alloc_mode = "Smart Auto"
 
