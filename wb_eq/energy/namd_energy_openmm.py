@@ -80,7 +80,7 @@ PARAM_FILES = [
     "../../common/ff/toppar_water_ions.prot.str"
 ]
 PSF_FILE = "../../common/amyl_wb.psf"       # TODO : input structure file
-DCD_FILES = find_files("..", "amyl_wb_eq", ".dcd", 2, 2)          # TODO : trajectory dcd files
+DCD_FILES = find_files("..", "amyl_wb_eq", ".dcd")          # TODO : trajectory dcd files
 
 ## Selections (MDAnalysis selection syntax)
 # -> hydration shell: water and around 4.25 protein
@@ -155,7 +155,7 @@ QUEUE_FRAME_COUNT = 50                # TODO TEST Size of the Zero-Copy Shared M
 
 RAM_DISK_PATH = "/tmp/namd_energy.openmm"          # ram disk path to use
 RAM_LOADING_ENABLED: bool = True     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
-RAM_READER_COUNT = 3                  # Concurrent readers for RAM chunks
+RAM_READER_COUNT = 2                 # Concurrent readers for RAM chunks
 
 # Chunking to RAM (requires catdcd))
 RAM_CHUNK_MODE: bool = True           # Loads big DCD files to RAM_DISK in chunks
