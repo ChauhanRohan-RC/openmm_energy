@@ -72,7 +72,7 @@ def find_files(dir_path, prefix, suffix, min_num=None, max_num=None, sort_natura
 # =============================================================================
 # INPUT
 # =============================================================================
-USE_GPU = True  # TODO: important for smart thread allocation
+USE_GPU = True  # Keep it True, Auto-fallback to CPU
 
 PARAM_FILES = [
     "../../common/ff/par_all36m_prot.prm",
@@ -147,12 +147,14 @@ COMMENT_TOKEN = "#"
 # ==============================================
 # FRAME LOADING and PERFORMANCE
 # ==============================================
-NUM_COMPUTE_WORKERS = 4               # TODO TEST Number of parallel OpenMM Context processes (Scale up for dynamic modes)
+# TODO TEST NUM_OPENMM_CONTEXTS: Number of OpenMM workers processes in parallel
+# -> Consume RAM and VRAM. Scale up for DYNAMIC Selections based on VRAM
+NUM_COMPUTE_WORKERS = 2
 QUEUE_FRAME_COUNT = 50                # TODO TEST Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
 
 RAM_DISK_PATH = "/tmp/namd_energy.openmm"          # ram disk path to use
 RAM_LOADING_ENABLED: bool = False     # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
-RAM_READER_COUNT = 1                  # Concurrent readers for RAM chunks
+RAM_READER_COUNT = 2                  # Concurrent readers for RAM chunks
 
 # Chunking to RAM (requires catdcd))
 RAM_CHUNK_MODE: bool = True           # Loads big DCD files to RAM_DISK in chunks
@@ -165,8 +167,8 @@ RAM_EXTRA_MARGIN_GB = 0.1             # Extra buffer headroom (GiB)
 
 ## Thread controls
 # 0 = Smart Auto-Allocation, >0 = Override
-MDA_THREADS_PER_READER = 0          # Threads per MDAnalysis reader instance (OpenMP)
-OPENMM_CPU_THREADS = 0              # Compute threads for each OpenMM context (applies only if running on CPU)
+MDA_THREADS_PER_READER = 0            # Threads per MDAnalysis reader instance (OpenMP)
+OPENMM_THREADS_PER_CONTEXT = 0        # Compute threads for each OpenMM context (applies only if running on CPU)
 
 
 
@@ -260,11 +262,11 @@ actual_ram_reader_count = max(min(RAM_READER_COUNT, SYS_CORES - 1), 1) if RAM_LO
 openmm_alloc_mode = "Smart Auto"
 if USE_GPU:
     assigned_openmm_threads = 1
-    if OPENMM_CPU_THREADS > 1:
-        log_info(f"Running OpenMM on GPU, IGNORING OPENMM_CPU_THREADS={OPENMM_CPU_THREADS}")
+    if OPENMM_THREADS_PER_CONTEXT > 1:
+        log_info(f"Running OpenMM on GPU, IGNORING OPENMM_CPU_THREADS={OPENMM_THREADS_PER_CONTEXT}")
 else:
-    if OPENMM_CPU_THREADS > 0:
-        assigned_openmm_threads = OPENMM_CPU_THREADS
+    if OPENMM_THREADS_PER_CONTEXT > 0:
+        assigned_openmm_threads = OPENMM_THREADS_PER_CONTEXT
         openmm_alloc_mode = "User Override"
         if (assigned_openmm_threads * NUM_COMPUTE_WORKERS) > SYS_CORES:
             log_warn(f"STALL WARNING: Running {NUM_COMPUTE_WORKERS} OpenMM context (compute workers) on CPU with {assigned_openmm_threads} threads/context, but system only has {SYS_CORES} threads")
@@ -286,17 +288,17 @@ os.environ["OMP_NUM_THREADS"] = str(assigned_mda_threads)
 
 # Logging
 if __name__ == '__main__':
-    print("-" * 40)
+    print("-" * 60)
     log_info(f"OPENMM CONFIGURATION (Compute Engine)")
     log_info(f" => Platform    : {OMM_PLATFORM_DISPLAY_NAME}")
     log_info(f" => Contexts    : {NUM_COMPUTE_WORKERS} (compute workers)")
     log_info(f" => CPU Threads : {assigned_openmm_threads}/context  ({openmm_alloc_mode})")
-    print("-" * 20)
+    print("-" * 60)
     log_info(f"MDAnalysis CONFIGURATION (Frame Reader)")
     log_info(f" => RAM Loading : {f'ON  (Chunking: {RAM_CHUNK_MODE})' if RAM_LOADING_ENABLED else 'OFF'}")
     log_info(f" => Readers     : {f'{actual_ram_reader_count} (RAM cached mode) |' if RAM_LOADING_ENABLED else ''} 1 (DISK stream)")
     log_info(f" => CPU Threads : {assigned_mda_threads}/reader ({mda_alloc_mode})  [OMP_NUM_THREADS]")
-    print("-" * 40)
+    print("-" * 60)
 # ---------------------------------------------------------------------
 
 # Imports (must be after thread allocation)
@@ -394,17 +396,17 @@ class FastDynamicSelector:
 
         # Fetch raw C-level coordinates instantly
         coords = u.trajectory.ts.positions
-        box = u.trajectory.ts.dimensions if is_periodic else None
+        dimensions = u.trajectory.ts.dimensions if is_periodic else None    # 1D array of len 6 [lx, ly, lz, alpha, beta, gamma]
 
         pos_base = coords[self.base_indices]
         pos_ref = coords[self.ref_indices]
 
         use_scipy = True
         boxsize = None
-        if box is not None:
+        if dimensions is not None:
             # SciPy cKDTree only supports orthogonal periodic boxes (angles == 90)
-            if np.allclose(box[3:], 90.0):
-                boxsize = box[:3]
+            if np.allclose(dimensions[3:], 90.0):
+                boxsize = dimensions[:3]
             else:
                 use_scipy = False
                 if not self._triclinic_warned:
@@ -440,7 +442,7 @@ class FastDynamicSelector:
         else:
             # Fallback for Triclinic/Non-Orthogonal boxes
             from MDAnalysis.lib.distances import capped_distance
-            pairs = capped_distance(pos_base, pos_ref, self.cutoff, box=box, return_distances=False)
+            pairs = capped_distance(pos_base, pos_ref, self.cutoff, box=dimensions, return_distances=False)
             if len(pairs) > 0:
                 unique_base_idx = np.unique(pairs[:, 0])
                 selected_actual_idx = self.base_indices[unique_base_idx]
@@ -477,7 +479,7 @@ class SharedFrameBuffer:
         # Memory Optimization: Use float32 for coords and int32 for indices.
         self.specs = {
             'coords': ((num_slots, n_atoms, 3), np.float32),
-            'box': ((num_slots, 6), np.float32),
+            'box': ((num_slots, 3, 3), np.float32),
             'meta': ((num_slots, 3), np.int64)  # Format: [abs_f, n1, n2]
         }
 
@@ -514,21 +516,30 @@ class SharedFrameBuffer:
             for i in range(num_slots):
                 self.free_slots.put(i)
 
-    def write_frame(self, slot_idx: int, abs_f: int, coords_nm: np.ndarray, box_nm: np.ndarray, arr_sel1: np.ndarray,
+    def write_frame(self, slot_idx: int, abs_frame_idx: int, coords: np.ndarray, box: np.ndarray, arr_sel1: np.ndarray,
                     arr_sel2: np.ndarray):
-        """Called by Reader Processes: Dumps extracted data directly into the shared RAM slot."""
+        """
+        Called by Reader Processes: Dumps extracted data directly into the shared RAM slot.
+
+        @:param slot_idx: slot id, previously acquired from polling self.free_slots
+        @:param abs_f: absolute frame index
+        @:param coords_nm: coordinates array. Shape (N_atoms, 3)
+        @:param box_nm: box vectors. A 3x3 Matrix
+        @:param arr_sel1: selection-1 atom indices array, or NOne
+        @:param arr_sel2: selection-2 atom indices array, or None
+        """
         n1 = len(arr_sel1) if arr_sel1 is not None else 0
         n2 = len(arr_sel2) if arr_sel2 is not None else 0
 
-        self.arrays['meta'][slot_idx, 0] = abs_f
+        self.arrays['meta'][slot_idx, 0] = abs_frame_idx
         self.arrays['meta'][slot_idx, 1] = n1
         self.arrays['meta'][slot_idx, 2] = n2
 
         # Implicitly casts float64 coordinates to float32 natively
-        self.arrays['coords'][slot_idx] = coords_nm
+        self.arrays['coords'][slot_idx] = coords
 
-        if box_nm is not None:
-            self.arrays['box'][slot_idx, :len(box_nm)] = box_nm
+        if box is not None:
+            self.arrays['box'][slot_idx] = box
 
         if self.has_dyn_sel1 and n1 > 0:
             self.arrays['sel1'][slot_idx, :n1] = arr_sel1
@@ -536,7 +547,11 @@ class SharedFrameBuffer:
             self.arrays['sel2'][slot_idx, :n2] = arr_sel2
 
     def read_frame(self, slot_idx: int):
-        """Called by Compute Workers: Returns NumPy views sliced exactly to the dynamic selection lengths."""
+        """
+        Called by Compute Workers: Returns NumPy views sliced exactly to the dynamic selection lengths
+
+        @:param slot_idx: slot id previously acquired from polling self.ready_slots
+        """
         abs_f = int(self.arrays['meta'][slot_idx, 0])
         n1 = int(self.arrays['meta'][slot_idx, 1])
         n2 = int(self.arrays['meta'][slot_idx, 2])
@@ -734,7 +749,7 @@ class IndexStreamBuffer:
 # GLOBAL VARIABLES
 # ------------------------------------------------------------------------
 shutdown_event: mp.Event = mp.Event()       # MAIN SHUTDOWN EVENT. use .is_set() and .set()
-SHUTDOWN_REQUESTED = True       # Only for reporting purposes
+SHUTDOWN_REQUESTED = False       # Only for reporting purposes
 
 ACTIVE_RAM_FILES = set()
 RAM_FILES_LOCK = threading.Lock()
@@ -857,6 +872,8 @@ if SWITCHDIST >= CUTOFF:
         f"Switching distance must be less than CUTOFF. Given Cutoff: {CUTOFF} Å, Switch dist: {SWITCHDIST} Å. Disabling switching")
     SWITCHDIST = 0.0  # disable switching
 
+HAS_SWITCHING = SWITCHDIST > 0 and SWITCHDIST < CUTOFF
+
 if PME_ENABLED and not PERIODIC:
     log_warn("PME only works for Periodic systems. Disabling PME...")
     PME_ENABLED = False
@@ -918,6 +935,8 @@ base_nb_method = app.CutoffPeriodic if PERIODIC else app.CutoffNonPeriodic
 base_system = psf.createSystem(params, nonbondedMethod=base_nb_method,
                                nonbondedCutoff=(CUTOFF / 10.0) * unit.nanometers)
 
+N_ATOMS = base_system.getNumParticles()
+
 pair_system = mm.System()
 for i in range(base_system.getNumParticles()):
     pair_system.addParticle(base_system.getParticleMass(i))
@@ -933,9 +952,10 @@ u_init_ts = u_init.trajectory[0]  # initialize first frame
 
 ## coordinates and box of first frame
 # u_init_coords = u_init.atoms.positions
-# u_init_dimensions = u_init_ts.dimensions if PERIODIC else None
-total_atom_count = u_init.atoms.n_atoms
-n_covalent_bonds = len(u_init.bonds)  # True covalent bonds from PSF
+n_init_atoms = u_init.atoms.n_atoms     # num_atoms from 1 st frame
+n_covalent_bonds = len(u_init.bonds)    # True covalent bonds from PSF
+if N_ATOMS != n_init_atoms:
+    log_error(f"Number of atoms in PSF ({N_ATOMS}) does not match number of atoms in trajectory ({u_init.atoms.n_atoms})")
 
 if (UPDATE_SELECTION1 or UPDATE_SELECTION2) and not FAST_DYNAMIC_SELECTION:
     log_warn(
@@ -992,17 +1012,6 @@ if not is_self_interaction:
 else:
     static_sel2_idx_set = static_sel1_idx_set
 
-print("\n------------------------------------------------------")
-print(" SYSTEM INFORMATION ")
-print("------------------------------------------------------")
-log_info(f"TOTAL ATOM COUNT: {total_atom_count}")
-log_info(f"SELECTION-1  : \"{SELECTION1}\" (atom count at frame 0: {len(static_sel1_idx_set)})")
-log_info(f"UPDATE SEL-1 : {'ON' if UPDATE_SELECTION1 else 'OFF'}")
-if not is_self_interaction:
-    log_info(f"SELECTION-2  : \"{SELECTION2}\" (atom count at frame 0: {len(static_sel2_idx_set)})")
-    log_info(f"UPDATE SEL-2 : {'ON' if UPDATE_SELECTION2 else 'OFF'}")
-print("------------------------------------------------------\n")
-
 
 # ------------------------------------------------------------------------
 # VDW NBFIX Detection and Cloning
@@ -1016,10 +1025,37 @@ for f in base_system.getForces():
         break
 
 # ------------------------------------------------------------------------
+# SYSTEM INFORMATION LOG
+# ------------------------------------------------------------------------
+if __name__ == '__main__':
+    print("\n------------------------------------------------------")
+    print(" SYSTEM INFORMATION ")
+    print("------------------------------------------------------")
+    log_info(f"TOTAL ATOM COUNT: {N_ATOMS}")
+    log_info(f"SELECTION-1  : \"{SELECTION1}\" (atom count at frame 0: {len(static_sel1_idx_set)})")
+    log_info(f"UPDATE SEL-1 : {'ON' if UPDATE_SELECTION1 else 'OFF'}")
+    if not is_self_interaction:
+        log_info(f"SELECTION-2  : \"{SELECTION2}\" (atom count at frame 0: {len(static_sel2_idx_set)})")
+        log_info(f"UPDATE SEL-2 : {'ON' if UPDATE_SELECTION2 else 'OFF'}")
+    log_info(f"CHARMM NBFix : {'ON' if HAS_NBFIX else 'OFF'}")
+    log_info(f"PERIODIC     : {'ON' if PERIODIC else 'OFF'}  (PME: {'ON' if PME_ENABLED else 'OFF'})")
+    log_info(f"SWITCHING    : {'ON' if HAS_SWITCHING else 'OFF'}")
+    print("------------------------------------------------------\n")
+
+# ------------------------------------------------------------------------
 # VDW and ELECTRIC Force definition
 # ------------------------------------------------------------------------
+# Force Group Constants
+FORCE_GROUP_VDW = 1
+FORCE_GROUP_ELEC = 2
+FORCE_GROUP_BOND = 3
+FORCE_GROUP_ANGL = 4
+FORCE_GROUP_DIHE = 5
+FORCE_GROUP_IMPR = 6
+FORCE_GROUP_PME_RECIP = 7
+
 # NAMD X-PLOR Cutoff & Shifting Algebra
-if SWITCHDIST > 0 and SWITCHDIST < CUTOFF:
+if HAS_SWITCHING:
     ron = SWITCHDIST / 10.0
     roff = CUTOFF / 10.0
     roff2 = roff ** 2
@@ -1064,7 +1100,7 @@ if PERIODIC and PME_ENABLED:
     pme_recip_force = mm.NonbondedForce()
     pme_recip_force.setNonbondedMethod(mm.NonbondedForce.PME)
     pme_recip_force.setIncludeDirectSpace(False)  # Isolate reciprocal mesh only
-    pme_recip_force.setForceGroup(7)  # Group 7 (Avoids conflict with IMPR 6)
+    pme_recip_force.setForceGroup(FORCE_GROUP_PME_RECIP)  # Group 7 (Avoids conflict with IMPR 6)
 
     # Static Cross uses GPU offsets for instant 0-overhead toggling
     if not IS_DYNAMIC and not is_self_interaction:
@@ -1141,15 +1177,13 @@ if HAS_NBFIX:
             nx, ny, vals = func.getFunctionParameters()
             vdw_force.addTabulatedFunction(name, mm.Discrete2DFunction(nx, ny, vals))
 
-vdw_force.setForceGroup(1)
-elec_force.setForceGroup(2)
+vdw_force.setForceGroup(FORCE_GROUP_VDW)
+elec_force.setForceGroup(FORCE_GROUP_ELEC)
 print("")
 
 # ------------------------------------------------------------------------
 # Setting ATOM PARAMETERS
 # ------------------------------------------------------------------------
-N_ATOMS = base_system.getNumParticles()
-
 # Parameter Caches, only needed for DYNAMIC selections
 dynamic_elec_q_cache_np: np.ndarray = None  # charges of all atoms, numpy type for fast math
 dynamic_vdw_type_cache: np.ndarray = None       # vdw type values of each particle
@@ -1255,7 +1289,7 @@ vdw_14_force = mm.CustomBondForce(f"4*epsilon*((sigma/r)^12 - (sigma/r)^6)")
 vdw_14_force.addPerBondParameter("sigma")
 vdw_14_force.addPerBondParameter("epsilon")
 vdw_14_force.setUsesPeriodicBoundaryConditions(PERIODIC)
-vdw_14_force.setForceGroup(1)
+vdw_14_force.setForceGroup(FORCE_GROUP_VDW)
 
 if PERIODIC and PME_ENABLED:
     # Subtracts artificial reciprocal mesh overlaps (erf) to yield pure scaled Coulomb math
@@ -1268,7 +1302,7 @@ elec_14_force.addPerBondParameter("q_14")
 if PERIODIC and PME_ENABLED:
     elec_14_force.addPerBondParameter("q_prod")
 elec_14_force.setUsesPeriodicBoundaryConditions(PERIODIC)
-elec_14_force.setForceGroup(2)
+elec_14_force.setForceGroup(FORCE_GROUP_ELEC)
 
 vdw_14_count, elec_ex_count = 0, 0
 
@@ -1319,7 +1353,7 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
 
             if not is_ub and "bond" in final_erg_components:
                 new_f = mm.HarmonicBondForce()
-                new_f.setForceGroup(3)
+                new_f.setForceGroup(FORCE_GROUP_BOND)
                 added = 0
                 for i in range(f.getNumBonds()):
                     p1, p2, l, k = f.getBondParameters(i)
@@ -1332,7 +1366,7 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
 
             elif is_ub and "angl" in final_erg_components:
                 new_f = mm.HarmonicBondForce()
-                new_f.setForceGroup(4)  # Route UB explicitly to ANGLE
+                new_f.setForceGroup(FORCE_GROUP_ANGL)  # Route UB explicitly to ANGLE
                 added = 0
                 for i in range(f.getNumBonds()):
                     p1, p2, l, k = f.getBondParameters(i)
@@ -1345,7 +1379,7 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
 
         elif fname == "HarmonicAngleForce" and "angl" in final_erg_components:
             new_f = mm.HarmonicAngleForce()
-            new_f.setForceGroup(4)
+            new_f.setForceGroup(FORCE_GROUP_ANGL)
             added = 0
             for i in range(f.getNumAngles()):
                 p1, p2, p3, th, k = f.getAngleParameters(i)
@@ -1358,7 +1392,7 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
 
         elif fname == "PeriodicTorsionForce" and "dihe" in final_erg_components:
             new_f = mm.PeriodicTorsionForce()
-            new_f.setForceGroup(5)
+            new_f.setForceGroup(FORCE_GROUP_DIHE)
             added = 0
             for i in range(f.getNumTorsions()):
                 p1, p2, p3, p4, per, ph, k = f.getTorsionParameters(i)
@@ -1371,7 +1405,7 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
 
         elif fname == "CustomTorsionForce" and "impr" in final_erg_components:
             new_f = mm.CustomTorsionForce(f.getEnergyFunction())
-            new_f.setForceGroup(6)
+            new_f.setForceGroup(FORCE_GROUP_IMPR)
             for j in range(f.getNumPerTorsionParameters()):
                 new_f.addPerTorsionParameter(f.getPerTorsionParameterName(j))
             for j in range(f.getNumGlobalParameters()):
@@ -1388,7 +1422,7 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
 
         elif fname == "CMAPTorsionForce" and "dihe" in final_erg_components:
             new_f = mm.CMAPTorsionForce()
-            new_f.setForceGroup(5)  # Sums natively into Dihedral group
+            new_f.setForceGroup(FORCE_GROUP_DIHE)  # Sums natively into Dihedral group
             for i in range(f.getNumMaps()):
                 size, map_data = f.getMapParameters(i)
                 new_f.addMap(size, map_data)
@@ -1428,9 +1462,15 @@ del u_init_ts
 gc.collect()  # force python gc
 
 # Extended Group Mapping
-group_map = {"vdw": 1, "elec": 2, "bond": 3, "angl": 4, "dihe": 5, "impr": 6}
+force_group_map = {"vdw": FORCE_GROUP_VDW,
+                   "elec": FORCE_GROUP_ELEC,
+                   "bond": FORCE_GROUP_BOND,
+                   "angl": FORCE_GROUP_ANGL,
+                   "dihe": FORCE_GROUP_DIHE,
+                   "impr": FORCE_GROUP_IMPR}
+
 comp_idx = {"vdw": 0, "elec": 1, "bond": 2, "angl": 3, "dihe": 4, "impr": 5}
-active_fetches = [(1 << group_map[c], comp_idx[c]) for c in final_erg_components]
+active_fetches = [(1 << force_group_map[c], comp_idx[c]) for c in final_erg_components]
 
 
 # =============================================================================
@@ -1474,6 +1514,8 @@ def parallel_reader_worker(shm_buffer, psf, dcd, start, stop, global_offset, ste
             # ------------------------------------------------------
             # Create data for OpenMM
             coords_nm = u.atoms.positions / 10.0  # convert to nm for OpenMM
+
+            # Tricilnic box. A 3x3 matrix with unit cell vectors
             box_nm = ts.triclinic_dimensions / 10.0 if PERIODIC else None  # convert to nm for OpenMM
 
             # --- PHASE 2: ZERO-COPY SHARED MEMORY WRITE ---
@@ -1691,10 +1733,10 @@ def master_producer(shm_buffer, shutdown_event):
 
     except Exception as e:
         shutdown_event.set()
-        log_error(f"Producer thread crashed: {e}")
 
         import traceback
         traceback.print_exception(e)
+        log_error(f"Producer thread crashed: {e}")
     finally:
         # Push EOF termination tokens downstream to gracefully halt all Compute Workers
         for _ in range(NUM_COMPUTE_WORKERS):
@@ -1720,7 +1762,7 @@ def create_comments_str() -> str:
         f"PARAM File(s): {PARAM_FILES}",
         f"PSF File     : {PSF_FILE}",
         f"DCD File(s)  : {DCD_FILES}",
-        f"TOTAL Atom Count: {total_atom_count}",
+        f"TOTAL Atom Count: {N_ATOMS}",
         "## Selections ---------------",
         f"SELECTION 1  : \"{SELECTION1}\"  (atom count at frame 0: {len(static_sel1_idx_set)})",
         f"SELECTION 2  : \"{SELECTION2}\"  (atom count at frame 0: {len(static_sel2_idx_set) if not is_self_interaction else 0})",
@@ -1844,11 +1886,11 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
     # Extract independent force pointers from the local system
     local_vdw_force, local_elec_force, local_pme_force = None, None, None
     for f in local_pair_system.getForces():
-        if f.getForceGroup() == 1:
+        if f.getForceGroup() == FORCE_GROUP_VDW and isinstance(f, mm.CustomNonbondedForce):
             local_vdw_force = f
-        elif f.getForceGroup() == 2:
+        elif f.getForceGroup() == FORCE_GROUP_ELEC and isinstance(f, mm.CustomNonbondedForce):
             local_elec_force = f
-        elif f.getForceGroup() == 7:
+        elif f.getForceGroup() == FORCE_GROUP_PME_RECIP and isinstance(f, mm.NonbondedForce):
             local_pme_force = f
 
     # Localize platform initialization to prevent CUDA Fork crashes
@@ -1884,7 +1926,7 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
     NP_EMPTY_ARR_INT32.setflags(write=False)    # immutable
 
     # Zero output cache
-    zero_erg_arr = np.zeros(len(group_map), dtype=np.float64)
+    zero_erg_arr = np.zeros(len(force_group_map), dtype=np.float64)
     zero_force_mags = [0.0, 0.0, 0.0] if OUT_FORCE else None
     zero_force_comps = [np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64)] if OUT_FORCE_COMPONENTS else None
 
@@ -2006,7 +2048,7 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
                 prev_arr2 = actual_curr_arr2
 
         # Query Energies
-        erg_raw = np.zeros(len(group_map), dtype=np.float64)
+        erg_raw = np.zeros(len(force_group_map), dtype=np.float64)
         for mask, idx in active_fetches:
             erg_raw[idx] = context.getState(getEnergy=True, groups=mask).getPotentialEnergy().value_in_unit(to_kcal)
 
@@ -2157,7 +2199,7 @@ if __name__ == '__main__':
     # Creator allocates the physical RAM. Forked children inherit handles instantly.
     shm_buffer_main = SharedFrameBuffer(
         num_slots=QUEUE_FRAME_COUNT,
-        n_atoms=total_atom_count,
+        n_atoms=N_ATOMS,
         has_dyn_sel1=UPDATE_SELECTION1,
         has_dyn_sel2=not is_self_interaction and UPDATE_SELECTION2,
         is_creator=True

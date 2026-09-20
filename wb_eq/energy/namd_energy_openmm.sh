@@ -30,13 +30,13 @@ export selection_water_bulk="water and not around 5.0 protein"
 OUT_FILE_SUFFIX="3"
 
 
-## Run 1: Protein Self
-# export NAMD_ENERGY_LABEL="Protein Self-Interaction Energy"
-# export NAMD_ENERGY_SELECTION1="protein"
-# export NAMD_ENERGY_SELECTION2=""
-# export NAMD_ENERGY_OUT_PREFIX="prot_self${OUT_FILE_SUFFIX}"
-# export NAMD_ENERGY_OUT_ENERGIES="-conf -nonb -pote"
-# run_openmm_static
+# Run 1: Protein Self
+export NAMD_ENERGY_LABEL="Protein Self-Interaction Energy"
+export NAMD_ENERGY_SELECTION1="protein"
+export NAMD_ENERGY_SELECTION2=""
+export NAMD_ENERGY_OUT_PREFIX="prot_self${OUT_FILE_SUFFIX}"
+export NAMD_ENERGY_OUT_ENERGIES="-conf -nonb -pote"
+run_openmm_static
 #
 # ## Run 2: Water Self
 # export NAMD_ENERGY_LABEL="Water Self-Interaction Energy"
@@ -46,13 +46,13 @@ OUT_FILE_SUFFIX="3"
 # export NAMD_ENERGY_OUT_ENERGIES="-nonb -pote"
 # run_openmm_static
 # #
-## Run 3: Protein-Water
-export NAMD_ENERGY_LABEL="Protein-Water Cross-Interaction Energy"
-export NAMD_ENERGY_SELECTION1="protein"
-export NAMD_ENERGY_SELECTION2="water"
-export NAMD_ENERGY_OUT_PREFIX="prot_water${OUT_FILE_SUFFIX}"
-export NAMD_ENERGY_OUT_ENERGIES="-nonb -pote"
-run_openmm_static
+# ## Run 3: Protein-Water
+# export NAMD_ENERGY_LABEL="Protein-Water Cross-Interaction Energy"
+# export NAMD_ENERGY_SELECTION1="protein"
+# export NAMD_ENERGY_SELECTION2="water"
+# export NAMD_ENERGY_OUT_PREFIX="prot_water${OUT_FILE_SUFFIX}"
+# export NAMD_ENERGY_OUT_ENERGIES="-nonb -pote"
+# run_openmm_static
 
 #-----------------------------------------------------------------
 
@@ -83,12 +83,12 @@ run_openmm_static
 # export NAMD_ENERGY_OUT_ENERGIES="-all"
 # run_openmm
 
-## Run: Protein-Bulk Water
-export NAMD_ENERGY_LABEL="Protein Bulk Water Cross-Interaction Energy"
-export NAMD_ENERGY_SELECTION1="protein"
-export NAMD_ENERGY_SELECTION2="$selection_water_bulk"
-export NAMD_ENERGY_UPDATE_SELECTION1=0
-export NAMD_ENERGY_UPDATE_SELECTION2=1
-export NAMD_ENERGY_OUT_PREFIX="prot_water_bulk${OUT_FILE_SUFFIX}"
-export NAMD_ENERGY_OUT_ENERGIES="-nonb -pote"
-run_openmm
+# ## Run: Protein-Bulk Water
+# export NAMD_ENERGY_LABEL="Protein Bulk Water Cross-Interaction Energy"
+# export NAMD_ENERGY_SELECTION1="protein"
+# export NAMD_ENERGY_SELECTION2="$selection_water_bulk"
+# export NAMD_ENERGY_UPDATE_SELECTION1=0
+# export NAMD_ENERGY_UPDATE_SELECTION2=1
+# export NAMD_ENERGY_OUT_PREFIX="prot_water_bulk${OUT_FILE_SUFFIX}"
+# export NAMD_ENERGY_OUT_ENERGIES="-nonb -pote"
+# run_openmm
