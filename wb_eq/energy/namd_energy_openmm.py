@@ -17,6 +17,9 @@
 TODO TEST: ALMOST STABLE IMPLEMENTATION OF MULTIPROCESSING COMPUTE LOOP
 1. DONE: Extensive testing is needed
 2. TODO: Stats (IO wait, init ... etc) needs to be reimplemented around parallel Workers
+        Avg worker stats
+
+3. TODO: frame load times in frame loader
 """
 
 ## USAGE --------------------------------------------------
@@ -2339,12 +2342,12 @@ if __name__ == '__main__':
     producer_process.start()
 
     # ---------------- MAIN THREAD STRING CONSUMER ----------------
-    t_work_start = time.perf_counter()
-    t_init_total += (t_work_start- t_app_start)  # TODO: TEST must add worker init times
+    t_compute_start = time.perf_counter()
+    t_init_total += (t_compute_start - t_app_start)  # TODO: TEST must add worker init times
 
     frames_processed = 0
     next_progress_report_frames = PROGRESS_REPORT_INTERVAL_FRAMES
-    t_last_progress_report = t_work_start
+    t_last_progress_report = t_compute_start
 
     active_omm_workers = NUM_COMPUTE_WORKERS
     log_info("Main Process is listening for computed frames...")
@@ -2367,12 +2370,6 @@ if __name__ == '__main__':
                 log_warn(f"Frame Producer crashed (Exit Code: {producer_process.exitcode}). Initiating shutdown.")
                 shutdown_event.set()
                 SHUTDOWN_REQUESTED = True
-
-            # # Safely catch deadlocks if producer/workers crash
-            # if not producer_process.is_alive() and shm_buffer_main.ready_slots.empty() and out_erg_q.empty():
-            #     log_warn("Producer or Workers died unexpectedly. Initiating shutdown.")
-            #     shutdown_event.set()
-            #     SHUTDOWN_REQUESTED = True
             continue
 
         if msg is None:
@@ -2405,6 +2402,8 @@ if __name__ == '__main__':
     shm_buffer_main.close()
 
     # Worker Time metrics
+    max_w_t_init = 0.0
+    max_w_t_io_wait = 0.0
     for _ in range(NUM_COMPUTE_WORKERS):
         w_meta = None
         try: w_meta = out_meta_q.get_nowait()
@@ -2413,16 +2412,19 @@ if __name__ == '__main__':
 
         w_id, w_t_total, w_t_init_total, w_t_compute_total, w_t_io_wait_total = w_meta
 
-        # Add worker times to global time metrics
-        t_init_total += w_t_init_total
-        t_compute_total += w_t_compute_total
-        t_io_wait_total += w_t_io_wait_total
+        # Cannot just add worker times, as they run in parallel
+        max_w_t_init = max(max_w_t_init, w_t_init_total)
+        max_w_t_io_wait = max(max_w_t_io_wait, w_t_io_wait_total)
+
+    t_init_total += max_w_t_init
+    t_io_wait_total += max_w_t_io_wait
 
     # =============================================================================
     # EXECUTION REPORT
     # =============================================================================
     t_app_end = time.perf_counter()
     t_total = t_app_end - t_app_start
+    t_compute_total = t_app_end - t_compute_start
     t_compute_active_total = max(0.0, t_compute_total - t_io_wait_total)
 
     avg_fps = frames_processed / max(0.001, t_compute_total)
