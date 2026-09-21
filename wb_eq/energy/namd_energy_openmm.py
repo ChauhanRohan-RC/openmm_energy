@@ -334,17 +334,9 @@ import shutil
 import signal
 import atexit
 import threading
-
 from itertools import chain
 import subprocess
 import numpy as np
-import openmm as mm
-from openmm import app, unit
-
-import warnings
-warnings.filterwarnings("ignore", message=r".*DCDReader currently makes independent timesteps.*")
-import MDAnalysis as mda
-
 import multiprocessing as mp
 try:
     # Force 'fork' to prevent catastrophic script re-execution on macOS/Windows spawn defaults
@@ -352,6 +344,15 @@ try:
 except Exception:
     pass
 from multiprocessing import shared_memory
+
+# OpenMM main import
+import openmm as mm
+from openmm import app, unit
+
+# MDAnalysis import
+import MDAnalysis as mda
+import warnings
+warnings.filterwarnings("ignore", message=r".*DCDReader currently makes independent timesteps.*")
 
 
 
