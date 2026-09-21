@@ -1156,7 +1156,7 @@ for f in base_system.getForces():
 # ------------------------------------------------------------------------
 if __name__ == '__main__':
     print("\n------------------------------------------------------")
-    print(" SYSTEM INFORMATION ")
+    log_info(" SYSTEM INFORMATION ")
     print("------------------------------------------------------")
     log_info(f"PARAM Files  : {len(CHARMM_PARAM_FILES)} {CHARMM_PARAM_FILES}")
     log_info(f"Structure    : {PSF_FILE}")
@@ -1718,7 +1718,7 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, chu
         temp_name = os.path.join(RAM_DISK_PATH, f"{base_name}_chunk_{unique_suffix}.dcd")
         cmd = ["catdcd", "-o", temp_name, "-first", str(current_start), "-last", str(current_last), dcd_file]
 
-        log_info(f"LOADER 2 RAM CHUNKING: Extracting frames {current_start}-{current_last} via catdcd to RAM...")
+        log_info(f"CHUNK LOAD START: Extracting {CYAN}Frames: {current_start}-{current_last}{NOCOL} to RAM (via catdcd) ...")
         t0 = time.perf_counter()
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -1733,11 +1733,16 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, chu
             break
 
         if proc.returncode == 0:
-            t_ram_load_total += (time.perf_counter() - t0)
+            t1e = time.perf_counter() - t0
+            t_ram_load_total += t1e
             register_ram_file(temp_name)
             chunks_queue.put((temp_name, this_chunk_frames))
+
+            chunk_fps = this_chunk_frames / max(t1e, 0.0001)
+            mib_ps = chunk_fps * bytes_per_frame / (1024 * 1024)
+            log_info(f"CHUNK LOAD DONE: {CYAN}Frames: {current_start}-{current_last}{NOCOL}  |  Time Taken: {t1e:.1f} s  |  Speed: {chunk_fps:.1f} fps (~{mib_ps:.1f} MiB/s)  \n   => CHUNK FILE: {temp_name}")
         else:
-            log_error(f"LOADER 2: catdcd subprocess failed with return code: {proc.returncode}")
+            log_error(f"CATDCD FAILED: Subprocess exited with return code: {proc.returncode}")
 
         frames_remaining -= this_chunk_frames
         current_start += this_chunk_frames
@@ -1798,7 +1803,7 @@ def master_producer(shm_buffer: SharedFrameBuffer, shutdown_event: mp.Event):
 
             # Logic for determining Loader Strategy
             if not RAM_LOAD_ENABLED:
-                log_info(f"LOADER 0 DISK STREAM: RAM Loading Disabled. Streaming {base_name} from Disk...")
+                log_info(f"DISK STREAM FALLBACK: RAM Loading Disabled. Streaming {base_name} from Disk...")
                 disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
                 global_frame_offset += total_frames
                 continue
@@ -1812,17 +1817,22 @@ def master_producer(shm_buffer: SharedFrameBuffer, shutdown_event: mp.Event):
             # RAM direct copy mode
             if not RAM_CHUNK_MODE or total_frames <= RAM_CHUNK_FRAMES:
                 if file_fits:
-                    log_info(f"LOADER 1 FULL RAM LOAD: Loading entire {os.path.basename(dcd_file)} file to RAM ...")
+                    log_info(f"FULL RAM LOAD START: Loading entire {os.path.basename(dcd_file)} file to RAM ...")
                     temp_dcd = os.path.join(RAM_DISK_PATH, f"{base_name}_copy_{uuid.uuid4().hex[:8]}.dcd")
+                    fbytes = os.path.getsize(dcd_file)
                     t0 = time.perf_counter()
                     shutil.copy2(dcd_file, temp_dcd)
-                    t_ram_load_total += (time.perf_counter() - t0)
+                    t1e = time.perf_counter() - t0
+                    t_ram_load_total += t1e
+                    mib_ps = (fbytes / max(t1e, 0.001)) / (1024*1024)
+
+                    log_info(f"FULL RAM LOAD DONE: File: {os.path.basename(dcd_file)}  |  Time: {t1e.1f} s  |  Speed: {mib_ps:.1f} MiB/ps")
 
                     register_ram_file(temp_dcd)
                     ramdisk_read_blocking(shm_buffer, temp_dcd, total_frames, global_frame_offset, shutdown_event)
                     unregister_ram_file(temp_dcd)
                 elif not RAM_CHUNK_MODE:
-                    log_warn( f"[LOADER 0] DISK STREAM: Insufficient RAM for direct copy of {os.path.basename(dcd_file)}. Falling back to disk streaming.")
+                    log_warn( f"DISK STREAM FALLBACK: Insufficient RAM for direct copy of {os.path.basename(dcd_file)}. Falling back to disk streaming.")
                     disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
 
                 global_frame_offset += total_frames
@@ -1834,26 +1844,26 @@ def master_producer(shm_buffer: SharedFrameBuffer, shutdown_event: mp.Event):
 
             if free_space < two_chunk_bytes:
                 if not RAM_CHUNK_DYNAMIC:
-                    log_warn(f"LOADER 2: Falling back to DISK STREAM. Insufficient RAM and Dynamic Chunking is disabled. Streaming from disk: {os.path.basename(dcd_file)}")
+                    log_warn(f"DISK STREAM FALLBACK: Insufficient RAM and Dynamic Chunking is disabled. Streaming from disk: {os.path.basename(dcd_file)}")
                     disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
                     global_frame_offset += total_frames
                     continue
 
-                log_warn(f"LOADER 2 LOW RAM: Cannot fit 2 default chunks ({active_chunk_frames} frames each).")
+                log_warn(f"LOW RAM: Cannot fit 2 default chunks ({active_chunk_frames} frames each) to RAM")
                 available_for_chunks = free_space - margin_bytes
                 resized_frames = int(available_for_chunks / (2 * bytes_per_frame)) if available_for_chunks > 0 else 0
 
                 if resized_frames < RAM_CHUNK_MIN_FRAMES:
-                    log_warn(f"LOADER 2: Dynamic chunk size ({resized_frames}) below MIN_CHUNK_FRAMES ({RAM_CHUNK_MIN_FRAMES}).")
-                    log_warn(f"LOADER 2: Falling back to Disk Streaming for {os.path.basename(dcd_file)}.")
+                    log_warn(f"FAILED DYNAMIC CHUNK SIZE: Dynamic chunk size ({resized_frames}) below MIN_CHUNK_FRAMES ({RAM_CHUNK_MIN_FRAMES}).")
+                    log_warn(f"DISK STREAM FALLBACK: Falling back to Disk Streaming for {os.path.basename(dcd_file)}.")
                     disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
                     global_frame_offset += total_frames
                     continue
 
                 active_chunk_frames = resized_frames
-                log_info(f"LOADER 2: DYNAMIC CHUNK SIZING: Reduced chunk size to {active_chunk_frames} frames.")
+                log_info(f"DYNAMIC CHUNK SIZING: Reduced chunk size to {active_chunk_frames} frames.")
 
-            log_info(f"LOADER 2: catdcd Chunking with {active_chunk_frames} frames/chunk)")
+            log_info(f"CHUNKING TO RAM: CATDCD Chunking with {active_chunk_frames} frames/chunk")
             q_chunks = queue.Queue(maxsize=2)
             chunk_mgr_thread = threading.Thread(target=catdcd_chunk_loader,
                                                 args=(
@@ -2448,7 +2458,7 @@ if __name__ == '__main__':
     t_last_progress_report = t_compute_start
 
     active_omm_workers = NUM_COMPUTE_WORKERS
-    log_info("Main Process is listening for computed frames...")
+    log_info("Main Process is listening for computed frames...\n")
     while active_omm_workers > 0 and not shutdown_event.is_set():
         try:
             # Poll the lightweight string queue
