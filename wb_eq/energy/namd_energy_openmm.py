@@ -2526,7 +2526,7 @@ if __name__ == '__main__':
     print(f" Status               : {status_str}")
     print(f" Frames Processed     : {frames_processed}")
     print(f" Processing Speed     : {avg_fps_col}{avg_fps:.1f} frames/sec{NOCOL} (avg)")
-    print(f" Final Output File    : {CYAN}{out_file_path}{CYAN}")
+    print(f" Final Output File    : {CYAN}{out_file_path}{NOCOL}")
     print(f" Compute Engine       : {OPENMM_PLATFORM_DISPLAY_NAME}")
     print("-" * 60)
     print(f" Total Wall Time      : {t_total:.1f} s")
