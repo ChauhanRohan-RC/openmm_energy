@@ -202,17 +202,20 @@ PME_TOLERANCE: float = 1e-6                      # NAMD default PME error tolera
 # MAIN
 # ==========================================================================
 
-print("\n\n")
+print("")
 
 # Logging ------------------------------
 def log_info(msg): print(f"\033[92m[INFO]\033[0m {msg}")
 
-
-def log_warn(msg): print(f"\033[93m[WARN]\033[0m {msg}")
-
-
 def log_debug(msg):
     if DEBUG: print(f"\033[93m[DEBUG]\033[0m {msg}")
+
+
+def log_warn(msg, exc=None):
+    if exc is not None:
+        import traceback
+        traceback.print_exception(exc)
+    print(f"\033[93m[WARN]\033[0m {msg}")
 
 
 def log_error(msg, exc=None):
@@ -476,6 +479,47 @@ class SharedFrameBuffer:
     Zero-Copy Inter-Process Communication (IPC) ring buffer.
     Allocates contiguous RAM blocks to share coordinate and index arrays
     across independent Python processes without Pickling/Serialization overhead.
+
+    WORKFLOW:
+    ----------------------
+    => [Producer process]
+    ----------------------
+    slot_idx = None
+    while not shutdown_event.is_set():
+        try:
+            # Lease a free memory block from the ring buffer
+            slot_idx = shm_buffer.free_slots.get(timeout=1.0)
+            break
+        except queue.Empty: continue
+
+    if shutdown_event.is_set() or slot_idx is None: break OR return
+
+    # Dump data directly into raw RAM
+    shm_buffer.write_frame(slot_idx, abs_f, coords_nm, box_nm, arr1, arr2)
+
+    # Notify Compute Workers that this memory block is ready
+    shm_buffer.ready_slots.put(slot_idx)
+
+    ----------------------
+    => [Consumer process]
+     ----------------------
+    while not shutdown_event.is_set():
+        try:
+            slot_idx = shm_buffer.ready_slots.get(timeout=1.0)
+        except queue.Empty: continue
+
+        if slot_idx is None: break
+
+        # Zero-Copy Read from Shared RAM. DO NOT FREE IT YET, OTHERWISE it may get overwritten by producer
+        abs_f, coords_nm, box_nm, arr_sel1, arr_sel2, n1, n2 = shm_buffer.read_frame(slot_idx)
+
+        # DO WORK WITH THE SHARED DATA HERE.
+
+        # When done., release memory
+        shm_buffer.free_slots.put(slot_idx)
+    -----------------------------------------------------------------------------
+
+    Must call .close() when done 
     """
     TAG = "SharedFrameBuffer"
 
@@ -486,8 +530,10 @@ class SharedFrameBuffer:
         self.has_dyn_sel2 = has_dyn_sel2
         self.is_creator = is_creator
 
-        self.shm_blocks = {}
-        self.arrays = {}
+        self._lock = mp.Lock()
+        self._is_closed: bool = False
+        self.shm_blocks: dict = {}
+        self.arrays: dict = {}
 
         # Memory Optimization: Use float32 for coords and int32 for indices.
         self.specs = {
@@ -529,63 +575,95 @@ class SharedFrameBuffer:
             for i in range(num_slots):
                 self.free_slots.put(i)
 
-    def write_frame(self, slot_idx: int, abs_frame_idx: int, coords: np.ndarray, box: np.ndarray, arr_sel1: np.ndarray,
+    def is_closed(self) -> bool: return self._is_closed
+
+    def check_creator_closed(self, func_tag=""):
+        if not self.is_creator: raise RuntimeError(f"{self.TAG}:{func_tag} Not a creator")
+        if self._is_closed: raise RuntimeError(f"{self.TAG}:{func_tag} Already closed")
+
+    def get_free_slot(self, block: bool = True, timeout: float | None = None) -> int:
+        self.check_creator_closed("get_free_slot")
+        return self.free_slots.get(block=block, timeout=timeout)
+
+    def get_ready_slot(self, block: bool = True, timeout: float | None = None) -> int:
+        self.check_creator_closed("get_ready_slot")
+        return self.ready_slots.get(block=block, timeout=timeout)
+
+    def put_free_slot(self, slot_idx: int, block: bool = True, timeout: float | None = None):
+        self.check_creator_closed("put_free_slot")
+        return self.free_slots.put(slot_idx, block=block, timeout=timeout)
+
+    def put_ready_slot(self, slot_idx: int, block: bool = True, timeout: float | None = None):
+        self.check_creator_closed("put_ready_slot")
+        return self.ready_slots.put(slot_idx, block=block, timeout=timeout)
+
+    def write_frame(self, free_slot_idx: int, abs_frame_idx: int, coords: np.ndarray, box: np.ndarray, arr_sel1: np.ndarray,
                     arr_sel2: np.ndarray):
         """
         Called by Reader Processes: Dumps extracted data directly into the shared RAM slot.
 
-        @:param slot_idx: slot id, previously acquired from polling self.free_slots
+        @:param free_slot_idx: slot id, previously acquired from polling self.free_slots
         @:param abs_f: absolute frame index
         @:param coords_nm: coordinates array. Shape (N_atoms, 3)
         @:param box_nm: box vectors. A 3x3 Matrix
         @:param arr_sel1: selection-1 atom indices array, or NOne
         @:param arr_sel2: selection-2 atom indices array, or None
         """
+        # if self._is_closed: raise RuntimeError(f"{self.TAG}: Already closed. Cannot write frames")
+            
         n1 = len(arr_sel1) if arr_sel1 is not None else 0
         n2 = len(arr_sel2) if arr_sel2 is not None else 0
 
-        self.arrays['meta'][slot_idx, 0] = abs_frame_idx
-        self.arrays['meta'][slot_idx, 1] = n1
-        self.arrays['meta'][slot_idx, 2] = n2
+        self.arrays['meta'][free_slot_idx, 0] = abs_frame_idx
+        self.arrays['meta'][free_slot_idx, 1] = n1
+        self.arrays['meta'][free_slot_idx, 2] = n2
 
         # Implicitly casts float64 coordinates to float32 natively
-        self.arrays['coords'][slot_idx] = coords
+        self.arrays['coords'][free_slot_idx] = coords
 
         if box is not None:
-            self.arrays['box'][slot_idx] = box
+            self.arrays['box'][free_slot_idx] = box
 
         if self.has_dyn_sel1 and n1 > 0:
-            self.arrays['sel1'][slot_idx, :n1] = arr_sel1
+            self.arrays['sel1'][free_slot_idx, :n1] = arr_sel1
         if self.has_dyn_sel2 and n2 > 0:
-            self.arrays['sel2'][slot_idx, :n2] = arr_sel2
+            self.arrays['sel2'][free_slot_idx, :n2] = arr_sel2
 
-    def read_frame(self, slot_idx: int):
+    def read_frame(self, ready_slot_idx: int):
         """
         Called by Compute Workers: Returns NumPy views sliced exactly to the dynamic selection lengths
 
-        @:param slot_idx: slot id previously acquired from polling self.ready_slots
+        @:param free_slot_idx: slot id previously acquired from polling self.ready_slots
         """
-        abs_f = int(self.arrays['meta'][slot_idx, 0])
-        n1 = int(self.arrays['meta'][slot_idx, 1])
-        n2 = int(self.arrays['meta'][slot_idx, 2])
+        # if self._is_closed: raise RuntimeError(f"{self.TAG}: Already closed. Cannot read frames")
+        
+        abs_f = int(self.arrays['meta'][ready_slot_idx, 0])
+        n1 = int(self.arrays['meta'][ready_slot_idx, 1])
+        n2 = int(self.arrays['meta'][ready_slot_idx, 2])
 
-        coords_nm = self.arrays['coords'][slot_idx]
-        box_nm = self.arrays['box'][slot_idx]
+        coords_nm = self.arrays['coords'][ready_slot_idx]
+        box_nm = self.arrays['box'][ready_slot_idx]
 
-        arr_sel1 = self.arrays['sel1'][slot_idx, :n1] if self.has_dyn_sel1 else None
-        arr_sel2 = self.arrays['sel2'][slot_idx, :n2] if self.has_dyn_sel2 else None
+        arr_sel1 = self.arrays['sel1'][ready_slot_idx, :n1] if self.has_dyn_sel1 else None
+        arr_sel2 = self.arrays['sel2'][ready_slot_idx, :n2] if self.has_dyn_sel2 else None
 
         return abs_f, coords_nm, box_nm, arr_sel1, arr_sel2, n1, n2
 
-    def cleanup(self):
-        for name, shm in self.shm_blocks.items():
-            shm.close()
-            if self.is_creator:
-                try:
-                    shm.unlink()
-                    log_debug(f"{self.TAG}: Unlinked Shared RAM '{shm.name}'")
-                except Exception:
-                    pass
+    def close(self):
+        if self._is_closed: return
+        
+        with self._lock:
+            if self._is_closed: return
+            for name, shm in self.shm_blocks.items():
+                shm.close()
+                if self.is_creator:
+                    try:
+                        shm.unlink()
+                        log_debug(f"{self.TAG}: Unlinked Shared RAM '{shm.name}'")
+                    except Exception as e:
+                        log_warn(f"{self.TAG}: Failed to unlink Shared RAM '{shm.name}': {e}", e)
+
+            self._is_closed = True
 
 
 # =======================================================
@@ -631,9 +709,9 @@ class IndexStreamBuffer:
         """
 
         if output_file_path is None or len(output_file_path.strip()) == 0:
-            raise ValueError(f"{self.__class__.TAG}: output_file_path cannot be empty")
+            raise ValueError(f"{self.TAG}: output_file_path cannot be empty")
         if chunk_size <= 0:
-            raise ValueError(f"{self.__class__.TAG}: Chunk size must be greater than zero. Given: {chunk_size}")
+            raise ValueError(f"{self.TAG}: Chunk size must be greater than zero. Given: {chunk_size}")
 
         self.out_file_path = output_file_path
         self.chunk_size = chunk_size
@@ -658,7 +736,7 @@ class IndexStreamBuffer:
             try:
                 os.remove(self.out_file_path)
             except Exception as e:
-                raise RuntimeError("{self.__class__.TAG}: Could not remove file: " + self.out_file_path) from e
+                raise RuntimeError("{self.TAG}: Could not remove file: " + self.out_file_path) from e
 
     def _set_next_index(self, next_index: int):
         self._next_index: int = next_index
@@ -666,7 +744,7 @@ class IndexStreamBuffer:
 
     def _check_closed(self):
         if self._is_closed:
-            raise RuntimeError("{self.__class__.TAG}: Index buffer already is closed")
+            raise RuntimeError("{self.TAG}: Index buffer already is closed")
 
     def is_closed(self) -> bool:
         return self._is_closed
@@ -680,11 +758,11 @@ class IndexStreamBuffer:
     def insert(self, index: int, value: object):
         self._check_closed()
         if index < 0:
-            raise ValueError(f"{self.__class__.TAG}: Index must be greater than or equal to 0, given: {index}")
+            raise ValueError(f"{self.TAG}: Index must be greater than or equal to 0, given: {index}")
 
         with self._lock:
             if DEBUG and index in self._data:
-                log_warn(f"{self.__class__.TAG}: INDEX {index} already present !!!")
+                log_warn(f"{self.TAG}: INDEX {index} already present !!!")
 
             self._data[index] = value
             self._consider_flush_unsafe()
@@ -736,12 +814,10 @@ class IndexStreamBuffer:
             self._write_chunk_indices(indices, indices_size=self.chunk_size)
 
     def close(self):
-        if self._is_closed:
-            return
+        if self._is_closed: return
 
         with self._lock:
-            if self._is_closed:
-                return
+            if self._is_closed: return
             self._is_closed = True
 
             # force flush remaining indices in order
@@ -755,7 +831,7 @@ class IndexStreamBuffer:
                 try:
                     self._out_fd.close()
                 except Exception as e:
-                    print(f"{self.__class__.TAG}: WARNING Could not close output file: {self.out_file_path}", e)
+                    log_warn(f"{self.TAG}: Failed to close output file '{self.out_file_path}' : {e}", e)
 
 
 # ------------------------------------------------------------------------
@@ -815,7 +891,7 @@ def cleanup():
     # Safe fallback for Shared Memory cleanup if the script crashed early
     shm_buf = shm_buffer_main
     if shm_buf is not None:
-        shm_buf.cleanup()
+        shm_buf.close()
 
     idx_streamer = index_stream_buffer
     if idx_streamer is not None and isinstance(idx_streamer, IndexStreamBuffer):
@@ -840,6 +916,7 @@ def handle_exit():
     print("")
     log_info(f"Exiting...")
     cleanup()
+    print("")
 
 def handle_os_signal(signum, frame):
     global SHUTDOWN_REQUESTED
@@ -1052,6 +1129,8 @@ if __name__ == '__main__':
     log_info(f"CHARMM NBFix : {'ON' if HAS_NBFIX else 'OFF'}")
     log_info(f"PERIODIC     : {'ON' if PERIODIC else 'OFF'}  (PME: {'ON' if PME_ENABLED else 'OFF'})")
     log_info(f"SWITCHING    : {'ON' if HAS_SWITCHING else 'OFF'}")
+    if FRAME_STEP > 1:
+        log_info(f"FRAME_STEP   : {FRAME_STEP}")
     print("------------------------------------------------------\n")
 
 # ------------------------------------------------------------------------
@@ -1979,7 +2058,7 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
 
         if slot_idx is None: break
 
-        # Zero-Copy Read from Shared RAM
+        # Zero-Copy Read from Shared RAM. DO NOT FREE IT YET, OTHERWISE it may get overwritten by producer
         abs_f, coords_nm, box_nm, arr_sel1, arr_sel2, n1, n2 = shm_buffer.read_frame(slot_idx)
 
         # Fallback to baked global static NumPy arrays if a specific selection wasn't dynamic
@@ -2296,7 +2375,7 @@ if __name__ == '__main__':
     for w in workers:
         w.join(timeout=5)
 
-    shm_buffer_main.cleanup()
+    shm_buffer_main.close()
 
     # =============================================================================
     # EXECUTION REPORT
