@@ -65,16 +65,16 @@ export NAMD_ENERGY_UPDATE_SELECTION2=0
 export NAMD_ENERGY_OUT_PREFIX="water_hydration_self${OUT_FILE_SUFFIX}"
 export NAMD_ENERGY_OUT_ENERGIES="-nonb -pote"
 run_openmm
-#
-# ## Run: Bulk Water Self
-# export NAMD_ENERGY_LABEL="Bulk Water Self-interaction Energy"
-# export NAMD_ENERGY_SELECTION1="$selection_water_bulk"
-# export NAMD_ENERGY_SELECTION2=""
-# export NAMD_ENERGY_UPDATE_SELECTION1=1
-# export NAMD_ENERGY_UPDATE_SELECTION2=0
-# export NAMD_ENERGY_OUT_PREFIX="water_bulk_self${OUT_FILE_SUFFIX}"
-# export NAMD_ENERGY_OUT_ENERGIES="-nonb -pote"
-# run_openmm
+
+## Run: Bulk Water Self
+export NAMD_ENERGY_LABEL="Bulk Water Self-interaction Energy"
+export NAMD_ENERGY_SELECTION1="$selection_water_bulk"
+export NAMD_ENERGY_SELECTION2=""
+export NAMD_ENERGY_UPDATE_SELECTION1=1
+export NAMD_ENERGY_UPDATE_SELECTION2=0
+export NAMD_ENERGY_OUT_PREFIX="water_bulk_self${OUT_FILE_SUFFIX}"
+export NAMD_ENERGY_OUT_ENERGIES="-nonb -pote"
+run_openmm
 
 ## Run: Protein-Hydration Water
 export NAMD_ENERGY_LABEL="Protein Hydration Water Cross-Interaction Energy"

@@ -78,7 +78,7 @@ RAM_READER_COUNT: int = 2            # Concurrent readers for RAM chunks. Auto-d
 # --------------------------------------------------------------------
 # INPUT
 # --------------------------------------------------------------------
-PARAM_FILES = [
+CHARMM_PARAM_FILES = [
     "../../common/ff/par_all36m_prot.prm",
     "../../common/ff/toppar_water_ions.prot.str"
 ]
@@ -953,6 +953,24 @@ def handle_os_signal(signum, frame):
 # VALIDATION AND PRECONDITIONS
 # =============================================================================
 log_info(f"Starting Pair Interaction Analysis ({LABEL})")
+
+
+def check_files(file_paths: str | list[str], display_name: str):
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
+
+    if len(file_paths) == 0:
+        log_error(f"NO {display_name} supplied")
+    else:
+        for fp in file_paths:
+            if not os.path.isfile(fp):
+                log_error(f"{display_name} not found: \"{fp}\"")
+
+
+check_files(PSF_FILE, "STRUCTURE FILE")
+check_files(DCD_FILES, "DCD FILE")
+check_files(CHARMM_PARAM_FILES, "PARAMETER FILE")
+
 if not SELECTION1.strip():
     log_error("SELECTION1 cannot be empty. Please define a valid atom selection.")
 
@@ -1031,7 +1049,7 @@ if len(final_erg_components) == 0:
 # =============================================================================
 log_info("Parsing Topology and Forcefield...")
 psf = app.CharmmPsfFile(PSF_FILE)
-params = app.CharmmParameterSet(*PARAM_FILES)
+params = app.CharmmParameterSet(*CHARMM_PARAM_FILES)
 
 if PERIODIC:
     psf.setBox(10.0 * unit.nanometers, 10.0 * unit.nanometers, 10.0 * unit.nanometers)
@@ -1135,6 +1153,10 @@ if __name__ == '__main__':
     print("\n------------------------------------------------------")
     print(" SYSTEM INFORMATION ")
     print("------------------------------------------------------")
+    log_info(f"PARAM Files  : {len(CHARMM_PARAM_FILES)} {CHARMM_PARAM_FILES}")
+    log_info(f"Structure    : {PSF_FILE}")
+    log_info(f"DCD Files    : {len(DCD_FILES)} {DCD_FILES}")
+    print("-----------------")
     log_info(f"TOTAL ATOM COUNT: {N_ATOMS}")
     log_info(f"SELECTION-1  : \"{SELECTION1}\" (atom count at frame 0: {len(static_sel1_idx_set)})")
     log_info(f"UPDATE SEL-1 : {'ON' if UPDATE_SELECTION1 else 'OFF'}")
@@ -1872,7 +1894,7 @@ def create_comments_str() -> str:
         f"------------------------------------------------",
         f"=========   {LABEL}    ========",
         f"------------------------------------------------",
-        f"PARAM File(s): {PARAM_FILES}",
+        f"PARAM File(s): {CHARMM_PARAM_FILES}",
         f"PSF File     : {PSF_FILE}",
         f"DCD File(s)  : {DCD_FILES}",
         f"TOTAL Atom Count: {N_ATOMS}",
