@@ -221,7 +221,7 @@ def log_debug(msg, flush=True):
     if DEBUG: print(f"{CYAN}[DEBUG]{NOCOL} {msg}", flush=flush)
 
 
-def log_progress(msg, tag="PROGRESS", flush=True): print(f"{MAGENTA}[{tag}]{NOCOL} {msg}", flush=flush)
+def log_progress(msg, tag="PROGRESS", tty_color=MAGENTA, flush=True): print(f"{tty_color}[{tag}]{NOCOL} {msg}", flush=flush)
 
 
 def log_warn(msg, exc=None, flush=True):
@@ -1682,7 +1682,7 @@ def parallel_reader_worker(id, shm_buffer: SharedFrameBuffer,
                 t_prog_now = time.perf_counter()
                 read_fps = PROGRESS_REPORT_INTERVAL_FRAMES / max(0.001, t_prog_now - t_last_prog_report)
                 read_ms_per_frame = (1 / max(read_fps, 0.001)) * 1000
-                log_progress(tag=f"FRAME READER {id}", msg=f"Speed: {read_fps:.1f} fps  ({read_ms_per_frame:.2f} ms/frame)" + (f"  {RED}[FRAME BUFFER FULL]{NOCOL}" if shm_buffer.is_full() else ""))
+                log_progress(tag=f"FRAME READER {id}", tty_color=BLUE, msg=f"Speed: {read_fps:.1f} fps  ({read_ms_per_frame:.2f} ms/frame)" + (f"  {RED}[FRAME BUFFER FULL]{NOCOL}" if shm_buffer.is_full() else ""))
                 next_prog_report_frame += PROGRESS_REPORT_INTERVAL_FRAMES
                 t_last_prog_report = t_prog_now
     finally:
