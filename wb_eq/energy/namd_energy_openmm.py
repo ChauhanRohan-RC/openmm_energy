@@ -1954,17 +1954,29 @@ def create_output_erg_line(erg_row) -> str:
 # =============================================================================
 # INDEPENDENT COMPUTE WORKER PROCESS (Multi-processed)
 # =============================================================================
-def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_xml):
+def compute_worker_process(worker_id: int,
+                           shutdown_event: mp.Event,
+                           system_xml,
+                           shm_buffer: SharedFrameBuffer,
+                           out_erg_queue: mp.Queue,
+                           out_meta_queue: mp.Queue | None = None):
     """
     Standalone Compute Worker Process.
     Instantiates its own OpenMM Context and reads Zero-Copy frames from shared memory.
     """
-    # Ignore OS signals in child processes; let the parent handle them cleanly
+    import time
     import signal
+
+    # Ignore OS signals in child processes; let the parent handle them cleanly
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
     # log_info(f"WORKER {worker_id}: Initializing OpenMM Context on [{OPENMM_PLATFORM_DISPLAY_NAME}] ....")
+    local_t_start = time.perf_counter()
+    local_t_total = 0.0
+    local_t_init_total = 0.0
+    local_t_compute_total = 0.0     # = io_wait + compute_active
+    local_t_io_wait_total = 0.0
 
     # Deep-copy the C++ System to prevent SWIG pointer race conditions!
     local_pair_system = mm.XmlSerializer.deserialize(system_xml)
@@ -2010,10 +2022,6 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
     to_kcal = unit.kilocalorie_per_mole
     to_kcal_A = unit.kilocalorie_per_mole / unit.angstrom
 
-    # # Constants
-    # NP_EMPTY_ARR_INT32 = np.array([], dtype=np.int32)
-    # NP_EMPTY_ARR_INT32.setflags(write=False)    # immutable
-
     # Zero output cache
     zero_erg_arr = np.zeros(len(force_group_map), dtype=np.float64)
     zero_force_mags = [0.0, 0.0, 0.0] if OUT_FORCE else None
@@ -2044,17 +2052,23 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
         mask1 = np.zeros(N_ATOMS, dtype=bool)
         mask2 = np.zeros(N_ATOMS, dtype=bool)
 
+    # pre run GC
+    gc.collect()
+
     # Counters
-    frames_processed = 0
+    local_frames_processed = 0
     next_manual_gc_frames = MANUAL_GC_INTERVAL_FRAMES
 
-    gc.collect()        # pre run GC
+    # Time Metrics
+    local_t_compute_start = time.perf_counter()
+    local_t_init_total += (local_t_compute_start - local_t_start)
 
     while not shutdown_event.is_set():
+        t_itr_start = time.perf_counter()
         try:
             slot_idx = shm_buffer.ready_slots.get(timeout=1.0)
-        except queue.Empty:
-            continue
+        except queue.Empty: continue
+        finally: local_t_io_wait_total += (time.perf_counter() - t_itr_start)
 
         if slot_idx is None: break
 
@@ -2072,9 +2086,9 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
             # Emit zero-energy string to IndexStreamBuffer to prevent contiguous deadlocks
             zero_out_str = create_output_erg_line((abs_f, 0, n2 if UPDATE_SELECTION2 else None, zero_erg_arr, zero_force_mags, zero_force_comps))
 
-            try: out_q.put((abs_f, zero_out_str))
+            try: out_erg_queue.put((abs_f, zero_out_str))
             except Exception: pass
-            frames_processed += 1
+            local_frames_processed += 1
             continue
 
         context.setPositions(coords_nm)
@@ -2223,24 +2237,33 @@ def compute_worker_process(worker_id, shm_buffer, out_q, shutdown_event, system_
 
         # Push formatted string to lightweight output queue
         try:
-            out_q.put((abs_f, out_str))
-        except Exception:
-            pass
+            out_erg_queue.put((abs_f, out_str))
+        except Exception: pass
 
         # Release the slot back to the Reader Pool
         shm_buffer.free_slots.put(slot_idx)
 
         # ------------------ Finalize ------------------------
-        frames_processed += 1
+        local_frames_processed += 1
 
         # SWIG PROXY FLUSH (DYNAMIC MEMORY STABILIZATION)
-        if MANUAL_GC_ENABLED and IS_DYNAMIC and frames_processed == next_manual_gc_frames:
-            log_debug(f"WORKER {worker_id}: Manual garbage collection at frame {frames_processed}")
+        if MANUAL_GC_ENABLED and IS_DYNAMIC and local_frames_processed == next_manual_gc_frames:
+            log_debug(f"WORKER {worker_id}: Manual garbage collection at local frame {local_frames_processed}")
             gc.collect()
             next_manual_gc_frames += MANUAL_GC_INTERVAL_FRAMES
 
+    # Final Time Metrics
+    local_t_end = time.perf_counter()
+    local_t_total = local_t_end - local_t_start
+    local_t_compute_total = local_t_end - local_t_compute_start
+
+    # Return local time metrics to Main process
+    if out_meta_queue is not None:
+        try : out_meta_queue.put((worker_id, local_t_total, local_t_init_total, local_t_compute_total, local_t_io_wait_total))
+        except Exception: pass
+
     # Tell the Main Orchestrator this worker has gracefully terminated
-    try: out_q.put(None)
+    try: out_erg_queue.put(None)
     except Exception: pass
 
     # Worker shutdown cleanup
@@ -2297,13 +2320,17 @@ if __name__ == '__main__':
         is_creator=True
     )
 
-    out_queue = mp.Queue()
+    # Worker energy output queue
+    out_erg_q = mp.Queue()
+
+    # Worker Meta data queue
+    out_meta_q = mp.Queue()
 
     log_info(f"Spawning {NUM_COMPUTE_WORKERS} OpenMM Contexts (compute workers)...")
     workers = []
     for i in range(NUM_COMPUTE_WORKERS):
         p = mp.Process(target=compute_worker_process,
-                       args=(i + 1, shm_buffer_main, out_queue, shutdown_event, system_serialized_xml))
+                       args=(i + 1, shutdown_event, system_serialized_xml, shm_buffer_main, out_erg_q, out_meta_q))
         p.start()
         workers.append(p)
 
@@ -2312,18 +2339,19 @@ if __name__ == '__main__':
     producer_process.start()
 
     # ---------------- MAIN THREAD STRING CONSUMER ----------------
-    t_compute_start = time.perf_counter()
+    t_work_start = time.perf_counter()
+    t_init_total += (t_work_start- t_app_start)  # TODO: TEST must add worker init times
 
     frames_processed = 0
     next_progress_report_frames = PROGRESS_REPORT_INTERVAL_FRAMES
-    t_last_progress_report = time.perf_counter()
+    t_last_progress_report = t_work_start
 
     active_omm_workers = NUM_COMPUTE_WORKERS
     log_info("Main Process is listening for computed frames...")
     while active_omm_workers > 0 and not shutdown_event.is_set():
         try:
             # Poll the lightweight string queue
-            msg = out_queue.get(timeout=1.0)
+            msg = out_erg_q.get(timeout=1.0)
         except queue.Empty:
             # Safely catch Worker crashes (e.g., OOM, Segfault)
             # If a worker dies, it won't send its 'None' token, so active_omm_workers won't decrement.
@@ -2341,7 +2369,7 @@ if __name__ == '__main__':
                 SHUTDOWN_REQUESTED = True
 
             # # Safely catch deadlocks if producer/workers crash
-            # if not producer_process.is_alive() and shm_buffer_main.ready_slots.empty() and out_queue.empty():
+            # if not producer_process.is_alive() and shm_buffer_main.ready_slots.empty() and out_erg_q.empty():
             #     log_warn("Producer or Workers died unexpectedly. Initiating shutdown.")
             #     shutdown_event.set()
             #     SHUTDOWN_REQUESTED = True
@@ -2365,8 +2393,6 @@ if __name__ == '__main__':
             next_progress_report_frames += PROGRESS_REPORT_INTERVAL_FRAMES
             t_last_progress_report = t_now
 
-    t_compute_total = time.perf_counter() - t_compute_start
-
     log_info("Shutting down IPC pipeline...")
     shutdown_event.set()
 
@@ -2375,14 +2401,31 @@ if __name__ == '__main__':
     for w in workers:
         w.join(timeout=5)
 
+    # Close Shared memory buffer
     shm_buffer_main.close()
+
+    # Worker Time metrics
+    for _ in range(NUM_COMPUTE_WORKERS):
+        w_meta = None
+        try: w_meta = out_meta_q.get_nowait()
+        except queue.Empty: break
+        if w_meta is None: continue
+
+        w_id, w_t_total, w_t_init_total, w_t_compute_total, w_t_io_wait_total = w_meta
+
+        # Add worker times to global time metrics
+        t_init_total += w_t_init_total
+        t_compute_total += w_t_compute_total
+        t_io_wait_total += w_t_io_wait_total
 
     # =============================================================================
     # EXECUTION REPORT
     # =============================================================================
-    t_total = time.perf_counter() - t_app_start
-    compute_active_time = max(0.0, t_compute_total - t_io_wait_total)
-    fps = frames_processed / max(0.001, t_compute_total)
+    t_app_end = time.perf_counter()
+    t_total = t_app_end - t_app_start
+    t_compute_active_total = max(0.0, t_compute_total - t_io_wait_total)
+
+    avg_fps = frames_processed / max(0.001, t_compute_total)
     status_str = "\033[91mABORTED (Early Exit)\033[0m" if SHUTDOWN_REQUESTED else "\033[92mSUCCESS\033[0m"
 
     print(f"\n{get_cur_datetime_formatted()}")
@@ -2391,13 +2434,14 @@ if __name__ == '__main__':
     print("=" * 60)
     print(f" Status               : {status_str}")
     print(f" Frames Processed     : {frames_processed}")
-    print(f" Processing Speed     : {fps:.1f} frames/sec")
-    print(f" Compute Engine       : {OPENMM_PLATFORM_DISPLAY_NAME}")
+    print(f" Processing Speed     : {avg_fps:.1f} frames/sec (avg)")
     print(f" Final Output File    : {out_file_path}")
+    print(f" Compute Engine       : {OPENMM_PLATFORM_DISPLAY_NAME}")
     print("-" * 60)
     print(f" Total Wall Time      : {t_total:.1f} s")
-    print(f"   ├─ catdcd/RAM I/O  : {t_ram_load_total:.1f} s")
-    print(f"   ├─ Compute Loop    : {t_compute_total:.1f} s")
-    print(f"   │    ├─ Active     : {compute_active_time:.1f} s")
-    print(f"   │    └─ I/O Wait   : {t_io_wait_total:.1f} s")
+    print(f"   ├─ Initialization  : {t_init_total:.1f} s  ({t_init_total / t_total * 100:.2f} %)")
+    print(f"   ├─ catdcd/RAM I/O  : {t_ram_load_total:.1f} s  ({t_ram_load_total / t_total * 100:.2f} %)")
+    print(f"   ├─ Compute Loop    : {t_compute_total:.1f} s  ({t_compute_total / t_total * 100:.2f} %)")
+    print(f"        ├─ Active     : {t_compute_active_total:.1f} s  ({t_compute_active_total / max(0.001, t_compute_total) * 100:.2f} % of compute time)")
+    print(f"        └─ I/O Wait   : {t_io_wait_total:.1f} s  ({t_io_wait_total / max(0.001, t_compute_total) * 100:.2f} % of compute time)")
     print("=" * 60 + "\n")
