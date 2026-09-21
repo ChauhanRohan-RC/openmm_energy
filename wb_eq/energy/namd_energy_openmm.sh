@@ -27,7 +27,7 @@ export selection_water_hydration="water and around 4.25 protein"
 export selection_water_bulk="water and not around 5.0 protein"
 
 # TEST
-OUT_FILE_SUFFIX="9"
+OUT_FILE_SUFFIX=""
 
 
 # Run 1: Protein Self
