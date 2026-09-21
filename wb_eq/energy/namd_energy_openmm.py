@@ -1826,7 +1826,7 @@ def master_producer(shm_buffer: SharedFrameBuffer, shutdown_event: mp.Event):
                     t_ram_load_total += t1e
                     mib_ps = (fbytes / max(t1e, 0.001)) / (1024*1024)
 
-                    log_info(f"FULL RAM LOAD DONE: File: {os.path.basename(dcd_file)}  |  Time: {t1e.1f} s  |  Speed: {mib_ps:.1f} MiB/ps")
+                    log_info(f"FULL RAM LOAD DONE: File: {os.path.basename(dcd_file)}  |  Time: {t1e:.1f} s  |  Speed: {mib_ps:.1f} MiB/ps")
 
                     register_ram_file(temp_dcd)
                     ramdisk_read_blocking(shm_buffer, temp_dcd, total_frames, global_frame_offset, shutdown_event)
