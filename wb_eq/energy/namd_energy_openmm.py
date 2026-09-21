@@ -213,24 +213,26 @@ BLUE = "\033[94m"
 MAGENTA = "\033[95m"
 CYAN = "\033[96m"
 
-def log_info(msg): print(f"{GREEN}[INFO]{NOCOL} {msg}")
+def flush_stdout(): sys.stdout.flush()
 
-def log_debug(msg):
-    if DEBUG: print(f"{CYAN}[DEBUG]{NOCOL} {msg}")
+def log_info(msg, flush=True): print(f"{GREEN}[INFO]{NOCOL} {msg}", flush=flush)
+
+def log_debug(msg, flush=True):
+    if DEBUG: print(f"{CYAN}[DEBUG]{NOCOL} {msg}", flush=flush)
 
 
-def log_warn(msg, exc=None):
+def log_warn(msg, exc=None, flush=True):
     if exc is not None:
         import traceback
         traceback.print_exception(exc)
-    print(f"{YELLOW}[WARN]{NOCOL} {msg}")
+    print(f"{YELLOW}[WARN]{NOCOL} {msg}", flush=flush)
 
 
-def log_error(msg, exc=None):
+def log_error(msg, exc=None, flush=True):
     if exc is not None:
         import traceback
         traceback.print_exception(exc)
-    print(f"{RED}[ERROR]{NOCOL} {msg}")
+    print(f"{RED}[ERROR]{NOCOL} {msg}", flush=flush)
     sys.exit(1)
 
 
@@ -325,6 +327,7 @@ if __name__ == '__main__':
     log_info(f" => Readers     : {f'{actual_ram_reader_count} (RAM cached mode) |' if RAM_LOAD_ENABLED else ''} 1 (DISK stream)")
     log_info(f" => CPU Threads : {assigned_mda_threads}/reader ({mda_alloc_mode})  [OMP_NUM_THREADS]")
     print("-" * 60)
+    flush_stdout()
 # ---------------------------------------------------------------------
 
 # Imports (must be after thread allocation)
@@ -391,8 +394,7 @@ class FastDynamicSelector:
         match = pattern.match(selection_string.strip())
 
         if not match:
-            raise ValueError(
-                f"Could not parse dynamic selection: '{selection_string}'. Expected format: '<base_sel> and [not] around <distance> <ref_sel>'")
+            raise ValueError(f"Could not parse dynamic selection: '{selection_string}'. Expected format: '<base_sel> and [not] around <distance> <ref_sel>'")
 
         base_str, not_str, dist_str, ref_str = match.groups()
 
@@ -404,8 +406,7 @@ class FastDynamicSelector:
         if not self.ref_sel_str:
             raise ValueError("Reference selection missing in 'around' clause.")
 
-        log_debug(
-            f"FastDynamicSelector parsed: Base='{self.base_sel_str}', Invert={self.invert}, Cutoff={self.cutoff}A, Ref='{self.ref_sel_str}'")
+        log_debug(f"FastDynamicSelector parsed: Base='{self.base_sel_str}', Invert={self.invert}, Cutoff={self.cutoff}A, Ref='{self.ref_sel_str}'")
 
         # Extract permanent indices at frame 0
         base_ag = universe.select_atoms(self.base_sel_str)
@@ -437,8 +438,7 @@ class FastDynamicSelector:
             else:
                 use_scipy = False
                 if not self._triclinic_warned:
-                    log_warn(
-                        "Triclinic box detected! SciPy cKDTree requires orthogonal boxes. Falling back to MDAnalysis capped_distance (Slower).")
+                    log_warn("Triclinic box detected! SciPy cKDTree requires orthogonal boxes. Falling back to MDAnalysis capped_distance (Slower).")
                     self._triclinic_warned = True
 
         if use_scipy:
@@ -513,7 +513,7 @@ class SharedFrameBuffer:
 
     ----------------------
     => [Consumer process]
-     ----------------------
+    ----------------------
     while not shutdown_event.is_set():
         try:
             slot_idx = shm_buffer.ready_slots.get(timeout=1.0)
@@ -937,7 +937,7 @@ def handle_exit():
     print("")
     log_info(f"Exiting...")
     cleanup()
-    print("")
+    print("", flush=True)
 
 def handle_os_signal(signum, frame):
     global SHUTDOWN_REQUESTED
@@ -1174,6 +1174,7 @@ if __name__ == '__main__':
     if FRAME_STEP > 1:
         log_info(f"FRAME_STEP   : {FRAME_STEP}")
     print("------------------------------------------------------\n")
+    flush_stdout()
 
 # ------------------------------------------------------------------------
 # VDW and ELECTRIC Force definition
@@ -2380,7 +2381,7 @@ def process_worker_meta_data(meta_q: mp.Queue) -> np.ndarray | None:
             print(f"   ├─ Initialization  : {w_t_init:.1f} s  ({w_t_init / w_t_total * 100:.2f} %)")
             print(f"   ├─ Compute Loop    : {w_t_compute:.1f} s  ({w_t_compute / w_t_total * 100:.2f} %)")
             print(f"        ├─ Active     : {w_t_compute_active:.1f} s  ({w_t_compute_active / max(0.001, w_t_compute) * 100:.2f} %)")
-            print(f"        └─ I/O Wait   : {w_t_io_wait:.1f} s  ({w_t_io_wait / max(0.001, w_t_compute) * 100:.2f} %)")
+            print(f"        └─ I/O Wait   : {w_t_io_wait:.1f} s  ({w_t_io_wait / max(0.001, w_t_compute) * 100:.2f} %)", flush=True)
             # print("-" * 40)
 
     # Average worker times
@@ -2548,4 +2549,4 @@ if __name__ == '__main__':
     if avg_fps < 20:
         log_warn("SLOW COMPUTE PERFORMANCE: Make sure USE_GPU is enabled and increase NUM_COMPUTE_WORKERS (OpenMM Contexts)")
 
-    print("")
+    print("", flush=True)
