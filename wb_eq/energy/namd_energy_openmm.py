@@ -221,6 +221,9 @@ def log_debug(msg, flush=True):
     if DEBUG: print(f"{CYAN}[DEBUG]{NOCOL} {msg}", flush=flush)
 
 
+def log_progress(msg, tag="PROGRESS", flush=True): print(f"{MAGENTA}[{tag}]{NOCOL} {msg}", flush=flush)
+
+
 def log_warn(msg, exc=None, flush=True):
     if exc is not None:
         import traceback
@@ -1679,7 +1682,7 @@ def parallel_reader_worker(id, shm_buffer: SharedFrameBuffer,
                 t_prog_now = time.perf_counter()
                 read_fps = PROGRESS_REPORT_INTERVAL_FRAMES / max(0.001, t_prog_now - t_last_prog_report)
                 read_ms_per_frame = (1 / max(read_fps, 0.001)) * 1000
-                log_info(f"FRAME READER {id}: Speed: {read_fps:.1f} fps  ({read_ms_per_frame:.2f} ms/frame)" + (f"  {RED}[FRAME BUFFER FULL]{NOCOL}" if shm_buffer.is_full() else ""))
+                log_progress(tag=f"FRAME READER {id}", msg=f"Speed: {read_fps:.1f} fps  ({read_ms_per_frame:.2f} ms/frame)" + (f"  {RED}[FRAME BUFFER FULL]{NOCOL}" if shm_buffer.is_full() else ""))
                 next_prog_report_frame += PROGRESS_REPORT_INTERVAL_FRAMES
                 t_last_prog_report = t_prog_now
     finally:
@@ -1718,7 +1721,7 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, chu
         temp_name = os.path.join(RAM_DISK_PATH, f"{base_name}_chunk_{unique_suffix}.dcd")
         cmd = ["catdcd", "-o", temp_name, "-first", str(current_start), "-last", str(current_last), dcd_file]
 
-        log_info(f"CHUNK LOAD START: Extracting {CYAN}Frames: {current_start}-{current_last}{NOCOL} to RAM (via catdcd) ...")
+        log_info(f"CHUNK LOAD START: {MAGENTA}Frames [{current_start}, {current_last}]{NOCOL} loading to RAM (via catdcd) ...")
         t0 = time.perf_counter()
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -1740,7 +1743,8 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, chu
 
             chunk_fps = this_chunk_frames / max(t1e, 0.0001)
             mib_ps = chunk_fps * bytes_per_frame / (1024 * 1024)
-            log_info(f"CHUNK LOAD DONE: {CYAN}Frames: {current_start}-{current_last}{NOCOL}  |  Time Taken: {t1e:.1f} s  |  Speed: {chunk_fps:.1f} fps (~{mib_ps:.1f} MiB/s)  \n   => CHUNK FILE: {temp_name}")
+            log_info(f"CHUNK LOAD DONE : {MAGENTA}Frames [{current_start}, {current_last}]{NOCOL}  |  Time Taken: {t1e:.1f} s  |  Speed: {chunk_fps:.1f} fps (~{mib_ps:.1f} MiB/s)")
+            # log_debug(f" => CHUNK FILE: {temp_name}")
         else:
             log_error(f"CATDCD FAILED: Subprocess exited with return code: {proc.returncode}")
 
@@ -2498,7 +2502,7 @@ if __name__ == '__main__':
             q_frames = shm_buffer_main.size()
             q_frames_col = RED if q_frames < 3 else YELLOW if q_frames < 10 else GREEN
 
-            log_info(f"PROGRESS: Processed {frames_processed} frames  |  Speed: {fps_col}{fps_current:.1f} fps{NOCOL}  | Queued Frames: {q_frames_col}{q_frames}{NOCOL}")
+            log_progress(f"Processed: {frames_processed} frames  |  Speed: {fps_col}{fps_current:.1f} fps{NOCOL}  | Queued Frames: {q_frames_col}{q_frames}{NOCOL}")
             next_progress_report_frame += PROGRESS_REPORT_INTERVAL_FRAMES
             t_last_progress_report = t_now
 
