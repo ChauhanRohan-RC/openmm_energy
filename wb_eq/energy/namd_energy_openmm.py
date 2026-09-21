@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+# Requirements: 
+# => pip packages : numpy, openmm[cuda], mdanalysis
+# => external : catdcd (for chunking DCD to RAM)
+
 # ========================================================================
 # OpenMM and MDAnalysis implementation of NAMD PairInteraction Energy
 # ------------------------------------------------------------------------
