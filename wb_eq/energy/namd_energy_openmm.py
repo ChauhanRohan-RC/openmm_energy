@@ -1727,7 +1727,10 @@ def disk_stream_blocking(shm_buffer: SharedFrameBuffer, dcd_file: str, total_fra
     parallel_reader_worker_blocking(1, shm_buffer, PSF_FILE, dcd_file, 0, total_frames, FRAME_STEP, global_frame_offset, shutdown_event)
 
 
-def ramdisk_read(executor: ThreadPoolExecutor, shm_buffer: SharedFrameBuffer, temp_dcd: str, num_frames: int, global_frame_offset: int, shutdown_event: mp.Event, block: bool) -> list[Future] | None:
+def ramdisk_read(reader_idx: int, executor: ThreadPoolExecutor,
+                 shm_buffer: SharedFrameBuffer,
+                 temp_dcd: str, num_frames: int, global_frame_offset: int,
+                 shutdown_event: mp.Event, block: bool) -> list[Future] | None:
     """
     In blocking mode, we wait for all reader threads to finish,  and return None
 
@@ -1749,7 +1752,7 @@ def ramdisk_read(executor: ThreadPoolExecutor, shm_buffer: SharedFrameBuffer, te
         stop = min((i + 1) * c_size, num_frames)
         if start >= stop: continue
 
-        fut = executor.submit(parallel_reader_worker_blocking, i + 1, shm_buffer, PSF_FILE, temp_dcd,
+        fut = executor.submit(parallel_reader_worker_blocking, reader_idx + i, shm_buffer, PSF_FILE, temp_dcd,
                               start, stop, FRAME_STEP,
                               global_frame_offset, shutdown_event)
         futures.append(fut)
@@ -1834,7 +1837,11 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, chu
 
 
 def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queue, shutdown_event: mp.Event):
+    global_frame_offset = 0
+
     ram_reader_tpool: ThreadPoolExecutor | None = None  # init on demand
+    ramdisk_read_futures = []       # all ramdisk_read futures
+    ram_reader_count = 0
 
     # HELPER FUNCTIONS -----------------------------------------
     def create_ram_reader_th_pool():
@@ -1844,7 +1851,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
         if delete: try_delete_file_nothrow(filepath)
         action_queue.put((ACTION_UNREGISTER_RAM_FILE, filepath))  # Unregister for safety
 
-    def _swapn_ramdisk_read_wait_thread(dcd_file: str | None, futures: list[Future] | None):
+    def _handle_async_ram_read(dcd_file: str | None, futures: list[Future] | None):
         if futures is None or len(futures) == 0:
             if dcd_file: _local_unregister_ram_file(dcd_file)
             return
@@ -1852,12 +1859,15 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
         def _worker():
             concurrent.futures.wait(futures)
             if dcd_file: _local_unregister_ram_file(dcd_file)
-        # start waiting thread
+
+        ramdisk_read_futures.extend(futures)
+        # start waiting thread to wait on these specific futures, and delete this file as soon as finished
         threading.Thread(target=_worker).start()
 
-    # MAIN BLOCK ---------------------------------------------------
+    # ---------------------------------------------------------
+    # MAIN BLOCK
+    # ---------------------------------------------------------
     try:
-        global_frame_offset = 0
         for dcd_file in DCD_FILES:
             if shutdown_event.is_set():
                 break
@@ -1903,9 +1913,10 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
                     log_info(f"FULL RAM LOAD DONE : File '{os.path.basename(dcd_file)}'  |  Time: {t_taken:.1f} s  |  Speed: {mib_ps:.1f} MiB/ps")
                     if ram_reader_tpool is None:
                         ram_reader_tpool = create_ram_reader_th_pool()
-                    ramdisk_read(ram_reader_tpool, shm_buffer, temp_dcd, total_frames,
+                    ramdisk_read(ram_reader_count, ram_reader_tpool,
+                                 shm_buffer, temp_dcd, total_frames,
                                  global_frame_offset, shutdown_event, block=True)
-
+                    ram_reader_count += 1
                     _local_unregister_ram_file(temp_dcd)
                 elif not RAM_CHUNK_MODE:
                     log_warn( f"DISK STREAM FALLBACK: Insufficient RAM for direct copy of '{os.path.basename(dcd_file)}'. Falling back to disk streaming.")
@@ -1954,31 +1965,36 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
 
                 if ram_reader_tpool is None:
                     ram_reader_tpool = create_ram_reader_th_pool()
-                futures = ramdisk_read(ram_reader_tpool, shm_buffer, temp_dcd, n_frames,
-                                       global_frame_offset + chunk_frame_offset,
-                                       shutdown_event, block=False)
-
-                _swapn_ramdisk_read_wait_thread(temp_dcd, futures)
+                _futs = ramdisk_read(ram_reader_count, ram_reader_tpool,
+                                             shm_buffer, temp_dcd, n_frames,
+                                             global_frame_offset + chunk_frame_offset,
+                                             shutdown_event, block=False)
+                ram_reader_count += 1
+                _handle_async_ram_read(temp_dcd, _futs)
                 # _local_unregister_ram_file(temp_dcd)
                 chunk_frame_offset += n_frames
 
             chunk_mgr_thread.join()
             global_frame_offset += total_frames
+        # ----------------------------------------------------------------------------------
 
+        # All frames loaded to RAM/streamed to disk
+        # Wait for ramdisk_read workers to finsh
+        concurrent.futures.wait(ramdisk_read_futures)
+        
     except Exception as exc:
         shutdown_event.set()
         log_error(f"Producer thread crashed: {exc}", exc)
     finally:
-        # Push EOF termination tokens downstream to gracefully halt all Compute Workers
-        for _ in range(NUM_COMPUTE_WORKERS):
-            try: shm_buffer.ready_slots.put(None, timeout=1.0)
-            except Exception: pass
-
         # shutdown ram reader pool
         if isinstance(ram_reader_tpool, ThreadPoolExecutor):
             try: ram_reader_tpool.shutdown(wait=True)
             except Exception: pass
 
+        # Push EOF termination tokens downstream to gracefully halt all Compute Workers
+        for _ in range(NUM_COMPUTE_WORKERS):
+            try: shm_buffer.ready_slots.put(None, timeout=1.0)
+            except Exception: pass
 
 
 # =============================================================================
