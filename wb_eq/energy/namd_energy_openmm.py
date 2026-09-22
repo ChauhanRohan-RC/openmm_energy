@@ -17,6 +17,13 @@
 # => Smart multithreading allocation
 # ------------------------------------------------------------------------
 
+# TODO: BUG FIXES AND TESTS
+# 1. dynamic chunk size should only happen once at start
+# 2. ensure chunk size estimate is good. log the actual size
+# 3. action queue handler delay will cause non-registration of ram file in case or ealy exit
+#.   can start a separate bg thread or check the queue in cleanup call
+# 4. log_error behaviour in multi-proc environment
+
 ## USAGE --------------------------------------------------
 # 0: First run normal simulation to obtain .dcd trajectories
 # 1. Copy script to working dir
