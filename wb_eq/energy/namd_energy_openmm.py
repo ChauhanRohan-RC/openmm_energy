@@ -7,7 +7,7 @@
 # ========================================================================
 # OpenMM and MDAnalysis implementation of NAMD PairInteraction Energy
 # ------------------------------------------------------------------------
-# OPTIMIZED FOR GPU's
+# OPTIMIZED FOR GPU
 # ----------------------
 # => calculate pairinteraction energies from NAMD simulation trajectories with CHARMM force fields
 # => STATIC and DYNAMIC selections, self and cross-interactions
@@ -222,16 +222,17 @@ def print_exc_trace(exc):
 
 def flush_stdout(): sys.stdout.flush()
 
+
+def log(tag: str, msg: str, tag_color=BLUE, flush=True): print(f"{tag_color}[{tag}]{NOCOL} {msg}", flush=flush)
+
+
 def log_info(msg, flush=True): print(f"{GREEN}[INFO]{NOCOL} {msg}", flush=flush)
-
-
-def log_progress(msg, tag="PROGRESS", tag_color=MAGENTA, flush=True): print(f"{tag_color}[{tag}]{NOCOL} {msg}", flush=flush)
 
 
 def log_debug(msg, exc=None, flush=True):
     if DEBUG:
         print_exc_trace(exc)
-        print(f"{CYAN}[DEBUG]{NOCOL} {msg}", flush=flush)
+        print(f"{MAGENTA}[DEBUG]{NOCOL} {msg}", flush=flush)
 
 def log_warn(msg, exc=None, flush=True):
     print_exc_trace(exc)
@@ -1709,7 +1710,7 @@ def parallel_reader_worker_blocking(id, shm_buffer: SharedFrameBuffer,
                 t_prog_now = time.perf_counter()
                 read_fps = PROGRESS_REPORT_INTERVAL_FRAMES / max(0.001, t_prog_now - t_last_prog_report)
                 read_ms_per_frame = (1 / max(read_fps, 0.001)) * 1000
-                log_progress(tag=f"FRAME READER {id}", tag_color=BLUE, msg=f"Speed: {read_fps:.1f} fps  ({read_ms_per_frame:.2f} ms/frame)" + (f"  {RED}[FRAME BUFFER FULL]{NOCOL}" if shm_buffer.is_full() else ""))
+                log(tag=f"FRAME READER {id}", msg=f"Frame: {abs_f}  |  Speed: {read_fps:.1f} fps ({read_ms_per_frame:.2f} ms/frame)" + (f" {RED}[FRAME BUFFER FULL]{NOCOL}" if shm_buffer.is_full() else ""))
                 next_prog_report_frame += PROGRESS_REPORT_INTERVAL_FRAMES
                 t_last_prog_report = t_prog_now
     finally:
@@ -1752,7 +1753,8 @@ def ramdisk_read(reader_idx: int, executor: ThreadPoolExecutor,
         stop = min((i + 1) * c_size, num_frames)
         if start >= stop: continue
 
-        fut = executor.submit(parallel_reader_worker_blocking, reader_idx + i, shm_buffer, PSF_FILE, temp_dcd,
+        fut = executor.submit(parallel_reader_worker_blocking, reader_idx + i + 1,
+                              shm_buffer, PSF_FILE, temp_dcd,
                               start, stop, FRAME_STEP,
                               global_frame_offset, shutdown_event)
         futures.append(fut)
@@ -1768,8 +1770,9 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, chu
     bytes_per_frame = file_size / total_frames if total_frames > 0 else 0
     frames_remaining = total_frames
     current_start = 1
-    base_name = os.path.splitext(os.path.basename(dcd_file))[0]
-    chunk_idx = 0
+    base_name = os.path.basename(dcd_file)
+    base_name_noext = os.path.splitext(base_name)[0]
+    chunk_count = 1
 
     while frames_remaining > 0 and not shutdown_event.is_set():
         this_chunk_frames = min(chunk_frames, frames_remaining)
@@ -1783,10 +1786,10 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, chu
             free_space = shutil.disk_usage(RAM_DISK_PATH).free
             if free_space > (est_bytes + margin_bytes):
                 if space_warned:
-                    log_info(f"{GREEN}RAM CHUNKING RESUMED [CHUNK {chunk_idx}]{NOCOL}: RAM DIsk ({RAM_DISK_PATH}) now has enough free space ({free_space/(1024**3):.2f} GiB)")
+                    log_info(f"{GREEN}RAM CHUNKING RESUMED [CHUNK {chunk_count}]{NOCOL}: RAM DIsk ({RAM_DISK_PATH}) now has enough free space ({free_space/(1024**3):.2f} GiB)")
                 break
             if not space_warned:
-                log_warn(f"{YELLOW}RAM CHUNKING PAUSED [CHUNK {chunk_idx}]{NOCOL}: Not enough space in RAM DIsk ({RAM_DISK_PATH}). Waiting for RAM to clear...\n "
+                log_warn(f"{YELLOW}RAM CHUNKING PAUSED [CHUNK {chunk_count}]{NOCOL}: Not enough space in RAM DIsk ({RAM_DISK_PATH}). Waiting for RAM to clear...\n "
                          f"    [RAM DISK] Free: {free_space/(1024**3):.2f} GiB  |  "
                          f"Required: {est_bytes + margin_bytes/(1024**3):.2f} GiB (Safety Margin: {margin_bytes/(1024**3):.2f} GiB)")
                 space_warned = True
@@ -1795,11 +1798,11 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, chu
         if shutdown_event.is_set(): break
 
         unique_suffix = uuid.uuid4().hex[:8]
-        temp_chunk_name = f"{base_name}.chunk-{chunk_idx}.uuid-{unique_suffix}.dcd"
+        temp_chunk_name = f"{base_name_noext}.chunk-{chunk_count}.uuid-{unique_suffix}.dcd"
         temp_chunk_path = os.path.join(RAM_DISK_PATH, temp_chunk_name)
         cmd = ["catdcd", "-o", temp_chunk_path, "-first", str(current_start), "-last", str(current_last), dcd_file]
 
-        log_progress(tag=f"CHUNK {chunk_idx}", tag_color=BLUE, msg=f"{MAGENTA}LOADING: Frames [{current_start}, {current_last}]{NOCOL} to RAM (via catdcd) ...")
+        log(tag=f"CHUNK {chunk_count}", msg=f"{MAGENTA}LOADING: Frames [{current_start}, {current_last}]{NOCOL} to RAM (via catdcd) ...")
         t0 = time.perf_counter()
 
         action_queue.put((ACTION_REGISTER_RAM_FILE, temp_chunk_path))      # Pre-register for safety
@@ -1824,12 +1827,12 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, chu
             # Stats
             chunk_fps = this_chunk_frames / max(t_taken, 0.0001)
             mib_ps = chunk_fps * bytes_per_frame / (1024 * 1024)
-            log_progress(tag=f"CHUNK {chunk_idx}", tag_color=BLUE, msg=f"{MAGENTA}LOADED : Frames [{current_start}, {current_last}]{NOCOL}  |  Time Taken: {t_taken:.1f} s  |  Speed: {chunk_fps:.1f} fps (~{mib_ps:.1f} MiB/s)")
+            log(tag=f"CHUNK {chunk_count}", msg=f"{MAGENTA}LOADED : Frames [{current_start}, {current_last}]{NOCOL}  |  Time Taken: {t_taken:.1f} s  |  Speed: {chunk_fps:.1f} fps (~{mib_ps:.1f} MiB/s)")
             # log_debug(f" => CHUNK FILE: {temp_name}")
         else:
-            log_error(f"{RED}CATDCD FAILED [CHUNK {chunk_idx}]{NOCOL}: Subprocess exited with return code: {proc.returncode}")
+            log_error(f"{RED}CATDCD FAILED [CHUNK {chunk_count}]{NOCOL}: Subprocess exited with return code: {proc.returncode}")
 
-        chunk_idx += 1
+        chunk_count += 1
         frames_remaining -= this_chunk_frames
         current_start += this_chunk_frames
 
@@ -1845,7 +1848,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
 
     # HELPER FUNCTIONS -----------------------------------------
     def create_ram_reader_th_pool():
-        return ThreadPoolExecutor(max_workers=actual_ram_reader_count)
+        return ThreadPoolExecutor(max_workers=actual_ram_reader_count + 1)      # +1 so we can start reading next chunk
 
     def _local_unregister_ram_file(filepath: str, delete: bool = True):
         if delete: try_delete_file_nothrow(filepath)
@@ -1872,7 +1875,8 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
             if shutdown_event.is_set():
                 break
 
-            base_name = os.path.splitext(os.path.basename(dcd_file))[0]
+            base_name = os.path.basename(dcd_file)
+            base_name_noext = os.path.splitext(base_name)[0]
 
             # Find num frames from mda.Universe
             u_temp = mda.Universe(PSF_FILE, dcd_file)
@@ -1885,7 +1889,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
 
             # Logic for determining Loader Strategy
             if not RAM_LOAD_ENABLED:
-                log_info(f"DISK STREAM FALLBACK: RAM Loading Disabled. Streaming {base_name} from Disk...")
+                log_info(f"DISK STREAM: Streaming '{CYAN}{base_name}{NOCOL}' from Disk (RAM Loading Disabled) ...")
                 disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
                 global_frame_offset += total_frames
                 continue
@@ -1899,8 +1903,8 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
             # RAM direct copy mode
             if not RAM_CHUNK_MODE or total_frames <= RAM_CHUNK_FRAMES:
                 if file_fits:
-                    log_info(f"FULL RAM LOAD START: Loading entire {os.path.basename(dcd_file)} file to RAM ...")
-                    temp_dcd = os.path.join(RAM_DISK_PATH, f"{base_name}_copy_{uuid.uuid4().hex[:8]}.dcd")
+                    log_info(f"RAM LOAD: START loading {CYAN}{base_name}{NOCOL} file to RAM ...")
+                    temp_dcd = os.path.join(RAM_DISK_PATH, f"{base_name_noext}_copy_{uuid.uuid4().hex[:8]}.dcd")
                     fbytes = os.path.getsize(dcd_file)
                     t0 = time.perf_counter()
 
@@ -1910,7 +1914,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
                     t_taken = time.perf_counter() - t0
                     action_queue.put((ACTION_ADD_RAM_LOAD_TIME, t_taken))  # RAM LOAD TIME
                     mib_ps = (fbytes / max(t_taken, 0.001)) / (1024*1024)
-                    log_info(f"FULL RAM LOAD DONE : File '{os.path.basename(dcd_file)}'  |  Time: {t_taken:.1f} s  |  Speed: {mib_ps:.1f} MiB/ps")
+                    log_info(f"RAM LOAD:  DONE Loading '{CYAN}{base_name}{NOCOL}'  |  Time: {t_taken:.1f} s  |  Speed: {mib_ps:.1f} MiB/s")
                     if ram_reader_tpool is None:
                         ram_reader_tpool = create_ram_reader_th_pool()
                     ramdisk_read(ram_reader_count, ram_reader_tpool,
@@ -1919,7 +1923,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
                     ram_reader_count += 1
                     _local_unregister_ram_file(temp_dcd)
                 elif not RAM_CHUNK_MODE:
-                    log_warn( f"DISK STREAM FALLBACK: Insufficient RAM for direct copy of '{os.path.basename(dcd_file)}'. Falling back to disk streaming.")
+                    log_warn( f"DISK STREAM FALLBACK: Insufficient RAM for direct copy of '{CYAN}{base_name}{NOCOL}'. Falling back to disk streaming.")
                     disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
 
                 global_frame_offset += total_frames
@@ -1931,7 +1935,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
 
             if free_space < two_chunk_bytes:
                 if not RAM_CHUNK_DYNAMIC:
-                    log_warn(f"DISK STREAM FALLBACK: Insufficient RAM and Dynamic Chunking is disabled. Streaming from disk: {os.path.basename(dcd_file)}")
+                    log_warn(f"DISK STREAM FALLBACK: Insufficient RAM and Dynamic Chunking is disabled. Streaming from disk: {CYAN}{base_name}{NOCOL}")
                     disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
                     global_frame_offset += total_frames
                     continue
@@ -1942,7 +1946,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
 
                 if resized_frames < RAM_CHUNK_MIN_FRAMES:
                     log_warn(f"FAILED DYNAMIC CHUNK SIZE: Dynamic chunk size ({resized_frames}) below MIN_CHUNK_FRAMES ({RAM_CHUNK_MIN_FRAMES}).")
-                    log_warn(f"DISK STREAM FALLBACK: Falling back to Disk Streaming for {os.path.basename(dcd_file)}.")
+                    log_warn(f"DISK STREAM FALLBACK: Falling back to Disk Streaming for {CYAN}{base_name}{NOCOL}.")
                     disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
                     global_frame_offset += total_frames
                     continue
@@ -1950,7 +1954,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
                 active_chunk_frames = resized_frames
                 log_info(f"DYNAMIC CHUNK SIZING: Reduced chunk size to {active_chunk_frames} frames.")
 
-            log_info(f"CHUNKING TO RAM: CATDCD Chunking with {active_chunk_frames} frames/chunk")
+            log_info(f"CHUNKING TO RAM: '{CYAN}{base_name}{NOCOL}' with {active_chunk_frames} frames/chunk")
             chunks_queue = queue.Queue(maxsize=RAM_CHUNK_QUEUE_SIZE)
             chunk_mgr_thread = threading.Thread(target=catdcd_chunk_loader,
                                                 args=(dcd_file, total_frames, active_chunk_frames, chunks_queue, action_queue, shutdown_event))
@@ -1981,7 +1985,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
         # All frames loaded to RAM/streamed to disk
         # Wait for ramdisk_read workers to finsh
         concurrent.futures.wait(ramdisk_read_futures)
-        
+
     except Exception as exc:
         shutdown_event.set()
         log_error(f"Producer thread crashed: {exc}", exc)
@@ -2627,7 +2631,7 @@ if __name__ == '__main__':
             q_frames = shm_buffer_main.size()
             q_frames_col = RED if q_frames < 3 else YELLOW if q_frames < 10 else GREEN
 
-            log_progress(f"Processed: {frames_processed} frames  |  Speed: {fps_col}{fps_current:.1f} fps{NOCOL}  | Queued Frames: {q_frames_col}{q_frames}{NOCOL}")
+            log(tag="PROGRESS", tag_color=CYAN, msg=f"Processed: {frames_processed} frames  |  Speed: {fps_col}{fps_current:.1f} fps{NOCOL}  | Queued Frames: {q_frames_col}{q_frames}{NOCOL}")
             next_progress_report_frame += PROGRESS_REPORT_INTERVAL_FRAMES
             t_last_progress_report = t_now
 
