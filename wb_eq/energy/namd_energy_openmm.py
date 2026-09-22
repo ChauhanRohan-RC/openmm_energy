@@ -1889,7 +1889,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
 
             # Logic for determining Loader Strategy
             if not RAM_LOAD_ENABLED:
-                log_info(f"DISK STREAM: Streaming '{CYAN}{base_name}{NOCOL}' from Disk (RAM Loading Disabled) ...")
+                log_info(f"DISK STREAM: Streaming {CYAN}{base_name}{NOCOL} from Disk (RAM Loading Disabled) ...")
                 disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
                 global_frame_offset += total_frames
                 continue
@@ -1914,7 +1914,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
                     t_taken = time.perf_counter() - t0
                     action_queue.put((ACTION_ADD_RAM_LOAD_TIME, t_taken))  # RAM LOAD TIME
                     mib_ps = (fbytes / max(t_taken, 0.001)) / (1024*1024)
-                    log_info(f"RAM LOAD:  DONE Loading '{CYAN}{base_name}{NOCOL}'  |  Time: {t_taken:.1f} s  |  Speed: {mib_ps:.1f} MiB/s")
+                    log_info(f"RAM LOAD:  DONE Loading {CYAN}{base_name}{NOCOL}  |  Time: {t_taken:.1f} s  |  Speed: {mib_ps:.1f} MiB/s")
                     if ram_reader_tpool is None:
                         ram_reader_tpool = create_ram_reader_th_pool()
                     ramdisk_read(ram_reader_count, ram_reader_tpool,
@@ -1923,7 +1923,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
                     ram_reader_count += 1
                     _local_unregister_ram_file(temp_dcd)
                 elif not RAM_CHUNK_MODE:
-                    log_warn( f"DISK STREAM FALLBACK: Insufficient RAM for direct copy of '{CYAN}{base_name}{NOCOL}'. Falling back to disk streaming.")
+                    log_warn( f"DISK STREAM FALLBACK: Insufficient RAM for direct copy of {CYAN}{base_name}{NOCOL}. Falling back to disk streaming.")
                     disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
 
                 global_frame_offset += total_frames
@@ -1954,7 +1954,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
                 active_chunk_frames = resized_frames
                 log_info(f"DYNAMIC CHUNK SIZING: Reduced chunk size to {active_chunk_frames} frames.")
 
-            log_info(f"CHUNKING TO RAM: '{CYAN}{base_name}{NOCOL}' with {active_chunk_frames} frames/chunk")
+            log_info(f"CHUNKING TO RAM: {CYAN}{base_name}{NOCOL} with {active_chunk_frames} frames/chunk")
             chunks_queue = queue.Queue(maxsize=RAM_CHUNK_QUEUE_SIZE)
             chunk_mgr_thread = threading.Thread(target=catdcd_chunk_loader,
                                                 args=(dcd_file, total_frames, active_chunk_frames, chunks_queue, action_queue, shutdown_event))
@@ -2511,13 +2511,16 @@ def process_worker_meta_data(meta_q: mp.Queue) -> np.ndarray | None:
             w_t_total, w_t_init, w_t_compute, w_t_io_wait = w_meta_data
             w_t_compute_active = w_t_compute - w_t_io_wait
 
+            w_io_wait_percent = w_t_io_wait / max(0.001, w_t_compute) * 100
+            w_io_wait_col = RED if w_io_wait_percent >= 20 else YELLOW if w_io_wait_percent >= 10 else GREEN
+
             print("\n" + "-" * 40)
             log_debug(f"WORKER-{w_id} STATS: ")
             print(f" Total Wall Time      : {w_t_total:.1f} s")
-            print(f"   ├─ Initialization  : {w_t_init:.1f} s  ({w_t_init / w_t_total * 100:.2f} %)")
-            print(f"   ├─ Compute Loop    : {w_t_compute:.1f} s  ({w_t_compute / w_t_total * 100:.2f} %)")
-            print(f"        ├─ Active     : {w_t_compute_active:.1f} s  ({w_t_compute_active / max(0.001, w_t_compute) * 100:.2f} %)")
-            print(f"        └─ I/O Wait   : {w_t_io_wait:.1f} s  ({w_t_io_wait / max(0.001, w_t_compute) * 100:.2f} %)", flush=True)
+            print(f"   ├─ Initialization  : {w_t_init:.1f} s  ({w_t_init / w_t_total * 100:.1f} %)")
+            print(f"   ├─ Compute Loop    : {w_t_compute:.1f} s  ({w_t_compute / w_t_total * 100:.1f} %)")
+            print(f"        ├─ Active     : {w_t_compute_active:.1f} s  ({w_t_compute_active / max(0.001, w_t_compute) * 100:.1f} %)")
+            print(f"        └─ I/O Wait   : {w_io_wait_col}{w_t_io_wait:.1f} s  ({w_io_wait_percent:.1f} %){NOCOL}", flush=True)
             # print("-" * 40)
 
     # Average worker times
@@ -2691,5 +2694,4 @@ if __name__ == '__main__':
 
     if avg_fps < 20:
         log_warn("SLOW COMPUTE PERFORMANCE: Make sure USE_GPU is enabled and increase NUM_COMPUTE_WORKERS (OpenMM Contexts)")
-
-    print("", flush=True)
+    flush_stdout()
