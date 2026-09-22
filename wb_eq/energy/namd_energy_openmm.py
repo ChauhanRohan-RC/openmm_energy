@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# Requirements: 
+# Requirements:
 # => pip packages : numpy, openmm[cuda], mdanalysis
 # => external : catdcd (for chunking DCD to RAM)
 
@@ -1710,7 +1710,7 @@ def parallel_reader_worker_blocking(id, shm_buffer: SharedFrameBuffer,
                 t_prog_now = time.perf_counter()
                 read_fps = PROGRESS_REPORT_INTERVAL_FRAMES / max(0.001, t_prog_now - t_last_prog_report)
                 read_ms_per_frame = (1 / max(read_fps, 0.001)) * 1000
-                log(tag=f"FRAME READER {id}", msg=f"Frame: {abs_f}  |  Speed: {read_fps:.1f} fps ({read_ms_per_frame:.2f} ms/frame)" + (f" {RED}[FRAME BUFFER FULL]{NOCOL}" if shm_buffer.is_full() else ""))
+                log(tag=f"FRAME READER {id}", msg=f"Speed: {read_fps:.1f} fps ({read_ms_per_frame:.2f} ms/frame)" + (f" {RED}[FRAME BUFFER FULL]{NOCOL}" if shm_buffer.is_full() else ""))
                 next_prog_report_frame += PROGRESS_REPORT_INTERVAL_FRAMES
                 t_last_prog_report = t_prog_now
     finally:
