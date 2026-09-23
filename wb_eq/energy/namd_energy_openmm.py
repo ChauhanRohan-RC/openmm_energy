@@ -22,9 +22,9 @@
 # 1. Copy script to working dir
 # 2. INPUT: Set input structure (.psf) and trajectories (.dcd)
 # 3. INPUT: Set selection 1, Selection 2 (Optional), out_energies (Optional), out_file_prefix
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # -> ALTERNATIVELY, SET ENVIRONMENT VARIABLES (used when variables are not set in script)
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 #	-> NAMD_ENERGY_SELECTION1	        =	selection1
 #	-> NAMD_ENERGY_SELECTION2	        =	selection2 		  (optional)
 #	-> NAMD_ENERGY_UPDATE_SELECTION1	=	update_selection1
@@ -34,7 +34,7 @@
 #	-> NAMD_ENERGY_TIMESTEP_END         =	timestep_end      (optional)
 #	-> NAMD_ENERGY_LABEL                =	label			  (optional)
 #   -> NAMD_ENERGY_PROCESSES            =   namd_processes    (optional)
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # 4. set other input and output params [search for TODO]
 # 5. run with "./namd_energy_openmm.py"
 # 	OR
@@ -876,7 +876,7 @@ class IndexStreamBuffer:
 # ------------------------------------------------------------------------
 # GLOBAL VARIABLES
 # ------------------------------------------------------------------------
-shutdown_event: mp.Event = mp.Event()       # MAIN SHUTDOWN EVENT. use .is_set() and .set()
+shutdown_event = mp.Event()       # MAIN SHUTDOWN EVENT. use .is_set() and .set()
 SHUTDOWN_REQUESTED = False       # Only for reporting purposes
 
 ACTIVE_RAM_FILES = set()
@@ -1001,6 +1001,16 @@ def handle_os_signal(signum, frame):
     log_warn(f"Received OS Signal: {sig_name}. Initiating clean shutdown...")
 
 
+if __name__ == '__main__':
+    # Register Signal Handlers only in main process
+    atexit.register(handle_exit)
+    signal.signal(signal.SIGINT, handle_os_signal)
+    signal.signal(signal.SIGTERM, handle_os_signal)
+    try:
+        signal.signal(signal.SIGHUP, handle_os_signal)
+    except AttributeError:
+        pass
+
 # =============================================================================
 # VALIDATION AND PRECONDITIONS
 # =============================================================================
@@ -1109,6 +1119,8 @@ if len(final_erg_components) == 0:
 # =============================================================================
 # OPENMM SYSTEM INITIALIZATION
 # =============================================================================
+if shutdown_event.is_set(): sys.exit(1)
+
 log_info("Parsing Topology and Forcefield...")
 psf = app.CharmmPsfFile(PSF_FILE)
 params = app.CharmmParameterSet(*CHARMM_PARAM_FILES)
@@ -1122,6 +1134,7 @@ base_system = psf.createSystem(params, nonbondedMethod=base_nb_method,
 
 N_ATOMS = base_system.getNumParticles()
 
+if shutdown_event.is_set(): sys.exit(1)
 pair_system = mm.System()
 for i in range(base_system.getNumParticles()):
     pair_system.addParticle(base_system.getParticleMass(i))
@@ -1389,6 +1402,7 @@ is_dynamic_elec_q_cache_needed = IS_DYNAMIC or (PME_ENABLED and is_self_interact
 if is_dynamic_elec_q_cache_needed:
     dynamic_elec_q_cache_np = np.zeros(N_ATOMS, dtype=np.float64)
 
+if shutdown_event.is_set(): sys.exit(1)
 for i in range(N_ATOMS):
     c, s, e = nb_base.getParticleParameters(i)
     c_val = c.value_in_unit(unit.elementary_charge)
@@ -1453,6 +1467,7 @@ for i in range(N_ATOMS):
 # ------------------------------------------------------------------------
 # Adding VDW and ELECTRIC forces to pair system
 # ------------------------------------------------------------------------
+if shutdown_event.is_set(): sys.exit(1)
 if not USE_MASK:
     # Bipartite Small Static Interactions use InteractionGroups safely to drop water-water math natively
     vdw_force.addInteractionGroup(static_sel1_idx_set, static_sel2_idx_set)
@@ -1626,7 +1641,7 @@ if is_self_interaction and any(e in final_erg_components for e in ["bond", "angl
     print("")
 
 
-
+if shutdown_event.is_set(): sys.exit(1)
 # ------------------------------------------------------------------------
 # PRE-FORK MEMORY OPTIMIZATION & SYSTEM SERIALIZATION
 # ------------------------------------------------------------------------
@@ -1667,10 +1682,14 @@ def parallel_reader_worker_blocking(id, shm_buffer: SharedFrameBuffer,
                                     psf: str, dcd: str,
                                     start: int, stop: int, step: int,
                                     global_offset: int,
-                                    shutdown_event: mp.Event):
+                                    shutdown_event):
+    if shutdown_event.is_set(): return
+
     u, sel1, sel2 = None, None, None
     try:
         u = mda.Universe(psf, dcd)
+
+        if shutdown_event.is_set(): return
         # Only fallback to native MDA if our Fast Engine is disabled
         if not FAST_DYNAMIC_SELECTION or not UPDATE_SELECTION1:
             sel1 = u.select_atoms(SELECTION1, updating=UPDATE_SELECTION1)
@@ -1750,14 +1769,14 @@ def parallel_reader_worker_blocking(id, shm_buffer: SharedFrameBuffer,
         gc.collect()
 
 
-def disk_stream_blocking(shm_buffer: SharedFrameBuffer, dcd_file: str, total_frames: int, global_frame_offset: int, shutdown_event: mp.Event):
+def disk_stream_blocking(shm_buffer: SharedFrameBuffer, dcd_file: str, total_frames: int, global_frame_offset: int, shutdown_event):
     parallel_reader_worker_blocking(1, shm_buffer, PSF_FILE, dcd_file, 0, total_frames, FRAME_STEP, global_frame_offset, shutdown_event)
 
 
 def ramdisk_read(reader_idx: int, executor: ThreadPoolExecutor,
                  shm_buffer: SharedFrameBuffer,
                  temp_dcd: str, num_frames: int, global_frame_offset: int,
-                 shutdown_event: mp.Event, block: bool) -> list[Future] | None:
+                 shutdown_event, block: bool) -> list[Future] | None:
     """
     In blocking mode, we wait for all reader threads to finish,  and return None
 
@@ -1791,7 +1810,7 @@ def ramdisk_read(reader_idx: int, executor: ThreadPoolExecutor,
     return futures
 
 
-def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, free_slots_queue: queue.Queue, chunks_queue: queue.Queue, action_queue: mp.Queue, shutdown_event: mp.Event):
+def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, free_slots_queue: queue.Queue, chunks_queue: queue.Queue, action_queue: mp.Queue, shutdown_event):
     file_size = os.path.getsize(dcd_file)
     bytes_per_frame = file_size / total_frames if total_frames > 0 else 0
     frames_remaining = total_frames
@@ -1879,7 +1898,7 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, fre
     chunks_queue.put(None)
 
 
-def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queue, shutdown_event: mp.Event):
+def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queue, shutdown_event):
     global_frame_offset = 0
 
     ram_reader_tpool: ThreadPoolExecutor | None = None  # init on demand
@@ -1923,8 +1942,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
             ram_chunk_free_slots_q.put(i)
     try:
         for dcd_file in DCD_FILES:
-            if shutdown_event.is_set():
-                break
+            if shutdown_event.is_set(): break
 
             base_name = os.path.basename(dcd_file)
             base_name_noext = os.path.splitext(base_name)[0]
@@ -1937,6 +1955,8 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
             finally:
                 del u_temp
                 gc.collect()  # force GC
+
+            if shutdown_event.is_set(): break
 
             # Logic for determining Loader Strategy
             if not RAM_LOAD_ENABLED:
@@ -1956,8 +1976,10 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
                     fbytes = os.path.getsize(dcd_file)
                     t0 = time.perf_counter()
 
+                    if shutdown_event.is_set(): break
                     action_queue.put((ACTION_REGISTER_RAM_FILE, temp_dcd))      # Pre-register for safety
                     shutil.copy2(dcd_file, temp_dcd)
+                    if shutdown_event.is_set(): break
 
                     t_taken = time.perf_counter() - t0
                     action_queue.put((ACTION_ADD_RAM_LOAD_TIME, t_taken))  # RAM LOAD TIME
@@ -2003,6 +2025,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
                 active_chunk_frames = resized_frames
                 log_info(f"DYNAMIC CHUNK SIZING: Reduced chunk size to {active_chunk_frames} frames to fit {simul_chunk_count} chunk in RAM at once")
 
+            if shutdown_event.is_set(): break
             log_info(f"CHUNKING TO RAM: {CYAN}{base_name}{NOCOL} with {active_chunk_frames} frames/chunk")
             chunks_queue = queue.Queue()
             chunk_mgr_thread = threading.Thread(target=catdcd_chunk_loader,
@@ -2176,7 +2199,7 @@ def create_output_erg_line(erg_row) -> str:
 # INDEPENDENT COMPUTE WORKER PROCESS (Multi-processed)
 # =============================================================================
 def compute_worker_process(worker_id: int,
-                           shutdown_event: mp.Event,
+                           shutdown_event,
                            system_xml,
                            shm_buffer: SharedFrameBuffer,
                            out_erg_queue: mp.Queue,
@@ -2191,6 +2214,8 @@ def compute_worker_process(worker_id: int,
     # Ignore OS signals in child processes; let the parent handle them cleanly
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+    if shutdown_event.is_set(): return
 
     # log_info(f"WORKER {worker_id}: Initializing OpenMM Context on [{OPENMM_PLATFORM_DISPLAY_NAME}] ....")
     local_t_start = time.perf_counter()
@@ -2211,6 +2236,8 @@ def compute_worker_process(worker_id: int,
             local_elec_force = f
         elif f.getForceGroup() == FORCE_GROUP_PME_RECIP and isinstance(f, mm.NonbondedForce):
             local_pme_force = f
+
+    if shutdown_event.is_set(): return
 
     ## Localize platform initialization to prevent CUDA Fork crashes
 
@@ -2239,6 +2266,7 @@ def compute_worker_process(worker_id: int,
         return
 
     log_info(f"WORKER {worker_id}: Initialized OpenMM Context on [{OPENMM_PLATFORM_DISPLAY_NAME}]")
+    if shutdown_event.is_set(): return
 
     # Units
     to_kcal = unit.kilocalorie_per_mole
@@ -2581,15 +2609,6 @@ def process_worker_meta_data(meta_q: mp.Queue) -> np.ndarray | None:
 
 
 if __name__ == '__main__':
-    # Register Signal Handlers only in main process
-    atexit.register(handle_exit)
-    signal.signal(signal.SIGINT, handle_os_signal)
-    signal.signal(signal.SIGTERM, handle_os_signal)
-    try:
-        signal.signal(signal.SIGHUP, handle_os_signal)
-    except AttributeError:
-        pass
-
     # Output file configuration
     out_file_path = f"{OUT_FILE_PREFIX}.energy.csv"
     index_stream_buffer = IndexStreamBuffer(output_file_path=out_file_path,
