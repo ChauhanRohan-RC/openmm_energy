@@ -155,7 +155,8 @@ COMMENT_TOKEN = "#"
 # --------------------------------------------------------------------
 # FRAME LOADING and PERFORMANCE
 # --------------------------------------------------------------------
-RAM_DISK_PATH = "/tmp/namd_energy.openmm"          # ram disk path to use
+RAM_DISK_PATH = "/tmp/namd_energy.openmm"   # ram disk path to use
+RAM_DISK_MAX_USAGE_FACTOR: float = 0.75     # [0.1, 0.95] RAM disk max usage allowed (as fraction). KEEP BELOW 0.8
 
 QUEUE_FRAME_COUNT = 50                # Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
 
@@ -163,10 +164,7 @@ QUEUE_FRAME_COUNT = 50                # Size of the Zero-Copy Shared Memory Ring
 RAM_CHUNK_DYNAMIC: bool = True        # Automatically shrink chunk if RAM is constrained
 RAM_CHUNK_FRAMES: int = 10000         # Max frames per chunk
 RAM_CHUNK_MIN_FRAMES: int = 2000      # Fallback to disk streaming if chunks cannot meet this size
-RAM_CHUNK_MAX_COUNT: int = 4          # Max num of chunks that may be loaded to RAM at once
-
-RAM_SAFETY_MARGIN_GB = 1.0            # Base free RAM margin required (GiB)
-RAM_EXTRA_MARGIN_GB = 0.1             # Extra buffer headroom (GiB)
+RAM_CHUNK_MAX_COUNT: int = 3          # Max num of chunks that may be loaded to RAM at once
 
 ## Thread controls
 # 0 = Smart Auto-Allocation, >0 = Override
@@ -246,7 +244,7 @@ def log_error(msg, exc=None, flush=True, shutdown: bool = True, _exit: bool = Tr
     """
     if shutdown:
         shut_eve = shutdown_event
-        if isinstance(shut_eve, mp.Event):
+        if shut_eve is not None:
             shut_eve.set()
     print_exc_trace(exc)
     print(f"{RED}[ERROR]{NOCOL} {msg}", flush=flush)
@@ -921,6 +919,15 @@ def __remove_ram_file_internal(filepath):
         log_debug(f"RAM DISK: FAILED to remove file '{filepath}'. Error: {e}", e)
 
 
+def is_ramdisk_free(bytes, return_avail_bytes: bool = False):
+    usage = shutil.disk_usage(RAM_DISK_PATH)
+    avail_bytes = max(math.floor(usage.total * RAM_DISK_MAX_USAGE_FACTOR) - usage.used, 0)
+    is_free = avail_bytes > math.ceil(bytes)
+    if return_avail_bytes:
+        return is_free, avail_bytes
+    return is_free
+
+
 # MUST ONLY BE CALLED FROM MAIN-PROCESS. USE ACTION QUEUE OTHERWISE
 # action_queue.put((ACTION_REGISTER_RAM_FILE, filepath))
 def __register_ram_file(filepath):
@@ -1056,11 +1063,21 @@ if RAM_LOAD_ENABLED:
     try:
         os.makedirs(RAM_DISK_PATH, exist_ok=True)
     except Exception as e:
-        log_error(f"RAM loading enabled but failed to create RAM_DISK directory {RAM_DISK_PATH}: {e}", e)
+        log_error(f"RAM DISK: Failed to create RAM-DISK directory {RAM_DISK_PATH}: {e}", e)
 
     if RAM_CHUNK_MODE and shutil.which("catdcd") is None:
-        log_warn("CHUNKING DISABLED: 'catdcd' not found on system PATH. Falling back to FULL RAM LOAD [LOADER 1]...")
+        log_warn(f"{YELLOW}CHUNKING DISABLED: {CYAN}'catdcd'{NOCOL} not found on system PATH. Falling back to FULL RAM LOAD [LOADER 1]...")
         RAM_CHUNK_MODE = False
+
+    if RAM_DISK_MAX_USAGE_FACTOR < 0.1:
+        log_warn("RAM DISK: RAM-Disk Max Usage Factor must be > 0.1 (10%). Resetting to 0.1 ")
+        RAM_DISK_MAX_USAGE_FACTOR = 0.1
+    elif RAM_DISK_MAX_USAGE_FACTOR > 0.95:
+        log_warn("RAM DISK: RAM-Disk Max Usage Factor must be < 0.95 (95%) for safety. Resetting to 0.95 ")
+        RAM_DISK_MAX_USAGE_FACTOR = 0.95
+
+    if RAM_DISK_MAX_USAGE_FACTOR >= 0.79:
+        log_warn(f"RAM DISK: HIGH RAM-Disk max Usage Factor: {YELLOW}{RAM_DISK_MAX_USAGE_FACTOR}. This may cause 'QUOTA EXCEEDED' errors{NOCOL}. You should lower it below 0.80")
 
 # ------------------------------------------------------------------------
 raw_erg_requested: set = set([e.lower().strip().lstrip('-') for e in OUT_ENERGIES])
@@ -1792,20 +1809,17 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, fre
 
         this_chunk_frames = min(chunk_frames, frames_remaining)
         current_last = current_start + this_chunk_frames - 1
-        est_bytes = this_chunk_frames * bytes_per_frame
-        margin_bytes = (RAM_SAFETY_MARGIN_GB + RAM_EXTRA_MARGIN_GB) * 1024 ** 3
+        est_bytes = math.ceil(this_chunk_frames * bytes_per_frame)
 
         # Wait to free the RAM
         space_warned = False
         while not shutdown_event.is_set():
-            free_space = shutil.disk_usage(RAM_DISK_PATH).free
-            if free_space > (est_bytes + margin_bytes):
-                if space_warned: log_info(f"{GREEN}RAM CHUNKING RESUMED [CHUNK {chunk_count}]{NOCOL}: RAM DIsk ({RAM_DISK_PATH}) now has enough free space ({free_space/(1024**3):.2f} GiB)")
+            if is_ramdisk_free(est_bytes):
+                if space_warned:
+                    log_info(f"{GREEN}RAM CHUNKING RESUMED [CHUNK {chunk_count}]{NOCOL}: RAM DIsk ({RAM_DISK_PATH}) now has enough free space")
                 break
             if not space_warned:
-                log_warn(f"{YELLOW}RAM CHUNKING PAUSED [CHUNK {chunk_count}]{NOCOL}: Not enough space in RAM DIsk ({RAM_DISK_PATH}). Waiting for RAM to clear...\n "
-                         f"    [RAM DISK] Free: {free_space/(1024**3):.2f} GiB  |  "
-                         f"Required: {est_bytes + margin_bytes/(1024**3):.2f} GiB (Safety Margin: {margin_bytes/(1024**3):.2f} GiB)")
+                log_warn(f"{YELLOW}RAM CHUNKING PAUSED [CHUNK {chunk_count}]{NOCOL}: Not enough space in RAM DIsk ({RAM_DISK_PATH}). REQUIRED: {est_bytes / (1024**3):.2f} GiB. Waiting for RAM to clear...")
                 space_warned = True
             time.sleep(1.0)
 
@@ -1833,7 +1847,7 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, fre
             time.sleep(0.5)
 
         if shutdown_event.is_set():
-            try_delete_file_nothrow(temp_chunk_path)
+            # try_delete_file_nothrow(temp_chunk_path)
             break
 
         # Process exit status
@@ -1878,9 +1892,9 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
     def create_ram_reader_th_pool():
         return ThreadPoolExecutor(max_workers=actual_ram_reader_count + 1)      # +1 so we can start reading next chunk
 
-    def _local_unregister_ram_file(filepath: str, delete: bool = True):
+    def _local_unregister_ram_file(filepath: str, delete_now: bool = False):
         if not filepath: return
-        if delete: try_delete_file_nothrow(filepath)
+        if delete_now: try_delete_file_nothrow(filepath)
         action_queue.put((ACTION_UNREGISTER_RAM_FILE, filepath))  # Unregister for safety
 
     def _on_ramdisk_read_done(slot_id: int, dcd_file: str | None):
@@ -1931,17 +1945,14 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
                 global_frame_offset += total_frames
                 continue
 
-            file_size = os.path.getsize(dcd_file)
-            bytes_per_frame = file_size / total_frames if total_frames > 0 else 0
-            free_space = shutil.disk_usage(RAM_DISK_PATH).free
-            margin_bytes = (RAM_SAFETY_MARGIN_GB + RAM_EXTRA_MARGIN_GB) * 1024 ** 3
-            file_fits = free_space > (file_size + margin_bytes)
+            file_bytes = os.path.getsize(dcd_file)
+            bytes_per_frame = file_bytes / total_frames if total_frames > 0 else 0
 
             # RAM direct copy mode
             if not RAM_CHUNK_MODE or total_frames <= RAM_CHUNK_FRAMES:
-                if file_fits:
+                if is_ramdisk_free(file_bytes):
                     log_info(f"RAM LOAD: START loading {CYAN}{base_name}{NOCOL} file to RAM ...")
-                    temp_dcd = os.path.join(RAM_DISK_PATH, f"{base_name_noext}_copy_{uuid.uuid4().hex[:8]}.dcd")
+                    temp_dcd = os.path.join(RAM_DISK_PATH, f"{base_name_noext}.copy.uuid-{uuid.uuid4().hex[:8]}.dcd")
                     fbytes = os.path.getsize(dcd_file)
                     t0 = time.perf_counter()
 
@@ -1968,18 +1979,19 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
 
             # RAM Chunk Mode: Dynamic Chunk Sizing Check (Loader 2)
             active_chunk_frames = RAM_CHUNK_FRAMES
-            two_chunk_bytes = (active_chunk_frames * bytes_per_frame * 2) + margin_bytes
+            simul_chunk_count = 2 if RAM_CHUNK_MAX_COUNT > 1 else 1
+            simul_chunk_bytes = math.ceil(active_chunk_frames * bytes_per_frame * simul_chunk_count)
+            simul_chunk_fits, ram_avail_bytes = is_ramdisk_free(simul_chunk_bytes, return_avail_bytes=True)
 
-            if free_space < two_chunk_bytes:
+            if not simul_chunk_fits:
                 if not RAM_CHUNK_DYNAMIC:
                     log_warn(f"DISK STREAM FALLBACK: Insufficient RAM and Dynamic Chunking is disabled. Streaming from disk: {CYAN}{base_name}{NOCOL}")
                     disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
                     global_frame_offset += total_frames
                     continue
 
-                log_warn(f"LOW RAM: Cannot fit 2 default chunks ({active_chunk_frames} frames each) to RAM")
-                available_for_chunks = free_space - margin_bytes
-                resized_frames = int(available_for_chunks / (2 * bytes_per_frame)) if available_for_chunks > 0 else 0
+                log_warn(f"LOW RAM: Cannot fit {simul_chunk_count} default chunk ({active_chunk_frames} frames each) to RAM")
+                resized_frames = math.floor(ram_avail_bytes / (simul_chunk_count * bytes_per_frame)) if ram_avail_bytes > 0 else 0
 
                 if resized_frames < RAM_CHUNK_MIN_FRAMES:
                     log_warn(f"FAILED DYNAMIC CHUNK SIZE: Dynamic chunk size ({resized_frames}) below MIN_CHUNK_FRAMES ({RAM_CHUNK_MIN_FRAMES}).")
@@ -1989,7 +2001,7 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
                     continue
 
                 active_chunk_frames = resized_frames
-                log_info(f"DYNAMIC CHUNK SIZING: Reduced chunk size to {active_chunk_frames} frames.")
+                log_info(f"DYNAMIC CHUNK SIZING: Reduced chunk size to {active_chunk_frames} frames to fit {simul_chunk_count} chunk in RAM at once")
 
             log_info(f"CHUNKING TO RAM: {CYAN}{base_name}{NOCOL} with {active_chunk_frames} frames/chunk")
             chunks_queue = queue.Queue()
