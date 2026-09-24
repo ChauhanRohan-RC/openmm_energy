@@ -189,6 +189,7 @@ OPENMM_THREADS_PER_CONTEXT = 0        # Compute threads for each OpenMM context 
 # EXtra Options
 # -----------------------------------
 RAM_READER_MIN_FRAMES = 50     # Minimum frames a RAM reader must have to read, otherwise dynamically lower reader count
+RAM_CHUNK_PREFER_CATDCD: bool = True            # Prefer catdcd over cpptraj for chunking DCD files
 
 PROGRESS_REPORT_INTERVAL_FRAMES: int = 1000      # num frames
 
@@ -1905,7 +1906,7 @@ def traj_chunk_loader(use_catdcd: bool, topology_file: str, traj_file: str, tota
         temp_chunk_path = os.path.join(RAM_DISK_PATH, temp_chunk_name)
         action_queue.put((ACTION_REGISTER_RAM_FILE, temp_chunk_path))  # Pre-register for safety
 
-        log(tag=f"CHUNK {chunk_count}", msg=f"{MAGENTA}LOADING: Frames [{current_start}, {current_last}]{NOCOL} to RAM (via {'catdcd' if use_catdcd else 'cpptraj'}) ...")
+        log(tag=f"CHUNK {chunk_count}", msg=f"{MAGENTA}LOADING: Frames [{current_start}, {current_last}]{NOCOL} to RAM (via {CYAN}{'catdcd' if use_catdcd else 'cpptraj'}{NOCOL}) ...")
         t0 = time.perf_counter()
         if use_catdcd:
             cmd = ["catdcd", "-o", temp_chunk_path, "-first", str(current_start), "-last", str(current_last), traj_file]
@@ -1965,7 +1966,7 @@ def get_chunk_program(traj_extension, warn: bool = True) -> str:
         if HAS_CATDCD or HAS_CPPTRAJ:
             is_dcd = traj_extension.lower() == ".dcd"
             # prefer catdcd for .dcd files
-            if is_dcd and HAS_CATDCD:
+            if is_dcd and HAS_CATDCD and (RAM_CHUNK_PREFER_CATDCD or not HAS_CPPTRAJ):
                 chunk_program = "catdcd"
             else:
                 if HAS_CPPTRAJ:
@@ -2696,7 +2697,7 @@ def handle_worker_meta_data(meta_q: mp.Queue) -> np.ndarray | None:
 
             w_frames_processed = w_meta[META_FRAMES_PROCESSED]
             w_fps = w_frames_processed / max(w_t_total, 0.001)
-            w_fps_col = RED if w_fps < 10 else YELLOW if w_fps < 20 else GREEN
+            w_fps_col = RED if w_fps < 5 else YELLOW if w_fps < 10 else GREEN
 
             w_io_wait_percent = w_t_io_wait / max(0.001, w_t_compute) * 100
             w_io_wait_col = RED if w_io_wait_percent >= 20 else YELLOW if w_io_wait_percent >= 10 else GREEN
