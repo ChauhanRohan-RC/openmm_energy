@@ -5,10 +5,6 @@
 # => external : cpptraj (OPTIONAL, for chunking trajectory files to RAM)
 #               catdcd  (OPTIONAL, preferred for chunking DCD files to RAM)
 
-# TODO: TEST new features
-# 1. universal chunking with cpptraj
-# 2. AMBER mode
-
 # ========================================================================
 # OpenMM and MDAnalysis implementation of NAMD PairInteraction Energy
 # ------------------------------------------------------------------------
@@ -272,8 +268,8 @@ def log_error(msg, exc=None, flush=True, shutdown: bool = True, _exit: bool = Tr
 # OpenMM Hardware Initialization (CUDA -> HIP -> OpenCL -> CPU)
 try:
     from openmm import Platform
-except ImportError:
-    log_error(f"OPENMM not found. Please install OpenMM in your environment with {CYAN}\"pip install openmm[cuda]\"{NOCOL}")
+except (ImportError, ModuleNotFoundError) as e:
+    log_error(f"OPENMM not found. Please install OpenMM in your environment with {CYAN}\"pip install openmm[cuda]\"{NOCOL}", e)
 
 OPENMM_PLATFORM_NAME = "CPU"
 OPENMM_PLATFORM_DISPLAY_NAME = "CPU"
@@ -391,14 +387,14 @@ from multiprocessing import shared_memory
 try:
     import openmm as mm
     from openmm import app, unit
-except ImportError:
-    log_error(f"OPENMM not found. Please install OpenMM in your environment with {CYAN}\"pip install openmm[cuda]\"{NOCOL}")
+except (ImportError, ModuleNotFoundError) as e:
+    log_error(f"OPENMM not found. Please install OpenMM in your environment with {CYAN}\"pip install openmm[cuda]\"{NOCOL}", e)
 
 # MDAnalysis import
 try:
     import MDAnalysis as mda
-except ImportError:
-    log_error(f"MDAnalysis not found. Please install MDAnalysis in your environment with {CYAN}\"pip install mdanalysis\"{NOCOL}")
+except (ImportError, ModuleNotFoundError) as e:
+    log_error(f"MDAnalysis not found. Please install MDAnalysis in your environment with {CYAN}\"pip install mdanalysis\"{NOCOL}", e)
 import warnings
 warnings.filterwarnings("ignore", message=r".*DCDReader currently makes independent timesteps.*")
 
@@ -1266,11 +1262,25 @@ else:
 # ------------------------------------------------------------------------
 nbfix_force = None
 HAS_NBFIX = False
+NUM_NBFIX_PARAMS = 0        # number of per-particle NBFix params
+nbfix_param_names = []
 for f in base_system.getForces():
-    if isinstance(f, mm.CustomNonbondedForce) and "acoef" in f.getEnergyFunction():
-        nbfix_force = f
-        HAS_NBFIX = True
-        break
+    if isinstance(f, mm.CustomNonbondedForce):
+        # Look for the structural footprint of an NBFIX (2D Tabulated Functions)
+        for i in range(f.getNumTabulatedFunctions()):
+            if isinstance(f.getTabulatedFunction(i), mm.Discrete2DFunction) and f.getNumPerParticleParameters() > 0:
+                nbfix_force = f
+                NUM_NBFIX_PARAMS = f.getNumPerParticleParameters()
+                HAS_NBFIX = True
+                break
+    if HAS_NBFIX: break
+
+if HAS_NBFIX:
+    for i in range(NUM_NBFIX_PARAMS):
+        nbfix_param_names.append(nbfix_force.getPerParticleParameterName(i))
+    log_info(f"{CYAN}NBFIX DETECTED{NOCOL}: Will use NBFix as custom VDW force...")
+    log_debug(f"NBFIX: Parameter Names in NBFix force: {nbfix_param_names}")
+
 
 # ------------------------------------------------------------------------
 # SYSTEM INFORMATION LOG
@@ -1334,10 +1344,14 @@ else:
 
 # VDW definition
 if HAS_NBFIX:
-    log_info("CHARMM NBFIX detected. Cloning 2D lookup tables for exact VDW.")
-    vdw_base = f"(((acoef(type1, type2)/r6)^2 - bcoef(type1, type2)/r6) * {S_vdw}); r6=r^6"
+    orig_nbfix_vdw_expr = nbfix_force.getEnergyFunction()
+    log_info(f"NBFIX VDW FORCE: USing nbfix vdw energy function: {CYAN}'E_vdw = {orig_nbfix_vdw_expr}'{NOCOL}")
+    # Safely inject NAMD switching function into the main energy term (before any semicolons)
+    nbfix_expr_parts = orig_nbfix_vdw_expr.split(';')
+    nbfix_expr_parts[0] = f"(({nbfix_expr_parts[0]}) * {S_vdw})"
+    vdw_base = ";".join(nbfix_expr_parts)
 else:
-    log_info("Standard Lorentz-Berthelot mixing detected.")
+    log_info("VDW FORCE: Using Standard Lorentz-Berthelot mixing rules")
     vdw_base = f"(4*epsilon*((sigma/r)^12 - (sigma/r)^6) * {S_vdw}); sigma=0.5*(sigma1+sigma2); epsilon=sqrt(abs(epsilon1*epsilon2))"
 
 # Electrostatic Definition -------------
@@ -1400,7 +1414,8 @@ if USE_MASK:
     elec_force = mm.CustomNonbondedForce(elec_expr)
 
     if HAS_NBFIX:
-        vdw_force.addPerParticleParameter("type")
+        for p in nbfix_param_names:
+            vdw_force.addPerParticleParameter(p)
     else:
         vdw_force.addPerParticleParameter("sigma")
         vdw_force.addPerParticleParameter("epsilon")
@@ -1418,7 +1433,8 @@ else:
     elec_force = mm.CustomNonbondedForce(elec_base)
 
     if HAS_NBFIX:
-        vdw_force.addPerParticleParameter("type")
+        for p in nbfix_param_names:
+            vdw_force.addPerParticleParameter(p)
     else:
         vdw_force.addPerParticleParameter("sigma")
         vdw_force.addPerParticleParameter("epsilon")
@@ -1443,11 +1459,13 @@ print("")
 # ------------------------------------------------------------------------
 # Parameter Caches, only needed for DYNAMIC selections
 dynamic_elec_q_cache_np: np.ndarray = None  # charges of all atoms, numpy type for fast math
-dynamic_vdw_type_cache: np.ndarray = None       # vdw type values of each particle
+# dynamic_vdw_nbfix_cache: np.ndarray = None      # vdw nbfix param values of each particle
+dynamic_vdw_nbfix_cache: list = []      # vdw nbfix param values of each particle
 dynamic_vdw_sig_eps_cache: np.ndarray = None    # vdw sigma and epsilon of each particle. 2D array [[s1,e1], [s2,e2]...]
 if IS_DYNAMIC:
     if HAS_NBFIX:
-        dynamic_vdw_type_cache = np.zeros(N_ATOMS, dtype=np.float64)
+        pass
+        # dynamic_vdw_nbfix_cache = np.zeros((N_ATOMS, NUM_NBFIX_PARAMS), dtype=np.float64)
     else:
         dynamic_vdw_sig_eps_cache = np.zeros((N_ATOMS, 2), dtype=np.float64)
 
@@ -1461,10 +1479,9 @@ for i in range(N_ATOMS):
     c_val = c.value_in_unit(unit.elementary_charge)
 
     if HAS_NBFIX:
-        type_val = nbfix_force.getParticleParameters(i)[0]
-        vdw_params = (type_val,)
+        vdw_params = tuple(nbfix_force.getParticleParameters(i))
         if IS_DYNAMIC:
-            dynamic_vdw_type_cache[i] = type_val
+            dynamic_vdw_nbfix_cache.append(vdw_params)
     else:
         s_val = s.value_in_unit(unit.nanometers)
         e_val = e.value_in_unit(unit.kilojoules_per_mole)
@@ -2459,11 +2476,10 @@ def compute_worker_process(worker_id: int,
             changed1 = np.setxor1d(curr_arr1, prev_arr1, assume_unique=True)
 
             if is_self_interaction:
-                for i in changed1:
-                    idx = int(i)
+                for idx in changed1:
                     val = 1.0 if mask1[idx] else 0.0
                     q = float(dynamic_elec_q_cache_np[idx])
-                    vdw_tup = (float(dynamic_vdw_type_cache[idx]), val) if HAS_NBFIX else (
+                    vdw_tup = (*dynamic_vdw_nbfix_cache[idx], val) if HAS_NBFIX else (
                         float(dynamic_vdw_sig_eps_cache[idx, 0]), float(dynamic_vdw_sig_eps_cache[idx, 1]), val)
 
                     vdw_set(idx, vdw_tup)
@@ -2473,13 +2489,12 @@ def compute_worker_process(worker_id: int,
                 changed2 = np.setxor1d(actual_curr_arr2, prev_arr2, assume_unique=True)
                 all_changed = np.union1d(changed1, changed2)
 
-                for i in all_changed:
-                    idx = int(i)
+                for idx in all_changed:
                     val = 1.0 if mask1[idx] else 0.0
                     s2_val = 1.0 if mask2[idx] else 0.0
                     q = float(dynamic_elec_q_cache_np[idx])
 
-                    vdw_tup = (float(dynamic_vdw_type_cache[idx]), val, s2_val) if HAS_NBFIX else (
+                    vdw_tup = (*dynamic_vdw_nbfix_cache[idx], val, s2_val) if HAS_NBFIX else (
                         float(dynamic_vdw_sig_eps_cache[idx, 0]), float(dynamic_vdw_sig_eps_cache[idx, 1]), val, s2_val)
                     vdw_set(idx, vdw_tup)
                     elec_set(idx, (q, val, s2_val))
