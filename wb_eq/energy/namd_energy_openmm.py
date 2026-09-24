@@ -223,10 +223,16 @@ BLUE = "\033[94m"
 MAGENTA = "\033[95m"
 CYAN = "\033[96m"
 
+def get_cur_datetime_formatted() -> str:
+    import time
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def print_exc_trace(exc):
     if exc is not None:
         import traceback
         traceback.print_exception(exc)
+
 
 def flush_stdout(): sys.stdout.flush()
 
@@ -267,9 +273,10 @@ def log_error(msg, exc=None, flush=True, shutdown: bool = True, _exit: bool = Tr
 # Header
 if __name__ == '__main__':
     print("")
-    print("================================================================")
-    print("================ OpenMM Pair-Interaction Energy ================")
-    print("================================================================")
+    print("============================================================")
+    print("=============  OpenMM Pair-Interaction Energy  =============")
+    print("============================================================")
+    print(f"Started on {get_cur_datetime_formatted()}")
     print("")
 
 # OpenMM Hardware Initialization (CUDA -> HIP -> OpenCL -> CPU)
@@ -418,10 +425,6 @@ def boolify(value: str, default_val: bool = False, err_msg: str = "") -> bool:
         log_error(f"{err_msg}: {value!r}", shutdown=False, _exit=False)
         raise ValueError(f"{err_msg}: {value!r}")
     return default_val
-
-
-def get_cur_datetime_formatted() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 # =======================================================
