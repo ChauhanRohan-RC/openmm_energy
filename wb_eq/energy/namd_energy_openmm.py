@@ -269,7 +269,10 @@ def log_error(msg, exc=None, flush=True, shutdown: bool = True, _exit: bool = Tr
 # HARDWARE INIT and CHECKS
 # --------------------------------------------
 # OpenMM Hardware Initialization (CUDA -> HIP -> OpenCL -> CPU)
-from openmm import Platform
+try:
+    from openmm import Platform
+except ImportError:
+    log_error(f"OPENMM not found. Please install OpenMM in your environment with {CYAN}\"pip install openmm[cuda]\"{NOCOL}")
 
 OPENMM_PLATFORM_NAME = "CPU"
 OPENMM_PLATFORM_DISPLAY_NAME = "CPU"
@@ -384,11 +387,17 @@ except Exception:
 from multiprocessing import shared_memory
 
 # OpenMM main import
-import openmm as mm
-from openmm import app, unit
+try:
+    import openmm as mm
+    from openmm import app, unit
+except ImportError:
+    log_error(f"OPENMM not found. Please install OpenMM in your environment with {CYAN}\"pip install openmm[cuda]\"{NOCOL}")
 
 # MDAnalysis import
-import MDAnalysis as mda
+try:
+    import MDAnalysis as mda
+except ImportError:
+    log_error(f"MDAnalysis not found. Please install MDAnalysis in your environment with {CYAN}\"pip install mdanalysis\"{NOCOL}")
 import warnings
 warnings.filterwarnings("ignore", message=r".*DCDReader currently makes independent timesteps.*")
 

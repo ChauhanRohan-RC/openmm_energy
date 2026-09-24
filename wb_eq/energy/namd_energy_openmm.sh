@@ -9,7 +9,7 @@
 #set -e
 
 # for cpptraj chunking support
-module load ambertools
+#module load ambertools
 
 
 run_openmm() {
