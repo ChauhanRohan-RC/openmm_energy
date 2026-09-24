@@ -8,17 +8,19 @@
 # ========================================================================
 # OpenMM and MDAnalysis implementation of NAMD PairInteraction Energy
 # ------------------------------------------------------------------------
-# OPTIMIZED FOR GPU
+# OPTIMIZED FOR GPU.
 # ----------------------
-# => Supports both CHARMM and AMBER topologies
-# => calculate pairinteraction energies from NAMD simulation trajectories with CHARMM force fields
+# => Supports both CHARMM and AMBER topologies and trajectories
+# => calculate pairinteraction energies from simulation trajectories
+# => Mimics NAMD pairinteraction feature, with similar X-PLOR based non-bonded switching
 # => STATIC and DYNAMIC selections, self and cross-interactions
 # => PME for long range electrostatics (NAMD pairinteraction does not have this)
 #    Electrostatic energies with PME will be highly negative compared to NAMD pairinteraction
-# => Trajectory Disk Streaming/RAM loading/RAM chunking modes (chunking requires cpptraj/catdcd)
-# => Smart multithreading allocation
+# => Trajectory Disk Streaming/RAM loading/RAM chunking modes (chunking requires cpptraj/catdcd in PATH)
+# => RECOMMENDED MODE: GPU with RAM_LOAD and RAM_CHUNK_MODE enabled
 # ------------------------------------------------------------------------
 
+"""
 ## USAGE --------------------------------------------------
 # 0: First run normal simulation to obtain trajectories
 # 1. Copy script to working dir
@@ -27,23 +29,22 @@
 # ----------------------------------------------------------------------------
 # -> ALTERNATIVELY, SET ENVIRONMENT VARIABLES (used when variables are not set in script)
 # ----------------------------------------------------------------------------
-#	-> NAMD_ENERGY_SELECTION1	        =	selection1
-#	-> NAMD_ENERGY_SELECTION2	        =	selection2 		  (optional)
-#	-> NAMD_ENERGY_UPDATE_SELECTION1	=	update_selection1
-#	-> NAMD_ENERGY_UPDATE_SELECTION2	=	update_selection2
-#	-> NAMD_ENERGY_OUT_ENERGIES	        = 	out_energies	  (optional)
-#	-> NAMD_ENERGY_OUT_PREFIX	        =	out_file_prefix
-#	-> NAMD_ENERGY_TIMESTEP_END         =	timestep_end      (optional)
-#	-> NAMD_ENERGY_LABEL                =	label			  (optional)
-#   -> NAMD_ENERGY_PROCESSES            =   namd_processes    (optional)
+#	-> OPENMM_ENERGY_SELECTION1	        =	selection1
+#	-> OPENMM_ENERGY_SELECTION2	        =	selection2 		  (optional)
+#	-> OPENMM_ENERGY_UPDATE_SELECTION1	=	update_selection1
+#	-> OPENMM_ENERGY_UPDATE_SELECTION2	=	update_selection2
+#	-> OPENMM_ENERGY_OUT_ENERGIES	    = 	out_energies	  (optional)
+#	-> OPENMM_ENERGY_OUT_PREFIX	        =	out_file_prefix
+#	-> OPENMM_ENERGY_LABEL              =	label			  (optional)
 # ----------------------------------------------------------------------------
 # 4. set other input and output params [search for TODO]
-# 5. run with "./namd_energy_openmm.py"
+# 5. run with "python3 openmm_energy.py"
 # 	OR
-# 6. use namd_energy_openmm.sh launcher.
+# 6. use openmm_energy.sh launcher script.
 #	-> First, unset selection1, selection2, out_energies, out_file_prefix in this script
-#	-> Set environment variables in namd_energy_openmm.sh
-#		=> ./namd_energy_openmm.sh
+#	-> Set environment variables in openmm_energy.sh
+#   => run with "./openmm_energy.sh" 
+"""
 
 import os
 import sys
@@ -101,19 +102,19 @@ TRAJ_FILES = find_files("..", "amyl_wb_eq", ".dcd")          # TODO : trajectory
 
 ## Selections (MDAnalysis selection syntax)
 # -> hydration shell: water and around 4.25 protein
-SELECTION1: str = os.getenv("NAMD_ENERGY_SELECTION1", "")   # TODO: or set ENV VAR: NAMD_ENERGY_SELECTION1
-SELECTION2: str = os.getenv("NAMD_ENERGY_SELECTION2", "")   # TODO: or set ENV VAR: NAMD_ENERGY_SELECTION2
+SELECTION1: str = os.getenv("OPENMM_ENERGY_SELECTION1", "")   # TODO: or set ENV VAR: OPENMM_ENERGY_SELECTION1
+SELECTION2: str = os.getenv("OPENMM_ENERGY_SELECTION2", "")   # TODO: or set ENV VAR: OPENMM_ENERGY_SELECTION2
 
 # Dynamic Selections (update every frame)
-UPDATE_SELECTION1: str = str(os.getenv("NAMD_ENERGY_UPDATE_SELECTION1", 0))     # TODO
-UPDATE_SELECTION2: str = str(os.getenv("NAMD_ENERGY_UPDATE_SELECTION2", 0))     # TODO
+UPDATE_SELECTION1: str = str(os.getenv("OPENMM_ENERGY_UPDATE_SELECTION1", 0))     # TODO
+UPDATE_SELECTION2: str = str(os.getenv("OPENMM_ENERGY_UPDATE_SELECTION2", 0))     # TODO
 FAST_DYNAMIC_SELECTION: bool = True   # Bypasses slow MDAnalysis 'updating=True' and manually update selection using FastDynamicSelector
 
 ## Output file names
-OUT_FILE_PREFIX: str = os.getenv("NAMD_ENERGY_OUT_PREFIX", "interaction")    # TODO: or set ENV VAR: NAMD_ENERGY_OUT_PREFIX
+OUT_FILE_PREFIX: str = os.getenv("OPENMM_ENERGY_OUT_PREFIX", "pair_interaction")    # TODO: or set ENV VAR: OPENMM_ENERGY_OUT_PREFIX
 
 ## [OPTIONAL][ Label for this run
-LABEL: str = os.getenv("NAMD_ENERGY_LABEL", "Interaction Energy (OpenMM)")   # or ser ENV VAR: NAMD_ENERGY_LABEL
+LABEL: str = os.getenv("OPENMM_ENERGY_LABEL", "Pair-Interaction Energy (OpenMM)")   # or ser ENV VAR: OPENMM_ENERGY_LABEL
 
 ### Energies to calculate (as sequence of 4-letter codes)
 # -------------------------------------------------------------------------------------
@@ -126,7 +127,7 @@ LABEL: str = os.getenv("NAMD_ENERGY_LABEL", "Interaction Energy (OpenMM)")   # o
 # -------------------------------------------------------------------------------------
 # WITH SELECTION 2: ONLY [ -vdw -elec -nonb -pote -all ] ARE ALLOWED
 
-OUT_ENERGIES: list[str] = os.getenv("NAMD_ENERGY_OUT_ENERGIES", "-all").split()     # TODO: or set ENV VAR: NAMD_ENERGY_OUT_ENERGIES
+OUT_ENERGIES: list[str] = os.getenv("OPENMM_ENERGY_OUT_ENERGIES", "-all").split()     # TODO: or set ENV VAR: OPENMM_ENERGY_OUT_ENERGIES
 
 ## Params
 CUTOFF: float = 12.0            # TODO: Cutoff distance (in Å)
@@ -164,7 +165,7 @@ COMMENT_TOKEN = "#"
 # --------------------------------------------------------------------
 # FRAME LOADING and PERFORMANCE
 # --------------------------------------------------------------------
-RAM_DISK_PATH = "/tmp/namd_energy.openmm"   # ram disk path to use
+RAM_DISK_PATH = "/tmp/openmm_energy"        # ram disk path to use
 RAM_DISK_MAX_USAGE_FACTOR: float = 0.75     # [0.1, 0.95] RAM disk max usage allowed (as fraction). KEEP BELOW 0.8
 
 QUEUE_FRAME_COUNT = 50                # Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
@@ -1093,9 +1094,9 @@ if not SELECTION1.strip():
 
 # Extracting boolean env vars
 UPDATE_SELECTION1: bool = boolify(UPDATE_SELECTION1,
-                                  err_msg="Invalid value of environment variable NAMD_ENERGY_UPDATE_SELECTION1")
+                                  err_msg="Invalid value of environment variable OPENMM_ENERGY_UPDATE_SELECTION1")
 UPDATE_SELECTION2: bool = boolify(UPDATE_SELECTION2,
-                                  err_msg="Invalid value of environment variable NAMD_ENERGY_UPDATE_SELECTION2")
+                                  err_msg="Invalid value of environment variable OPENMM_ENERGY_UPDATE_SELECTION2")
 
 if SELECTION2.strip():
     if SELECTION1 == SELECTION2:
@@ -1312,6 +1313,8 @@ if __name__ == '__main__':
     if not AMBER_MODE:
         log_info(f"PARAM Files  : {len(CHARMM_PARAM_FILES)} {CHARMM_PARAM_FILES}")
     log_info(f"Topology     : {TOPOLOGY_FILE}")
+    if HAS_NBFIX:
+        log_info(f"NBFix (vdw)  : ON  (params: {nbfix_param_names})")
     log_info(f"TRAJ Files   : {len(TRAJ_FILES)} {TRAJ_FILES}")
     print("-----------------")
     log_info(f"TOTAL ATOM COUNT: {N_ATOMS}")
@@ -1320,7 +1323,6 @@ if __name__ == '__main__':
     if not is_self_interaction:
         log_info(f"SELECTION-2  : \"{SELECTION2}\" (atom count at frame 0: {len(static_sel2_idx_set)})")
         log_info(f"UPDATE SEL-2 : {'ON' if UPDATE_SELECTION2 else 'OFF'}")
-    log_info(f"CHARMM NBFix : {'ON' if HAS_NBFIX else 'OFF'}")
     log_info(f"PERIODIC     : {'ON' if PERIODIC else 'OFF'}  (PME: {'ON' if PME_ENABLED else 'OFF'})")
     log_info(f"SWITCHING    : {'ON' if HAS_SWITCHING else 'OFF'}")
     if FRAME_STEP > 1:
@@ -1365,7 +1367,7 @@ else:
 if HAS_NBFIX:
     orig_nbfix_vdw_expr = nbfix_force.getEnergyFunction()
     log_info(f"NBFIX VDW FORCE: USing nbfix vdw energy function: {CYAN}'E_vdw = {orig_nbfix_vdw_expr}'{NOCOL}")
-    # Safely inject NAMD switching function into the main energy term (before any semicolons)
+    # Safely inject switching function into the main energy term (before any semicolons)
     nbfix_expr_parts = orig_nbfix_vdw_expr.split(';')
     nbfix_expr_parts[0] = f"(({nbfix_expr_parts[0]}) * {S_vdw})"
     vdw_base = ";".join(nbfix_expr_parts)
@@ -1566,7 +1568,7 @@ nb_method = mm.CustomNonbondedForce.CutoffPeriodic if PERIODIC else mm.CustomNon
 for custom_f in [vdw_force, elec_force]:
     custom_f.setNonbondedMethod(nb_method)
     custom_f.setCutoffDistance((CUTOFF / 10.0) * unit.nanometers)
-    # CRITICAL: Disable OpenMM native C5 switch because we injected NAMD X-PLOR explicitly
+    # CRITICAL: Disable OpenMM native C5 switch because we injected our custom switching function explicitly
     custom_f.setUseSwitchingFunction(False)
 
 pair_system.addForce(vdw_force)
@@ -2213,7 +2215,7 @@ def create_comments_str() -> str:
     kbt_in_kcal_per_mol = 1.0 / (0.0019872 * TEMPERATURE) if TEMPERATURE is not None and TEMPERATURE > 0 else None
 
     comments = [
-        f"Created by Python OpenMM. {get_cur_datetime_formatted()}",
+        f"OpenMM Pair-Interaction Energy. {get_cur_datetime_formatted()}",
         f"------------------------------------------------",
         f"=========   {LABEL}    ========",
         f"------------------------------------------------",
