@@ -2,25 +2,31 @@
 
 # Requirements:
 # => pip packages : numpy, openmm[cuda], mdanalysis
-# => external : catdcd (for chunking DCD to RAM)
+# => external : cpptraj (OPTIONAL, for chunking trajectory files to RAM)
+#               catdcd  (OPTIONAL, preferred for chunking DCD files to RAM)
+
+# TODO: TEST new features
+# 1. universal chunking with cpptraj
+# 2. AMBER mode
 
 # ========================================================================
 # OpenMM and MDAnalysis implementation of NAMD PairInteraction Energy
 # ------------------------------------------------------------------------
 # OPTIMIZED FOR GPU
 # ----------------------
+# => Supports both CHARMM and AMBER topologies
 # => calculate pairinteraction energies from NAMD simulation trajectories with CHARMM force fields
 # => STATIC and DYNAMIC selections, self and cross-interactions
 # => PME for long range electrostatics (NAMD pairinteraction does not have this)
 #    Electrostatic energies with PME will be highly negative compared to NAMD pairinteraction
-# => Trajectory Disk Streaming/RAM loading/RAM chunking modes (chunking requires catdcd)
+# => Trajectory Disk Streaming/RAM loading/RAM chunking modes (chunking requires cpptraj/catdcd)
 # => Smart multithreading allocation
 # ------------------------------------------------------------------------
 
 ## USAGE --------------------------------------------------
-# 0: First run normal simulation to obtain .dcd trajectories
+# 0: First run normal simulation to obtain trajectories
 # 1. Copy script to working dir
-# 2. INPUT: Set input structure (.psf) and trajectories (.dcd)
+# 2. INPUT: Set input topology (.psf / .prmtop in AMBER) and trajectories (.dcd / .nc)
 # 3. INPUT: Set selection 1, Selection 2 (Optional), out_energies (Optional), out_file_prefix
 # ----------------------------------------------------------------------------
 # -> ALTERNATIVELY, SET ENVIRONMENT VARIABLES (used when variables are not set in script)
@@ -47,7 +53,7 @@ import os
 import sys
 
 
-# Helper function to find dcd files in a folder. min_num and max_num are both inclusive
+# Helper function to find trajectory files in a folder. min_num and max_num are both inclusive
 def find_files(dir_path, prefix, suffix, min_num=None, max_num=None, sort_natural=True, return_abs_path=False):
     import re; from pathlib import Path
     dir_path_obj = Path(dir_path)
@@ -75,20 +81,27 @@ DEBUG: bool = True
 USE_GPU: bool = True                 # Keep it True, Auto-fallbacks to CPU
 NUM_COMPUTE_WORKERS: int = 4         # [GPU ONLY] TODO: OpenMM Contexts running in parallel (Consume RAM and VRAM). Scale up for DYNAMIC MODE
 
-RAM_LOAD_ENABLED: bool = True        # TODO: Loads DCD files to RAM_DISK before processing, bypasses I/O bottlenecks
-RAM_CHUNK_MODE: bool = True          # Loads big DCD files to RAM_DISK in chunks. REQUIRES CATDCD in PATH
+RAM_LOAD_ENABLED: bool = True        # TODO: Loads trajectory files to RAM_DISK before processing, bypasses I/O bottlenecks
+RAM_CHUNK_MODE: bool = True          # Loads big traj files to RAM_DISK in chunks. REQUIRES CPPTRAJ/CATDCD in PATH
 RAM_READER_COUNT: int = 2            # Concurrent readers for RAM chunks. Auto-decrement for small trajectories (chunks)
 
 
 # --------------------------------------------------------------------
 # INPUT
 # --------------------------------------------------------------------
+# AMBER Only ---------
+AMBER_MODE = False          # Use AMBER topology
+PRMTOP_FILE = ""            # AMBER .prmtop (.prm7) topology + parameter file
+
+# CHARMM Only ---------
 CHARMM_PARAM_FILES = [
     "../../common/ff/par_all36m_prot.prm",
     "../../common/ff/toppar_water_ions.prot.str"
 ]
-PSF_FILE = "../../common/amyl_wb.psf"       # TODO : input structure file
-DCD_FILES = find_files("..", "amyl_wb_eq", ".dcd")          # TODO : trajectory dcd files
+PSF_FILE = "../../common/amyl_wb.psf"       # TODO : input topology file
+
+# Trajectory Files
+TRAJ_FILES = find_files("..", "amyl_wb_eq", ".dcd")          # TODO : trajectory files
 
 ## Selections (MDAnalysis selection syntax)
 # -> hydration shell: water and around 4.25 protein
@@ -131,7 +144,7 @@ PME_ENABLED: bool = True        # [ONLY PERIODIC] PME for long-range electrostat
 
 ## TIme Step parameters (ONLY USED FOR OUTPUT COLUMNS, DOES NOT AFFECT CALCULATION)
 TIMESTEP_FIRST: int = 0         # only for bookkeeping
-FRAME_FREQ: int = 100           # TODO: timesteps between frames (=dcd_freq). only for bookkeeping
+FRAME_FREQ: int = 100           # TODO: timesteps between frames (=dcd_freq in NAMD). only for bookkeeping
 
 # Skip Frames, faster calculation
 FRAME_SKIP: int = 0             # TODO: frame_step = frame_skip + 1
@@ -160,7 +173,7 @@ RAM_DISK_MAX_USAGE_FACTOR: float = 0.75     # [0.1, 0.95] RAM disk max usage all
 
 QUEUE_FRAME_COUNT = 50                # Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
 
-## RAM CHUNK MODE (requires catdcd)
+## RAM CHUNK MODE (requires cpptraj/catdcd in PATH)
 RAM_CHUNK_DYNAMIC: bool = True        # Automatically shrink chunk if RAM is constrained
 RAM_CHUNK_FRAMES: int = 10000         # Max frames per chunk
 RAM_CHUNK_MIN_FRAMES: int = 2000      # Fallback to disk streaming if chunks cannot meet this size
@@ -897,6 +910,12 @@ ACTION_REGISTER_RAM_FILE = "register_ram_file"
 ACTION_UNREGISTER_RAM_FILE = "unregister_ram_file"
 ACTION_ADD_RAM_LOAD_TIME = "add_ram_load_time"
 
+
+# WORKER Meta data keys
+META_WORKER_ID ="wid"
+META_WORKER_TIME_METRICS ="wtm"
+META_FRAMES_PROCESSED = "fp"
+
 # --------------------------------------------------------------------
 # Cleanup Handlers
 # --------------------------------------------------------------------
@@ -1022,16 +1041,27 @@ def check_files(file_paths: str | list[str], display_name: str):
         file_paths = [file_paths]
 
     if len(file_paths) == 0:
-        log_error(f"NO {display_name} supplied")
+        log_error(f"No {display_name} specified")
     else:
         for fp in file_paths:
             if not os.path.isfile(fp):
                 log_error(f"{display_name} not found: \"{fp}\"")
 
 
-check_files(PSF_FILE, "STRUCTURE FILE")
-check_files(DCD_FILES, "DCD FILE")
-check_files(CHARMM_PARAM_FILES, "PARAMETER FILE")
+if AMBER_MODE:
+    TOPOLOGY_FILE = PRMTOP_FILE
+    if PRMTOP_FILE is None or not PRMTOP_FILE.strip():
+        log_error("AMBER MODE: PRMTOP (parameter + topology) file is required")
+    check_files(PRMTOP_FILE, "AMBER PRMTOP FILE")
+else:
+    TOPOLOGY_FILE = PSF_FILE
+    if PSF_FILE is None or not PSF_FILE.strip():
+        log_error("CHARMM MODE: PSF topology file is required")
+    check_files(PSF_FILE, "PSF FILE")
+    check_files(CHARMM_PARAM_FILES, "PARAMETER FILE")
+
+check_files(TRAJ_FILES, "TRAJECTORY FILE")
+
 
 if not SELECTION1.strip():
     log_error("SELECTION1 cannot be empty. Please define a valid atom selection.")
@@ -1068,16 +1098,14 @@ if FRAME_SKIP < 0:
     FRAME_SKIP = 0
 FRAME_STEP = FRAME_SKIP + 1
 
+HAS_CATDCD = shutil.which("catdcd") is not None
+HAS_CPPTRAJ = shutil.which("cpptraj") is not None
 if RAM_LOAD_ENABLED:
     # make sure ram disk exists
     try:
         os.makedirs(RAM_DISK_PATH, exist_ok=True)
     except Exception as e:
         log_error(f"RAM DISK: Failed to create RAM-DISK directory {RAM_DISK_PATH}: {e}", e)
-
-    if RAM_CHUNK_MODE and shutil.which("catdcd") is None:
-        log_warn(f"{YELLOW}CHUNKING DISABLED: {CYAN}'catdcd'{NOCOL} not found on system PATH. Falling back to FULL RAM LOAD [LOADER 1]...")
-        RAM_CHUNK_MODE = False
 
     if RAM_DISK_MAX_USAGE_FACTOR < 0.1:
         log_warn("RAM DISK: RAM-Disk Max Usage Factor must be > 0.1 (10%). Resetting to 0.1 ")
@@ -1088,6 +1116,10 @@ if RAM_LOAD_ENABLED:
 
     if RAM_DISK_MAX_USAGE_FACTOR >= 0.79:
         log_warn(f"RAM DISK: HIGH RAM-Disk max Usage Factor: {YELLOW}{RAM_DISK_MAX_USAGE_FACTOR}. This may cause 'QUOTA EXCEEDED' errors{NOCOL}. You should lower it below 0.80")
+
+    if RAM_CHUNK_MODE and not (HAS_CATDCD or HAS_CPPTRAJ):
+        log_warn(f"{YELLOW}CHUNKING DISABLED:{NOCOL} {CYAN}'cpptraj'{NOCOL} and {CYAN}'catdcd'{NOCOL} not found on system PATH. Install cpptraj or catdcd and add to PATH ...")
+        RAM_CHUNK_MODE = False
 
 # ------------------------------------------------------------------------
 raw_erg_requested: set = set([e.lower().strip().lstrip('-') for e in OUT_ENERGIES])
@@ -1122,15 +1154,24 @@ if len(final_erg_components) == 0:
 if shutdown_event.is_set(): sys.exit(1)
 
 log_info("Parsing Topology and Forcefield...")
-psf = app.CharmmPsfFile(PSF_FILE)
-params = app.CharmmParameterSet(*CHARMM_PARAM_FILES)
-
-if PERIODIC:
-    psf.setBox(10.0 * unit.nanometers, 10.0 * unit.nanometers, 10.0 * unit.nanometers)
-
 base_nb_method = app.CutoffPeriodic if PERIODIC else app.CutoffNonPeriodic
-base_system = psf.createSystem(params, nonbondedMethod=base_nb_method,
-                               nonbondedCutoff=(CUTOFF / 10.0) * unit.nanometers)
+
+# Base System Creation
+if AMBER_MODE:
+    log_info(f"AMBER MODE: Loading PRMTOP file {CYAN}{PRMTOP_FILE}{NOCOL} ...")
+    prmtop = app.AmberPrmtopFile(PRMTOP_FILE)
+    if PERIODIC and prmtop.topology.getPeriodicBoxVectors() is None:
+        log_warn("AMBER MODE: No periodic box vectors found in PRMTOP. Defaulting to 10nm box.")
+        prmtop.topology.setPeriodicBoxVectors([mm.Vec3(10, 0, 0), mm.Vec3(0, 10, 0), mm.Vec3(0, 0, 10)] * unit.nanometers)
+    base_system = prmtop.createSystem(nonbondedMethod=base_nb_method, nonbondedCutoff=(CUTOFF / 10.0) * unit.nanometers)
+else:
+    log_info(f"CHARMM MODE:  Loading PSF file {CYAN}{PSF_FILE}{NOCOL} ...")
+    psf = app.CharmmPsfFile(PSF_FILE)
+    params = app.CharmmParameterSet(*CHARMM_PARAM_FILES)
+    if PERIODIC:
+        psf.setBox(10.0 * unit.nanometers, 10.0 * unit.nanometers, 10.0 * unit.nanometers)
+    base_system = psf.createSystem(params, nonbondedMethod=base_nb_method, nonbondedCutoff=(CUTOFF / 10.0) * unit.nanometers)
+
 
 N_ATOMS = base_system.getNumParticles()
 
@@ -1145,15 +1186,15 @@ if PERIODIC:
 nb_base = [f for f in base_system.getForces() if isinstance(f, mm.NonbondedForce)][0]
 
 # --- Coordinate Injection for Static Initialization ---
-u_init = mda.Universe(PSF_FILE, DCD_FILES[0])
+u_init = mda.Universe(TOPOLOGY_FILE, TRAJ_FILES[0])
 u_init_ts = u_init.trajectory[0]  # initialize first frame
 
 ## coordinates and box of first frame
 # u_init_coords = u_init.atoms.positions
 n_init_atoms = u_init.atoms.n_atoms     # num_atoms from 1 st frame
-n_covalent_bonds = len(u_init.bonds)    # True covalent bonds from PSF
+n_covalent_bonds = len(u_init.bonds)    # True covalent bonds from topology
 if N_ATOMS != n_init_atoms:
-    log_error(f"Number of atoms in PSF ({N_ATOMS}) does not match number of atoms in trajectory ({u_init.atoms.n_atoms})")
+    log_error(f"Number of atoms in TOPOLOGY ({N_ATOMS}) does not match number of atoms in trajectory ({u_init.atoms.n_atoms})")
 
 if (UPDATE_SELECTION1 or UPDATE_SELECTION2) and not FAST_DYNAMIC_SELECTION:
     log_warn("FAST_DYNAMIC_SELECTION is OFF. Falling back to native MDAnalysis 'updating=True'. This may be slow!")
@@ -1228,9 +1269,11 @@ if __name__ == '__main__':
     print("\n------------------------------------------------------")
     log_info(" SYSTEM INFORMATION ")
     print("------------------------------------------------------")
-    log_info(f"PARAM Files  : {len(CHARMM_PARAM_FILES)} {CHARMM_PARAM_FILES}")
-    log_info(f"Structure    : {PSF_FILE}")
-    log_info(f"DCD Files    : {len(DCD_FILES)} {DCD_FILES}")
+    log_info(f"MODE         : {'AMBER' if AMBER_MODE else 'CHARMM'}")
+    if not AMBER_MODE:
+        log_info(f"PARAM Files  : {len(CHARMM_PARAM_FILES)} {CHARMM_PARAM_FILES}")
+    log_info(f"Topology     : {TOPOLOGY_FILE}")
+    log_info(f"TRAJ Files   : {len(TRAJ_FILES)} {TRAJ_FILES}")
     print("-----------------")
     log_info(f"TOTAL ATOM COUNT: {N_ATOMS}")
     log_info(f"SELECTION-1  : \"{SELECTION1}\" (atom count at frame 0: {len(static_sel1_idx_set)})")
@@ -1650,8 +1693,12 @@ system_serialized_xml = mm.XmlSerializer.serialize(pair_system)
 
 log_info("Flushing parsed topology databases before forking Compute Workers...\n")
 del base_system
-del psf
-del params
+try: del psf
+except NameError: pass
+try: del params
+except NameError: pass
+try: del prmtop
+except NameError: pass
 del pair_system
 del vdw_force
 del elec_force
@@ -1679,7 +1726,7 @@ active_fetches = [(1 << force_group_map[c], comp_idx[c]) for c in final_erg_comp
 # BACKGROUND PRODUCER PIPELINE
 # =============================================================================
 def parallel_reader_worker_blocking(id, shm_buffer: SharedFrameBuffer,
-                                    psf: str, dcd: str,
+                                    topology_file: str, traj_file: str,
                                     start: int, stop: int, step: int,
                                     global_offset: int,
                                     shutdown_event):
@@ -1687,7 +1734,7 @@ def parallel_reader_worker_blocking(id, shm_buffer: SharedFrameBuffer,
 
     u, sel1, sel2 = None, None, None
     try:
-        u = mda.Universe(psf, dcd)
+        u = mda.Universe(topology_file, traj_file)
 
         if shutdown_event.is_set(): return
         # Only fallback to native MDA if our Fast Engine is disabled
@@ -1769,13 +1816,13 @@ def parallel_reader_worker_blocking(id, shm_buffer: SharedFrameBuffer,
         gc.collect()
 
 
-def disk_stream_blocking(shm_buffer: SharedFrameBuffer, dcd_file: str, total_frames: int, global_frame_offset: int, shutdown_event):
-    parallel_reader_worker_blocking(1, shm_buffer, PSF_FILE, dcd_file, 0, total_frames, FRAME_STEP, global_frame_offset, shutdown_event)
+def disk_stream_blocking(shm_buffer: SharedFrameBuffer, traj_file: str, total_frames: int, global_frame_offset: int, shutdown_event):
+    parallel_reader_worker_blocking(1, shm_buffer, TOPOLOGY_FILE, traj_file, 0, total_frames, FRAME_STEP, global_frame_offset, shutdown_event)
 
 
 def ramdisk_read(reader_idx: int, executor: ThreadPoolExecutor,
                  shm_buffer: SharedFrameBuffer,
-                 temp_dcd: str, num_frames: int, global_frame_offset: int,
+                 temp_traj_file: str, num_frames: int, global_frame_offset: int,
                  shutdown_event, block: bool) -> list[Future] | None:
     """
     In blocking mode, we wait for all reader threads to finish,  and return None
@@ -1799,7 +1846,7 @@ def ramdisk_read(reader_idx: int, executor: ThreadPoolExecutor,
         if start >= stop: continue
 
         fut = executor.submit(parallel_reader_worker_blocking, reader_idx + i + 1,
-                              shm_buffer, PSF_FILE, temp_dcd,
+                              shm_buffer, TOPOLOGY_FILE, temp_traj_file,
                               start, stop, FRAME_STEP,
                               global_frame_offset, shutdown_event)
         futures.append(fut)
@@ -1810,13 +1857,13 @@ def ramdisk_read(reader_idx: int, executor: ThreadPoolExecutor,
     return futures
 
 
-def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, free_slots_queue: queue.Queue, chunks_queue: queue.Queue, action_queue: mp.Queue, shutdown_event):
-    file_size = os.path.getsize(dcd_file)
+def traj_chunk_loader(use_catdcd: bool, topology_file: str, traj_file: str, total_frames: int, chunk_frames: int, free_slots_queue: queue.Queue, chunks_queue: queue.Queue, action_queue: mp.Queue, shutdown_event):
+    file_size = os.path.getsize(traj_file)
     bytes_per_frame = file_size / total_frames if total_frames > 0 else 0
     frames_remaining = total_frames
-    current_start = 1
-    base_name = os.path.basename(dcd_file)
-    base_name_noext = os.path.splitext(base_name)[0]
+    current_start = 1           # start frame index (1 based indexing) [INCLUSIVE]
+    base_name = os.path.basename(traj_file)
+    base_name_noext, traj_ext = os.path.splitext(base_name)
     chunk_count = 1
 
     while frames_remaining > 0 and not shutdown_event.is_set():
@@ -1827,7 +1874,7 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, fre
             continue
 
         this_chunk_frames = min(chunk_frames, frames_remaining)
-        current_last = current_start + this_chunk_frames - 1
+        current_last = current_start + this_chunk_frames - 1    # end frame index (1 based indexing) [INCLUSIVE]
         est_bytes = math.ceil(this_chunk_frames * bytes_per_frame)
 
         # Wait to free the RAM
@@ -1845,20 +1892,24 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, fre
         if shutdown_event.is_set(): break
 
         unique_suffix = uuid.uuid4().hex[:8]
-        temp_chunk_name = f"{base_name_noext}.chunk-{chunk_count}.uuid-{unique_suffix}.dcd"
+        temp_chunk_name = f"{base_name_noext}.chunk-{chunk_count}.uuid-{unique_suffix}{traj_ext}"
         temp_chunk_path = os.path.join(RAM_DISK_PATH, temp_chunk_name)
+        action_queue.put((ACTION_REGISTER_RAM_FILE, temp_chunk_path))  # Pre-register for safety
 
-        log(tag=f"CHUNK {chunk_count}", msg=f"{MAGENTA}LOADING: Frames [{current_start}, {current_last}]{NOCOL} to RAM (via catdcd) ...")
-        action_queue.put((ACTION_REGISTER_RAM_FILE, temp_chunk_path))      # Pre-register for safety
-
+        log(tag=f"CHUNK {chunk_count}", msg=f"{MAGENTA}LOADING: Frames [{current_start}, {current_last}]{NOCOL} to RAM (via {'catdcd' if use_catdcd else 'cpptraj'}) ...")
         t0 = time.perf_counter()
-        cmd = ["catdcd", "-o", temp_chunk_path, "-first", str(current_start), "-last", str(current_last), dcd_file]
-        chunk_proc = subprocess.Popen(cmd,
-                                      stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE,
-                                      text=True)
+        if use_catdcd:
+            cmd = ["catdcd", "-o", temp_chunk_path, "-first", str(current_start), "-last", str(current_last), traj_file]
+            chunk_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        else:
+            # cpptraj expects a script. We feed it directly via stdin to avoid temp files.
+            cpptraj_script = f"parm {topology_file}\ntrajin {traj_file} {current_start} {current_last}\ntrajout {temp_chunk_path}\nrun\nquit\n"
+            chunk_proc = subprocess.Popen(["cpptraj"], stdin=subprocess.PIPE,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            chunk_proc.stdin.write(cpptraj_script)
+            chunk_proc.stdin.close()  # Close stdin so cpptraj starts executing
 
-        # Waiting for catdcd process: Sequential chunk load
+        # Waiting for chunking process: Sequential chunk load
         while chunk_proc.poll() is None:
             if shutdown_event.is_set():
                 chunk_proc.terminate()
@@ -1874,7 +1925,8 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, fre
         ret_code = chunk_proc.returncode
         if ret_code != 0:
             # log error from another process
-            err_msg = f"{RED}CATDCD FAILED [CHUNK {chunk_count}]{NOCOL}: Subprocess exited with return code: {ret_code}. Error: {proc_stderr if proc_stderr.strip() else proc_stdout}"
+            err_msg = (f"{RED}{'CATDCD' if use_catdcd else 'CPPTRAJ'} FAILED [CHUNK {chunk_count}]{NOCOL}: "
+                       f" Subprocess exited with return code: {ret_code}. Error: {proc_stderr if proc_stderr.strip() else proc_stdout}")
             log_error(err_msg, _exit=False)
             break
 
@@ -1898,6 +1950,24 @@ def catdcd_chunk_loader(dcd_file: str, total_frames: int, chunk_frames: int, fre
     chunks_queue.put(None)
 
 
+def get_chunk_program(traj_extension, warn: bool = True) -> str:
+    chunk_program = ""
+    if RAM_CHUNK_MODE:
+        if HAS_CATDCD or HAS_CPPTRAJ:
+            is_dcd = traj_extension.lower() == ".dcd"
+            # prefer catdcd for .dcd files
+            if is_dcd and HAS_CATDCD:
+                chunk_program = "catdcd"
+            else:
+                if HAS_CPPTRAJ:
+                    chunk_program = "cpptraj"
+                elif warn:
+                    log_warn(f"{YELLOW}CHUNKING DISABLED: {CYAN}'cpptraj'{NOCOL} not found on system PATH. It is required to chunk {CYAN}{traj_extension}{NOCOL} files")
+        elif warn:
+            log_warn(f"{YELLOW}CHUNKING DISABLED: {CYAN}'cpptraj'{NOCOL} {CYAN}'catdcd'{NOCOL} not found on system PATH. Falling back to FULL RAM LOAD ...")
+    return chunk_program
+
+
 def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queue, shutdown_event):
     global_frame_offset = 0
 
@@ -1916,19 +1986,19 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
         if delete_now: try_delete_file_nothrow(filepath)
         action_queue.put((ACTION_UNREGISTER_RAM_FILE, filepath))  # Unregister for safety
 
-    def _on_ramdisk_read_done(slot_id: int, dcd_file: str | None):
-        if dcd_file:
-            _local_unregister_ram_file(dcd_file)
+    def _on_ramdisk_read_done(slot_id: int, traj_file: str | None):
+        if traj_file:
+            _local_unregister_ram_file(traj_file)
         ram_chunk_free_slots_q.put(slot_id)     # make it free AFTER removing file from RAM
 
-    def _handle_async_ram_read(slot_id: int, dcd_file: str, futures: list[Future] | None):
+    def _handle_async_ram_read(slot_id: int, traj_file: str, futures: list[Future] | None):
         if futures is None or len(futures) == 0:
-            _on_ramdisk_read_done(slot_id, dcd_file)
+            _on_ramdisk_read_done(slot_id, traj_file)
             return
 
         def _worker():
             concurrent.futures.wait(futures)
-            _on_ramdisk_read_done(slot_id, dcd_file)
+            _on_ramdisk_read_done(slot_id, traj_file)
 
         ramdisk_read_futures.extend(futures)
         # start waiting thread to wait on these specific futures, and delete this file as soon as finished
@@ -1940,15 +2010,16 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
     if RAM_LOAD_ENABLED:
         for i in range(max(RAM_CHUNK_MAX_COUNT, 1)):
             ram_chunk_free_slots_q.put(i)
+
     try:
-        for dcd_file in DCD_FILES:
+        for traj_file in TRAJ_FILES:
             if shutdown_event.is_set(): break
 
-            base_name = os.path.basename(dcd_file)
-            base_name_noext = os.path.splitext(base_name)[0]
+            base_name = os.path.basename(traj_file)
+            base_name_noext, traj_ext = os.path.splitext(base_name)
 
             # Find num frames from mda.Universe
-            u_temp = mda.Universe(PSF_FILE, dcd_file)
+            u_temp = mda.Universe(TOPOLOGY_FILE, traj_file)
             total_frames = u_temp.trajectory.n_frames
             try:
                 u_temp.trajectory.close()
@@ -1958,27 +2029,35 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
 
             if shutdown_event.is_set(): break
 
-            # Logic for determining Loader Strategy
+            # --------------------------------------------------------------------------------------
+            # DISK STREAM
+            # --------------------------------------------------------------------------------------
             if not RAM_LOAD_ENABLED:
                 log_info(f"DISK STREAM: Streaming {CYAN}{base_name}{NOCOL} from Disk (RAM Loading Disabled) ...")
-                disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
+                disk_stream_blocking(shm_buffer, traj_file, total_frames, global_frame_offset, shutdown_event)
                 global_frame_offset += total_frames
                 continue
 
-            file_bytes = os.path.getsize(dcd_file)
+            # --------------------------------------------------------------------------------------
+            # RAM LOAD: Full traj or Chunking
+            # --------------------------------------------------------------------------------------
+            file_bytes = os.path.getsize(traj_file)
             bytes_per_frame = file_bytes / total_frames if total_frames > 0 else 0
 
-            # RAM direct copy mode
-            if not RAM_CHUNK_MODE or total_frames <= RAM_CHUNK_FRAMES:
+            ## Find the suitable chunk program for this file
+            chunk_program = get_chunk_program(traj_ext, warn=True)
+
+            # FULL RAM LOAD -----------------------------
+            if not chunk_program or total_frames <= RAM_CHUNK_FRAMES:
                 if is_ramdisk_free(file_bytes):
                     log_info(f"RAM LOAD: START loading {CYAN}{base_name}{NOCOL} file to RAM ...")
-                    temp_dcd = os.path.join(RAM_DISK_PATH, f"{base_name_noext}.copy.uuid-{uuid.uuid4().hex[:8]}.dcd")
-                    fbytes = os.path.getsize(dcd_file)
+                    temp_traj_file = os.path.join(RAM_DISK_PATH, f"{base_name_noext}.copy.uuid-{uuid.uuid4().hex[:8]}{traj_ext}")
+                    fbytes = os.path.getsize(traj_file)
                     t0 = time.perf_counter()
 
                     if shutdown_event.is_set(): break
-                    action_queue.put((ACTION_REGISTER_RAM_FILE, temp_dcd))      # Pre-register for safety
-                    shutil.copy2(dcd_file, temp_dcd)
+                    action_queue.put((ACTION_REGISTER_RAM_FILE, temp_traj_file))      # Pre-register for safety
+                    shutil.copy2(traj_file, temp_traj_file)
                     if shutdown_event.is_set(): break
 
                     t_taken = time.perf_counter() - t0
@@ -1988,18 +2067,20 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
                     if ram_reader_tpool is None:
                         ram_reader_tpool = create_ram_reader_th_pool()
                     ramdisk_read(tot_ram_reader_count, ram_reader_tpool,
-                                 shm_buffer, temp_dcd, total_frames,
+                                 shm_buffer, temp_traj_file, total_frames,
                                  global_frame_offset, shutdown_event, block=True)
                     tot_ram_reader_count += 1
-                    _local_unregister_ram_file(temp_dcd)
-                elif not RAM_CHUNK_MODE:
+                    _local_unregister_ram_file(temp_traj_file)
+                elif not chunk_program:
                     log_warn( f"DISK STREAM FALLBACK: Insufficient RAM for direct copy of {CYAN}{base_name}{NOCOL}. Falling back to disk streaming.")
-                    disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
+                    disk_stream_blocking(shm_buffer, traj_file, total_frames, global_frame_offset, shutdown_event)
 
                 global_frame_offset += total_frames
                 continue
 
-            # RAM Chunk Mode: Dynamic Chunk Sizing Check (Loader 2)
+            # --------------------------------------------------------------------------------------
+            # RAM Chunk Mode
+            # --------------------------------------------------------------------------------------
             active_chunk_frames = RAM_CHUNK_FRAMES
             simul_chunk_count = 2 if RAM_CHUNK_MAX_COUNT > 1 else 1
             simul_chunk_bytes = math.ceil(active_chunk_frames * bytes_per_frame * simul_chunk_count)
@@ -2008,17 +2089,18 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
             if not simul_chunk_fits:
                 if not RAM_CHUNK_DYNAMIC:
                     log_warn(f"DISK STREAM FALLBACK: Insufficient RAM and Dynamic Chunking is disabled. Streaming from disk: {CYAN}{base_name}{NOCOL}")
-                    disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
+                    disk_stream_blocking(shm_buffer, traj_file, total_frames, global_frame_offset, shutdown_event)
                     global_frame_offset += total_frames
                     continue
 
+                # DYNAMIC chunk sizing
                 log_warn(f"LOW RAM: Cannot fit {simul_chunk_count} default chunk ({active_chunk_frames} frames each) to RAM")
                 resized_frames = math.floor(ram_avail_bytes / (simul_chunk_count * bytes_per_frame)) if ram_avail_bytes > 0 else 0
 
                 if resized_frames < RAM_CHUNK_MIN_FRAMES:
                     log_warn(f"FAILED DYNAMIC CHUNK SIZE: Dynamic chunk size ({resized_frames}) below MIN_CHUNK_FRAMES ({RAM_CHUNK_MIN_FRAMES}).")
                     log_warn(f"DISK STREAM FALLBACK: Falling back to Disk Streaming for {CYAN}{base_name}{NOCOL}.")
-                    disk_stream_blocking(shm_buffer, dcd_file, total_frames, global_frame_offset, shutdown_event)
+                    disk_stream_blocking(shm_buffer, traj_file, total_frames, global_frame_offset, shutdown_event)
                     global_frame_offset += total_frames
                     continue
 
@@ -2027,11 +2109,13 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
 
             if shutdown_event.is_set(): break
             log_info(f"CHUNKING TO RAM: {CYAN}{base_name}{NOCOL} with {active_chunk_frames} frames/chunk")
+            use_catdcd = chunk_program == "catdcd"
             chunks_queue = queue.Queue()
-            chunk_mgr_thread = threading.Thread(target=catdcd_chunk_loader,
-                                                args=(dcd_file, total_frames, active_chunk_frames,
-                                                      ram_chunk_free_slots_q, chunks_queue, action_queue,
-                                                      shutdown_event))
+            chunk_mgr_thread = threading.Thread(target=traj_chunk_loader,
+                                                args=(use_catdcd, TOPOLOGY_FILE, traj_file,
+                                                      total_frames, active_chunk_frames,
+                                                      ram_chunk_free_slots_q, chunks_queue,
+                                                      action_queue, shutdown_event))
             chunk_mgr_thread.daemon = True
             chunk_mgr_thread.start()
 
@@ -2039,17 +2123,17 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
             while not shutdown_event.is_set():
                 chunk_data = chunks_queue.get()
                 if chunk_data is None: break
-                slot_id, temp_dcd, n_frames = chunk_data
+                slot_id, temp_traj_file, n_frames = chunk_data
 
                 if ram_reader_tpool is None:
                     ram_reader_tpool = create_ram_reader_th_pool()
                 _futs = ramdisk_read(tot_ram_reader_count, ram_reader_tpool,
-                                             shm_buffer, temp_dcd, n_frames,
+                                             shm_buffer, temp_traj_file, n_frames,
                                              global_frame_offset + chunk_frame_offset,
                                              shutdown_event, block=False)
                 tot_ram_reader_count += 1
-                _handle_async_ram_read(slot_id, temp_dcd, _futs)
-                # _local_unregister_ram_file(temp_dcd)
+                _handle_async_ram_read(slot_id, temp_traj_file, _futs)
+                # _local_unregister_ram_file(temp_traj_file)
                 chunk_frame_offset += n_frames
 
             chunk_mgr_thread.join()
@@ -2087,15 +2171,16 @@ def create_comments_str() -> str:
         f"------------------------------------------------",
         f"=========   {LABEL}    ========",
         f"------------------------------------------------",
-        f"PARAM File(s): {CHARMM_PARAM_FILES}",
-        f"PSF File     : {PSF_FILE}",
-        f"DCD File(s)  : {DCD_FILES}",
-        f"TOTAL Atom Count: {N_ATOMS}",
+        f"MODE           : {'AMBER' if AMBER_MODE else 'CHARMM'}",
+        f"PARAM File(s)  : " + ("N/A (AMBER)" if AMBER_MODE else f"{CHARMM_PARAM_FILES}"),
+        f"TOPOLOGY File  : {TOPOLOGY_FILE}",
+        f"TRAJ File(s)   : {TRAJ_FILES}",
+        f"TOTAL Atoms    : {N_ATOMS}",
         "## Selections ---------------",
-        f"SELECTION 1  : \"{SELECTION1}\"  (atom count at frame 0: {len(static_sel1_idx_set)})",
-        f"SELECTION 2  : \"{SELECTION2}\"  (atom count at frame 0: {len(static_sel2_idx_set) if not is_self_interaction else 0})",
-        f"Update SEL-1 : {'ON' if UPDATE_SELECTION1 else 'OFF'}",
-        f"Update SEL-2 : {'ON' if UPDATE_SELECTION2 else 'OFF'}",
+        f"SELECTION 1    : \"{SELECTION1}\"  (atom count at frame 0: {len(static_sel1_idx_set)})",
+        f"SELECTION 2    : \"{SELECTION2}\"  (atom count at frame 0: {len(static_sel2_idx_set) if not is_self_interaction else 0})",
+        f"Update SEL-1   : {'ON' if UPDATE_SELECTION1 else 'OFF'}",
+        f"Update SEL-2   : {'ON' if UPDATE_SELECTION2 else 'OFF'}",
         "## Output -------------------",
         f"OUTPUT Energies : {' '.join(OUT_ENERGIES)}",
         f"OUTPUT Force    : {'ON' if OUT_FORCE else 'OFF'}  (TOTAL_FORCE as VECTOR_SUM: {'ON' if TOTAL_FORCE_VECTOR_SUM else 'OFF'})",
@@ -2509,7 +2594,12 @@ def compute_worker_process(worker_id: int,
 
     # Return local time metrics to Main process
     if out_meta_queue is not None:
-        try : out_meta_queue.put((worker_id, local_t_total, local_t_init_total, local_t_compute_total, local_t_io_wait_total))
+        local_meta_dict = {
+            META_WORKER_ID: worker_id,
+            META_FRAMES_PROCESSED: local_frames_processed,
+            META_WORKER_TIME_METRICS: (local_t_total, local_t_init_total, local_t_compute_total, local_t_io_wait_total)
+        }
+        try : out_meta_queue.put(local_meta_dict)
         except Exception: pass
 
     # Tell the Main Orchestrator this worker has gracefully terminated
@@ -2561,42 +2651,51 @@ def _handle_action_queue(action_queue: mp.Queue, block: bool = True, timeout: fl
             if block: continue
             break
 
+
 # -----------------------------------------------------------------------------
 # META-DATA Processing (Returned by Workers at the end)
 # -----------------------------------------------------------------------------
-def process_worker_meta_data(meta_q: mp.Queue) -> np.ndarray | None:
+def handle_worker_meta_data(meta_q: mp.Queue) -> np.ndarray | None:
     """
      @:returns Avg. worker times as a numpy array, or None if queue is empty
                [w_avg_total_time, w_avg_init_time, w_avg_compute_time, w_avg_io_wait_time]
      """
-    w_meta_dict = {}  # worker_id -> w_meta data
+    meta_dicts = {}  # worker_id -> w_meta data
+    time_metrics_len = 0
     for _ in range(NUM_COMPUTE_WORKERS):
         w_meta = None
         try: w_meta = meta_q.get_nowait()
         except queue.Empty: break
         if w_meta is None: continue
-        w_meta_dict[w_meta[0]] = w_meta[1:]
+        meta_dicts[w_meta[META_WORKER_ID]] = w_meta
+        if time_metrics_len == 0:
+            time_metrics_len = len(w_meta[META_WORKER_TIME_METRICS])
 
-    n_workers = len(w_meta_dict)
+    n_workers = len(meta_dicts)
     if n_workers == 0: return None
 
-    sorted_w_ids = sorted(w_meta_dict.keys())
-    w_meta_len = len(w_meta_dict[sorted_w_ids[0]])
-    sum_w_t = np.zeros(w_meta_len, dtype= np.float64)
+    sorted_w_ids = sorted(meta_dicts.keys())
+    sum_w_times = np.zeros(time_metrics_len, dtype= np.float64)
 
     # Process Workers meta-data in the order of their id
     for w_id in sorted_w_ids:
-        w_meta_data = w_meta_dict[w_id]
-        sum_w_t += w_meta_data
+        w_meta = meta_dicts[w_id]
+        sum_w_times += w_meta[META_WORKER_TIME_METRICS]
         if DEBUG:
-            w_t_total, w_t_init, w_t_compute, w_t_io_wait = w_meta_data
+            w_t_total, w_t_init, w_t_compute, w_t_io_wait = w_meta[META_WORKER_TIME_METRICS]
             w_t_compute_active = w_t_compute - w_t_io_wait
+
+            w_frames_processed = w_meta[META_FRAMES_PROCESSED]
+            w_fps = w_frames_processed / max(w_t_total, 0.001)
+            w_fps_col = RED if w_fps < 10 else YELLOW if w_fps < 20 else GREEN
 
             w_io_wait_percent = w_t_io_wait / max(0.001, w_t_compute) * 100
             w_io_wait_col = RED if w_io_wait_percent >= 20 else YELLOW if w_io_wait_percent >= 10 else GREEN
 
             print("\n" + "-" * 40)
             log_debug(f"WORKER-{w_id} STATS: ")
+            print(f" Frames Processed     : {w_frames_processed}")
+            print(f" Processing Speed     : {w_fps_col}{w_fps:.1f} frames/sec{NOCOL} (avg)")
             print(f" Total Wall Time      : {w_t_total:.1f} s")
             print(f"   ├─ Initialization  : {w_t_init:.1f} s  ({w_t_init / w_t_total * 100:.1f} %)")
             print(f"   ├─ Compute Loop    : {w_t_compute:.1f} s  ({w_t_compute / w_t_total * 100:.1f} %)")
@@ -2605,7 +2704,7 @@ def process_worker_meta_data(meta_q: mp.Queue) -> np.ndarray | None:
             # print("-" * 40)
 
     # Average worker times
-    return sum_w_t / n_workers
+    return sum_w_times / n_workers
 
 
 if __name__ == '__main__':
@@ -2733,7 +2832,7 @@ if __name__ == '__main__':
     t_total = t_app_end - t_app_start
 
     # Worker Meta Data
-    worker_avg_times = process_worker_meta_data(out_meta_q)
+    worker_avg_times = handle_worker_meta_data(out_meta_q)
     if worker_avg_times is not None and len(worker_avg_times) >= 4:
         t_init_total += worker_avg_times[1]
         t_compute_total += worker_avg_times[2]
@@ -2760,7 +2859,7 @@ if __name__ == '__main__':
     print("-" * 60)
     print(f" Total Wall Time      : {t_total:.1f} s")
     print(f"   ├─ Initialization  : {t_init_total:.1f} s  ({t_init_total / t_total * 100:.2f} %)")
-    print(f"   ├─ catdcd/RAM I/O  : {t_ram_load_total:.1f} s  ({t_ram_load_total / t_total * 100:.2f} %)")
+    print(f"   ├─ RAM I/O         : {t_ram_load_total:.1f} s  ({t_ram_load_total / t_total * 100:.2f} %)")
     print(f"   ├─ Compute Loop    : {t_compute_total:.1f} s  ({t_compute_total / t_total * 100:.2f} %)")
     print(f"        ├─ Active     : {t_compute_active_total:.1f} s  ({t_compute_active_total / max(0.001, t_compute_total) * 100:.2f} %)")
     print(f"        └─ I/O Wait   : {io_wait_col}{t_io_wait_total:.1f} s  ({io_wait_percent:.2f} %){NOCOL}")

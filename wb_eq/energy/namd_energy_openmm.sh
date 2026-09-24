@@ -8,6 +8,10 @@
 # Exit on error
 #set -e
 
+# for cpptraj chunking support
+module load ambertools
+
+
 run_openmm() {
 	python3 namd_energy_openmm.py
 }
