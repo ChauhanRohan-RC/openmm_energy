@@ -212,7 +212,6 @@ PME_TOLERANCE: float = 1e-6                      # NAMD default PME error tolera
 # ==========================================================================
 # MAIN
 # ==========================================================================
-print("")
 shutdown_event = None   ##type: mp.Event (PLACEHOLDER, will initialize later)
 
 ## Logging ------------------------------
@@ -265,6 +264,14 @@ def log_error(msg, exc=None, flush=True, shutdown: bool = True, _exit: bool = Tr
 # --------------------------------------------
 # HARDWARE INIT and CHECKS
 # --------------------------------------------
+# Header
+if __name__ == '__main__':
+    print("")
+    print("================================================================")
+    print("================ OpenMM Pair-Interaction Energy ================")
+    print("================================================================")
+    print("")
+
 # OpenMM Hardware Initialization (CUDA -> HIP -> OpenCL -> CPU)
 try:
     from openmm import Platform
@@ -571,12 +578,21 @@ class SharedFrameBuffer:
     """
     TAG = "SharedFrameBuffer"
 
-    def __init__(self, num_slots: int, n_atoms: int, has_dyn_sel1: bool, has_dyn_sel2: bool, is_creator: bool = False):
+    KEY_COORDS = "coords"
+    KEY_BOX = "box"
+    KEY_META = "meta"
+    KEY_SEL1 = "sel1"
+    KEY_SEL2 = "sel2"
+
+    def __init__(self, num_slots: int, n_atoms: int, has_dyn_sel1: bool, has_dyn_sel2: bool,
+                 is_creator: bool = False, shm_id: str = None):
         self.num_slots = num_slots
         self.n_atoms = n_atoms
         self.has_dyn_sel1 = has_dyn_sel1
         self.has_dyn_sel2 = has_dyn_sel2
         self.is_creator = is_creator
+        # A Unique id for this shared memory instance to avoid conflicts with other instances
+        self.shm_id = shm_id.strip() if shm_id and shm_id.strip() else uuid.uuid4().hex[:8]
 
         self._lock = mp.Lock()
         self._is_closed: bool = False
@@ -585,20 +601,20 @@ class SharedFrameBuffer:
 
         # Memory Optimization: Use float32 for coords and int32 for indices.
         self.specs = {
-            'coords': ((num_slots, n_atoms, 3), np.float32),
-            'box': ((num_slots, 3, 3), np.float32),
-            'meta': ((num_slots, 3), np.int64)  # Format: [abs_f, n1, n2]
+            self.KEY_COORDS: ((num_slots, n_atoms, 3), np.float32),
+            self.KEY_BOX: ((num_slots, 3, 3), np.float32),
+            self.KEY_META: ((num_slots, 3), np.int64)  # Format: [abs_f, n1, n2]
         }
 
         # Memory Optimization: Only allocate arrays for selections that dynamically change
         if self.has_dyn_sel1:
-            self.specs['sel1'] = ((num_slots, n_atoms), np.int32)
+            self.specs[self.KEY_SEL1] = ((num_slots, n_atoms), np.int32)
         if self.has_dyn_sel2:
-            self.specs['sel2'] = ((num_slots, n_atoms), np.int32)
+            self.specs[self.KEY_SEL2] = ((num_slots, n_atoms), np.int32)
 
         for name, (shape, dtype) in self.specs.items():
             nbytes = math.prod(shape) * np.dtype(dtype).itemsize
-            shm_name = f"namd_energy_shm_{name}"
+            shm_name = f"openmm_shm_{name}_{self.shm_id}"
 
             if self.is_creator:
                 try:
@@ -672,20 +688,20 @@ class SharedFrameBuffer:
         n1 = len(arr_sel1) if arr_sel1 is not None else 0
         n2 = len(arr_sel2) if arr_sel2 is not None else 0
 
-        self.arrays['meta'][free_slot_idx, 0] = abs_frame_idx
-        self.arrays['meta'][free_slot_idx, 1] = n1
-        self.arrays['meta'][free_slot_idx, 2] = n2
+        self.arrays[self.KEY_META][free_slot_idx, 0] = abs_frame_idx
+        self.arrays[self.KEY_META][free_slot_idx, 1] = n1
+        self.arrays[self.KEY_META][free_slot_idx, 2] = n2
 
         # Implicitly casts float64 coordinates to float32 natively
-        self.arrays['coords'][free_slot_idx] = coords
+        self.arrays[self.KEY_COORDS][free_slot_idx] = coords
 
         if box is not None:
-            self.arrays['box'][free_slot_idx] = box
+            self.arrays[self.KEY_BOX][free_slot_idx] = box
 
         if self.has_dyn_sel1 and n1 > 0:
-            self.arrays['sel1'][free_slot_idx, :n1] = arr_sel1
+            self.arrays[self.KEY_SEL1][free_slot_idx, :n1] = arr_sel1
         if self.has_dyn_sel2 and n2 > 0:
-            self.arrays['sel2'][free_slot_idx, :n2] = arr_sel2
+            self.arrays[self.KEY_SEL2][free_slot_idx, :n2] = arr_sel2
 
     def read_frame(self, ready_slot_idx: int):
         """
@@ -695,15 +711,15 @@ class SharedFrameBuffer:
         """
         # if self._is_closed: raise RuntimeError(f"{self.TAG}: Already closed. Cannot read frames")
         
-        abs_f = int(self.arrays['meta'][ready_slot_idx, 0])
-        n1 = int(self.arrays['meta'][ready_slot_idx, 1])
-        n2 = int(self.arrays['meta'][ready_slot_idx, 2])
+        abs_f = int(self.arrays[self.KEY_META][ready_slot_idx, 0])
+        n1 = int(self.arrays[self.KEY_META][ready_slot_idx, 1])
+        n2 = int(self.arrays[self.KEY_META][ready_slot_idx, 2])
 
-        coords_nm = self.arrays['coords'][ready_slot_idx]
-        box_nm = self.arrays['box'][ready_slot_idx]
+        coords_nm = self.arrays[self.KEY_COORDS][ready_slot_idx]
+        box_nm = self.arrays[self.KEY_BOX][ready_slot_idx]
 
-        arr_sel1 = self.arrays['sel1'][ready_slot_idx, :n1] if self.has_dyn_sel1 else None
-        arr_sel2 = self.arrays['sel2'][ready_slot_idx, :n2] if self.has_dyn_sel2 else None
+        arr_sel1 = self.arrays[self.KEY_SEL1][ready_slot_idx, :n1] if self.has_dyn_sel1 else None
+        arr_sel2 = self.arrays[self.KEY_SEL2][ready_slot_idx, :n2] if self.has_dyn_sel2 else None
 
         return abs_f, coords_nm, box_nm, arr_sel1, arr_sel2, n1, n2
 
@@ -2891,7 +2907,12 @@ if __name__ == '__main__':
     print("=" * 60)
 
     if io_wait_percent >= 20:
-        log_warn("SLOW FRAME READING (i/O): You may want to enable RAM_CHUNKING or increase NUM_RAM_READERS")
+        msg = "SLOW FRAME READING (i/O): "
+        if not RAM_LOAD_ENABLED or not RAM_CHUNK_MODE:
+            msg += "You may want to enable RAM_CHUNKING or increase NUM_RAM_READERS"
+        else:
+            msg += "Your storage drive might be slow. Do NOT read/write to HDD while the program runs"
+        log_warn(msg)
 
     if avg_fps < 20:
         log_warn("SLOW COMPUTE PERFORMANCE: Make sure USE_GPU is enabled and increase NUM_COMPUTE_WORKERS (OpenMM Contexts)")
