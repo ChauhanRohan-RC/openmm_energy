@@ -1,0 +1,162 @@
+# ====================================================================
+# OpenMM PairInteraction Energy Configuration
+# ====================================================================
+# [Search for TODO]
+# RUN the program with -c <config_file> OR set ENV VAR: OPENMM_ENERGY_CONFIG=<config_file>
+# -------------------------------
+# CONFIGURATION PRIORITY ORDER:
+# 1. Environment Variables (Highest priority, acts as an override)
+# 2. TOML Configuration File (This file)
+# 3. Python Script Hardcoded Defaults (Lowest priority)
+# ====================================================================
+[general]
+debug = true                                 # ENV Override: OPENMM_ENERGY_DEBUG
+
+# --------------------------------------------------------------------
+# PERFORMANCE
+# --------------------------------------------------------------------
+[performance]
+use_gpu = true                               # Keep it true, auto-fallbacks to CPU
+num_compute_workers = 4                      # [GPU ONLY] TODO: OpenMM Contexts running in parallel (Consume RAM and VRAM). Scale up for DYNAMIC MODE
+
+ram_load_enabled = true                      # Loads trajectory files to RAM_DISK before processing, bypasses I/O bottlenecks
+ram_chunk_mode = true                        # Loads big traj files to RAM_DISK in chunks. REQUIRES CPPTRAJ/CATDCD in PATH
+ram_reader_count = 2                         # Concurrent readers for RAM chunks. Auto-decrement for small trajectories (chunks)
+
+# --------------------------------------------------------------------
+# INPUT
+# --------------------------------------------------------------------
+[input]
+amber_mode = false                           # true = Use AMBER topology, false = Use CHARMM topology
+prmtop_file = ""                             # [AMBER MODE ONLY] AMBER .prmtop (.prm7) topology + parameter file
+
+# If amber_mode = false, charmm_param_files and psf_file are REQUIRED.
+charmm_param_files = [
+    "../../common/ff/par_all36m_prot.prm",
+    "../../common/ff/toppar_water_ions.prot.str"
+]
+psf_file = "../../common/amyl_wb.psf"        # TODO: Input topology file
+
+## TODO: Selections (MDAnalysis selection syntax)
+# -> Example hydration shell: water and around 4.25 protein
+selection1 = ""                              # ENV Override: OPENMM_ENERGY_SELECTION1
+selection2 = ""                              # ENV Override: OPENMM_ENERGY_SELECTION2
+
+# TODO: Dynamic Selections (update every frame)
+update_selection1 = false                    # ENV Override: OPENMM_ENERGY_UPDATE_SELECTION1
+update_selection2 = false                    # ENV Override: OPENMM_ENERGY_UPDATE_SELECTION2
+fast_dynamic_selection = true                # Bypasses slow MDAnalysis 'updating=True' and manually update selection using FastDynamicSelector
+
+## TODO: Trajectory files (.dcd, .nc etc)
+## -> Provide a list explicitly, or use [find_traj_files] section below.
+## -> ENV Override: OPENMM_ENERGY_TRAJ_FILES  (paths delimited by colon ':')
+# traj_files = ["../amyl_wb_eq1.dcd", "../amyl_wb_eq2.dcd"]
+
+## TODO: AUTO-FIND TRAJECTORY FILES (Used if traj_files is omitted above)
+[find_traj_files]
+dir_path = ".."
+prefix = "amyl_wb_eq"
+suffix = ".dcd"
+# min_num = 1                                # Optional: Minimum index (inclusive)
+# max_num = 10                               # Optional: Maximum index (inclusive)
+sort_natural = true                          # Natural sorting (e.g., eq2 comes before eq10)
+return_abs_path = false                      # Return absolute paths instead of relative
+
+# --------------------------------------------------------------------
+# OUTPUT
+# --------------------------------------------------------------------
+[output]
+file_prefix = "pair_interaction"             # TODO, ENV Override: OPENMM_ENERGY_OUT_PREFIX
+label = "Pair-Interaction Energy (OpenMM)"   # ENV Override: OPENMM_ENERGY_LABEL
+
+# Energies to calculate (as sequence of 4-letter codes)
+# OPTIONS: -bond -angl -dihe -impr -conf -vdw -elec -nonb -pote -all
+# -> -dihe (dihedral), -impr (improper), -pote (potential)
+# -> -conf (conformational) = bond + angle + dihedral + improper
+# -> -nonb (non-bonded)     = elec + vdw
+# -> -pote (potential)      = conf + nonb
+# WITH SELECTION 2: ONLY [ -vdw -elec -nonb -pote -all ] ARE ALLOWED
+energies = ["-all"]                          # ENV Override: OPENMM_ENERGY_OUT_ENERGIES  (with space delimiters)
+
+# --------------------------------------------------------------------
+# PARAMS
+# --------------------------------------------------------------------
+[params]
+cutoff = 12.0                                # Cutoff distance (in Å)
+switchdist = 10.0                            # Switch distance (in Å) for non-bonded interactions. 0 to turn off switching
+dielectric = 1.0                             # Dielectric constant (> 1 will lessen the electrostatic forces)
+temperature = 300.0                          # [Optional] Temperature (in K) (Only used for bookkeeping)
+
+# Periodic [OPTIONAL]
+periodic = true
+pme_enabled = true                           # [ONLY PERIODIC] PME for long-range electrostatics
+
+# Time Step parameters (ONLY USED FOR OUTPUT COLUMNS, DOES NOT AFFECT CALCULATION)
+timestep_first = 0                           # Only for bookkeeping
+frame_freq = 100                             # TODO: Timesteps between frames (=dcd_freq in NAMD). 0 for None. Only for bookkeeping
+
+frame_skip = 0                               # TODO: Skip Frames. frame_step = frame_skip + 1
+
+# --------------------------------------------------------------------
+# OUTPUT PARAMS
+# --------------------------------------------------------------------
+[output_params]
+# Force Output (ONLY APPLICABLE when SEL-2 is defined)
+# Calculates force on SEL-1 due to SEL-2
+out_force = true                             
+out_force_components = false                 # Output force XYZ components
+
+# Total force will be the VECTOR SUM: mag(total_force) = mag(vdw_force + elec_force vectors) [true physical behaviour].
+# Else, mag(total_force) = mag(vdw_force) + mag(elec_force) [NO CANCELLATIONS, PHYSICALLY INACCURATE]
+total_force_vector_sum = true                
+
+out_energy_format = "{:.4f}"                # as python f-string format
+out_delimiter = " "
+comment_token = "#"
+
+# --------------------------------------------------------------------
+# FRAME LOADING
+# --------------------------------------------------------------------
+[frame_loading]
+ram_disk_path = "/tmp/openmm_energy"         # RAM disk path to use
+ram_disk_max_usage_factor = 0.75             # [0.1, 0.95] RAM disk max usage allowed (as fraction). KEEP BELOW 0.8
+queue_frame_count = 50                       # Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
+
+# RAM CHUNK MODE (requires cpptraj/catdcd in PATH)
+ram_chunk_dynamic = true                     # Automatically shrink chunk if RAM is constrained
+ram_chunk_frames = 10000                     # Max frames per chunk
+ram_chunk_min_frames = 2000                  # Fallback to disk streaming if chunks cannot meet this size
+ram_chunk_max_count = 3                      # Max num of chunks that may be loaded to RAM at once
+
+# Thread controls (0 = Smart Auto-Allocation, >0 = Override)
+mda_threads_per_reader = 0                   # Threads per MDAnalysis reader instance (OpenMP)
+openmm_threads_per_context = 0               # Compute threads for each OpenMM context (applies only if running on CPU)
+
+# --------------------------------------------------------------------
+# EXTRA OPTIONS
+# --------------------------------------------------------------------
+[extra_options]
+ram_reader_min_frames = 50                   # Minimum frames a RAM reader must have to read, otherwise dynamically lower reader count
+ram_chunk_prefer_catdcd = true               # Prefer catdcd over cpptraj for chunking DCD files
+
+progress_report_interval_frames = 1000       # Num frames
+
+index_stream_buffer_chunk_size = 2000        # Num of frames to hold the computed energy data in RAM
+index_stream_buffer_always_open = true       # Keep output file open
+
+# Optimize Memory: Force masking for large interaction pair count to avoid OOM crashes
+max_interaction_pairs_in_ram = 250000000     # Consumes 4-8 bytes per interaction pair
+interaction_pair_memory_mb = 0.00000762939   # memory (MiB) per interaction pair (8.0 / 1024**2)
+
+manual_gc_enabled = true                     # Manual GC (DYNAMIC MODE ONLY)
+manual_gc_interval_frames = 5000             # Num frames
+
+# --------------------------------------------------------------------
+# EXPERIMENTAL FEATURES
+# --------------------------------------------------------------------
+[experimental]
+# Experimental flag to turn off erfc(ewald_beta * r) factor in short range direct electrostatics
+# if true: multiplies short range raw coulomb energy with erfc(ewald_beta * r) (very fast decaying factor)
+# else: uses raw coulomb energy expression for short range electrostatics with sharp discontinuity at the cutoff
+pme_short_range_use_ewald_beta = true
+pme_tolerance = 1e-6                         # NAMD default PME error tolerance (unitless factor)

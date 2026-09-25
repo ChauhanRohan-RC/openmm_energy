@@ -29,7 +29,10 @@ run_openmm_static() {
 }
 
 
-# 2nd HYDRATION SHELL CUTOFF (from RDF vs r plot minima)
+# config.toml file
+export OPENMM_ENERGY_CONFIG="openmm_energy.toml"
+
+## 2nd HYDRATION SHELL CUTOFF (from RDF vs r plot minima)
 # TODO: use mdanalysis selection syntax
 export selection_water_hydration="water and around 4.25 protein"
 export selection_water_bulk="water and not around 5.0 protein"

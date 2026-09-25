@@ -24,11 +24,13 @@
 ## USAGE --------------------------------------------------
 # 0: First run normal simulation to obtain trajectories
 # 1. Copy script to working dir
-# 2. INPUT: Set input topology (.psf / .prmtop in AMBER) and trajectories (.dcd / .nc)
-# 3. INPUT: Set selection 1, Selection 2 (Optional), out_energies (Optional), out_file_prefix
+# 2. Configure config TOML. Use -c flag to specify config file (default: openmm_energy.toml)
 # ----------------------------------------------------------------------------
 # -> ALTERNATIVELY, SET ENVIRONMENT VARIABLES (used when variables are not set in script)
+# -> PRIORITY ORDER: ENV_VAR > TOML config > default value in script
 # ----------------------------------------------------------------------------
+#   -> OPENMM_ENERGY_CONFIG             =   config.toml file (defaults to openmm_energy.toml)
+#   -> OPENMM_ENERGY_TRAJ_FILES         =   traj_files  (paths delimited by colon ':')
 #	-> OPENMM_ENERGY_SELECTION1	        =	selection1
 #	-> OPENMM_ENERGY_SELECTION2	        =	selection2 		  (optional)
 #	-> OPENMM_ENERGY_UPDATE_SELECTION1	=	update_selection1
@@ -37,10 +39,11 @@
 #	-> OPENMM_ENERGY_OUT_PREFIX	        =	out_file_prefix
 #	-> OPENMM_ENERGY_LABEL              =	label			  (optional)
 # ----------------------------------------------------------------------------
-# 4. set other input and output params [search for TODO]
-# 5. run with "python3 openmm_energy.py"
+# 3. run with "python3 openmm_energy.py"        # defaults to "openmm_energy.toml" if present
+#   OR
+# 3. run with config: "python3 openmm_energy.py -c openmm_energy.toml"
 # 	OR
-# 6. use openmm_energy.sh launcher script.
+# 4. use openmm_energy.sh launcher script.
 #	-> First, unset selection1, selection2, out_energies, out_file_prefix in this script
 #	-> Set environment variables in openmm_energy.sh
 #   => run with "./openmm_energy.sh" 
@@ -48,9 +51,72 @@
 
 import os
 import sys
+import argparse
+try: import tomllib      # Try importing standard tomllib (Python 3.11+), fallback to tomli for older versions
+except (ImportError, ModuleNotFoundError):
+    try: import tomli as tomllib
+    except (ImportError, ModuleNotFoundError):
+        print("\033[91m[ERROR]\033[0m 'tomllib' or 'tomli' module is required to parse the TOML config.")
+        sys.exit(1)
+
+# -------------------------------------------------------------------
+# CONFIGURATION LOADER
+## Priority: ENV VAR > TOML (sys.argv > DEFAULT) > Default Value
+# -------------------------------------------------------------------
+DEFAULT_CONFIG_FILE_PATH = "openmm_energy.toml"
+
+# Parse sys.argv safely (ignoring unknown args to protect child processes)
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument("-c", "--config", type=str, default=None)
+_args, _ = _parser.parse_known_args()
+
+# TOML Priority Resolution: sys.argv > ENV VAR > Default
+CONFIG_FILE_PATH = _args.config if _args.config else os.getenv("OPENMM_ENERGY_CONFIG", DEFAULT_CONFIG_FILE_PATH)
+CONFIG = {}
+if os.path.isfile(CONFIG_FILE_PATH):
+    try:
+        with open(CONFIG_FILE_PATH, "rb") as f:
+            CONFIG = tomllib.load(f)
+            print(f"\033[92m[INFO]\033[0m CONFIG FILE: \033[96m'{CONFIG_FILE_PATH}'\033[0m")
+    except Exception as e:
+        print(f"\033[91m[ERROR]\033[0m Failed to load config file \033[91m'{CONFIG_FILE_PATH}'\033[0m. Error: {e}")
+        sys.exit(1)
+else:
+    print(f"\033[93m[WARN]\033[0m Could not find CONFIG File \033[91m'{CONFIG_FILE_PATH}'\033[0m. Using ENV VARS and defaults")
 
 
-# Helper function to find trajectory files in a folder. min_num and max_num are both inclusive
+def get_conf(toml_path, default, env_var=None, cast=None, list_cast_delimiter=None):
+    """
+    Retrieves config with priority: ENV VAR > TOML > Default
+    for passing a list of paths in ENV_VAR, use ':' delimiter just like $PATH variable
+    """
+    if env_var and os.getenv(env_var) is not None:
+        val = os.getenv(env_var)
+        if cast is bool:
+            _val = str(val).lower()
+            _on = {"true", "1", "yes", "on", "t", "y"}
+            _off = {"false", "0", "no", "off", "f", "n"}
+            if _val in _on: return True
+            if _val in _off: return False
+            raise ValueError(f"ENVIRONMENT VARIABLE '{env_var}' must be a boolean (true/on/yes). Invalid value: '{val}'")
+        if cast is list:
+            return val.split() if list_cast_delimiter is None else val.split(list_cast_delimiter)
+        return cast(val) if cast is not None else val
+
+    keys = toml_path.split('.')
+    curr = CONFIG
+    for k in keys:
+        if isinstance(curr, dict) and k in curr:
+            curr = curr[k]
+        else:
+            return default
+    return curr
+
+
+# -------------------------------------------------------------------
+# Helper function to find trajectory files in a folder
+# min_num and max_num are both inclusive
+# -------------------------------------------------------------------
 def find_files(dir_path, prefix, suffix, min_num=None, max_num=None, sort_natural=True, return_abs_path=False):
     import re; from pathlib import Path
     dir_path_obj = Path(dir_path)
@@ -71,50 +137,46 @@ def find_files(dir_path, prefix, suffix, min_num=None, max_num=None, sort_natura
     return result_list
 
 
-DEBUG: bool = True
+DEBUG: bool = get_conf('general.debug', False, 'OPENMM_ENERGY_DEBUG', bool)
 # --------------------------------------------------------------------
 # PERFORMANCE
 # --------------------------------------------------------------------
-USE_GPU: bool = True                 # Keep it True, Auto-fallbacks to CPU
-NUM_COMPUTE_WORKERS: int = 4         # [GPU ONLY] TODO: OpenMM Contexts running in parallel (Consume RAM and VRAM). Scale up for DYNAMIC MODE
+USE_GPU: bool = get_conf('performance.use_gpu', True, cast=bool)                 # Keep it True, Auto-fallbacks to CPU
+NUM_COMPUTE_WORKERS: int = get_conf('performance.num_compute_workers', 4, cast=int) # [GPU ONLY] TODO: OpenMM Contexts running in parallel (Consume RAM and VRAM). Scale up for DYNAMIC MODE
 
-RAM_LOAD_ENABLED: bool = True        # TODO: Loads trajectory files to RAM_DISK before processing, bypasses I/O bottlenecks
-RAM_CHUNK_MODE: bool = True          # Loads big traj files to RAM_DISK in chunks. REQUIRES CPPTRAJ/CATDCD in PATH
-RAM_READER_COUNT: int = 2            # Concurrent readers for RAM chunks. Auto-decrement for small trajectories (chunks)
-
+RAM_LOAD_ENABLED: bool = get_conf('performance.ram_load_enabled', True, cast=bool)  # TODO: Loads trajectory files to RAM_DISK before processing, bypasses I/O bottlenecks
+RAM_CHUNK_MODE: bool = get_conf('performance.ram_chunk_mode', True, cast=bool)      # Loads big traj files to RAM_DISK in chunks. REQUIRES CPPTRAJ/CATDCD in PATH
+RAM_READER_COUNT: int = get_conf('performance.ram_reader_count', 2, cast=int)       # Concurrent readers for RAM chunks. Auto-decrement for small trajectories (chunks)
 
 # --------------------------------------------------------------------
 # INPUT
 # --------------------------------------------------------------------
 # AMBER Only ---------
-AMBER_MODE = False          # Use AMBER topology
-PRMTOP_FILE = ""            # AMBER .prmtop (.prm7) topology + parameter file
+AMBER_MODE = get_conf('input.amber_mode', False, cast=bool)   # Use AMBER topology
+PRMTOP_FILE = get_conf('input.prmtop_file', "", cast=str)     # AMBER .prmtop (.prm7) topology + parameter file
 
 # CHARMM Only ---------
-CHARMM_PARAM_FILES = [
-    "../../common/ff/par_all36m_prot.prm",
-    "../../common/ff/toppar_water_ions.prot.str"
-]
-PSF_FILE = "../../common/amyl_wb.psf"       # TODO : input topology file
+CHARMM_PARAM_FILES = get_conf('input.charmm_param_files', [])
+PSF_FILE = get_conf('input.psf_file', "", cast=str)  # TODO : input topology file
 
-# Trajectory Files
-TRAJ_FILES = find_files("..", "amyl_wb_eq", ".dcd")          # TODO : trajectory files
+# Trajectory Files Handling: ENV_VAR > Explicit List > Auto-Find via TOML [find_traj_files]
+TRAJ_FILES = get_conf('input.traj_files', [], "OPENMM_ENERGY_TRAJ_FILES", cast=list, list_cast_delimiter=":")
 
 ## Selections (MDAnalysis selection syntax)
 # -> hydration shell: water and around 4.25 protein
-SELECTION1: str = os.getenv("OPENMM_ENERGY_SELECTION1", "")   # TODO: or set ENV VAR: OPENMM_ENERGY_SELECTION1
-SELECTION2: str = os.getenv("OPENMM_ENERGY_SELECTION2", "")   # TODO: or set ENV VAR: OPENMM_ENERGY_SELECTION2
+SELECTION1: str = get_conf('input.selection1', "", 'OPENMM_ENERGY_SELECTION1', str)   # TODO: or set ENV VAR: OPENMM_ENERGY_SELECTION1
+SELECTION2: str = get_conf('input.selection2', "", 'OPENMM_ENERGY_SELECTION2', str)   # TODO: or set ENV VAR: OPENMM_ENERGY_SELECTION2
 
 # Dynamic Selections (update every frame)
-UPDATE_SELECTION1: str = str(os.getenv("OPENMM_ENERGY_UPDATE_SELECTION1", 0))     # TODO
-UPDATE_SELECTION2: str = str(os.getenv("OPENMM_ENERGY_UPDATE_SELECTION2", 0))     # TODO
-FAST_DYNAMIC_SELECTION: bool = True   # Bypasses slow MDAnalysis 'updating=True' and manually update selection using FastDynamicSelector
+UPDATE_SELECTION1: bool = get_conf('input.update_selection1', False, 'OPENMM_ENERGY_UPDATE_SELECTION1', bool)     # TODO
+UPDATE_SELECTION2: bool = get_conf('input.update_selection2', False, 'OPENMM_ENERGY_UPDATE_SELECTION2', bool)     # TODO
+FAST_DYNAMIC_SELECTION: bool = get_conf('input.fast_dynamic_selection', True, cast=bool)   # Bypasses slow MDAnalysis 'updating=True' and manually update selection using FastDynamicSelector
 
 ## Output file names
-OUT_FILE_PREFIX: str = os.getenv("OPENMM_ENERGY_OUT_PREFIX", "pair_interaction")    # TODO: or set ENV VAR: OPENMM_ENERGY_OUT_PREFIX
+OUT_FILE_PREFIX: str = get_conf('output.file_prefix', "pair_interaction.energy", 'OPENMM_ENERGY_OUT_PREFIX', str)    # TODO: or set ENV VAR: OPENMM_ENERGY_OUT_PREFIX
 
 ## [OPTIONAL][ Label for this run
-LABEL: str = os.getenv("OPENMM_ENERGY_LABEL", "Pair-Interaction Energy (OpenMM)")   # or ser ENV VAR: OPENMM_ENERGY_LABEL
+LABEL: str = get_conf('output.label', "Pair-Interaction Energy (OpenMM)", 'OPENMM_ENERGY_LABEL', str)   # or ser ENV VAR: OPENMM_ENERGY_LABEL
 
 ### Energies to calculate (as sequence of 4-letter codes)
 # -------------------------------------------------------------------------------------
@@ -126,94 +188,108 @@ LABEL: str = os.getenv("OPENMM_ENERGY_LABEL", "Pair-Interaction Energy (OpenMM)"
 # -> -pote (potential)     = conf + nonb
 # -------------------------------------------------------------------------------------
 # WITH SELECTION 2: ONLY [ -vdw -elec -nonb -pote -all ] ARE ALLOWED
-
-OUT_ENERGIES: list[str] = os.getenv("OPENMM_ENERGY_OUT_ENERGIES", "-all").split()     # TODO: or set ENV VAR: OPENMM_ENERGY_OUT_ENERGIES
+OUT_ENERGIES: list[str] = get_conf('output.energies', ["-all"], 'OPENMM_ENERGY_OUT_ENERGIES', cast=list)     # TODO: or set ENV VAR: OPENMM_ENERGY_OUT_ENERGIES
 
 ## Params
-CUTOFF: float = 12.0            # TODO: Cutoff distance (in Å)
-SWITCHDIST: float = 10.0        # TODO: Switch distance (in Å) for non-bonded interactions. 0 to trn off switching
-DIELECTRIC: float = 1.0         # ielectric constant (> 1 will lessen the electrostatic forces)
-TEMPERATURE: float = 300        # [Optional] Temperature (in K) (Only used for bookkeeping)
+CUTOFF: float = get_conf('params.cutoff', 10.0 if AMBER_MODE else 12.0, cast=float)            # TODO: Cutoff distance (in Å)
+SWITCHDIST: float = get_conf('params.switchdist', 0.0 if AMBER_MODE else 10.0, cast=float)    # TODO: Switch distance (in Å) for non-bonded interactions. 0 to trn off switching
+DIELECTRIC: float = get_conf('params.dielectric', 1.0, cast=float)     # ielectric constant (> 1 will lessen the electrostatic forces)
+TEMPERATURE: float = get_conf('params.temperature', 300.0, cast=float) # [Optional] Temperature (in K) (Only used for bookkeeping)
 
 ## Periodic [OPTIONAL]
-PERIODIC: bool = True
-PME_ENABLED: bool = True        # [ONLY PERIODIC] PME for long-range electrostatics
+PERIODIC: bool = get_conf('params.periodic', True, cast=bool)
+PME_ENABLED: bool = get_conf('params.pme_enabled', True, cast=bool)    # [ONLY PERIODIC] PME for long-range electrostatics
 
 ## TIme Step parameters (ONLY USED FOR OUTPUT COLUMNS, DOES NOT AFFECT CALCULATION)
-TIMESTEP_FIRST: int = 0         # only for bookkeeping
-FRAME_FREQ: int = 100           # TODO: timesteps between frames (=dcd_freq in NAMD). only for bookkeeping
+TIMESTEP_FIRST: int = get_conf('params.timestep_first', 0, cast=int)   # only for bookkeeping
+FRAME_FREQ: int = get_conf('params.frame_freq', 0, cast=int)         # TODO: timesteps between frames (=dcd_freq in NAMD). 0 for None. only for bookkeeping
 
 # Skip Frames, faster calculation
-FRAME_SKIP: int = 0             # TODO: frame_step = frame_skip + 1
+FRAME_SKIP: int = get_conf('params.frame_skip', 0, cast=int)           # TODO: frame_step = frame_skip + 1
 
 # --------------------------------------------------------------------
 # OUTPUT Params
 # --------------------------------------------------------------------
 ## Force Output	(ONLY APPLICABLE when SEL-2 is defined)
 # -> Calculates force on SEL-1 due to SEL-2
-OUT_FORCE: bool = True
-OUT_FORCE_COMPONENTS: bool = False       # output force XYZ components
+OUT_FORCE: bool = get_conf('output_params.out_force', True, cast=bool)
+OUT_FORCE_COMPONENTS: bool = get_conf('output_params.out_force_components', False, cast=bool)       # output force XYZ components
 
 # total force will be the VECTOR SUM: mag(total_force) = mag(vdw_force + elec_force vectors) [true physical behaviour].
 # Else, mag(total_force) = mag(vdw_force) + mag(elec_force)    [NO CANCELLATIONS, PHYSICALLY INACCURATE]
-TOTAL_FORCE_VECTOR_SUM: bool = True
+TOTAL_FORCE_VECTOR_SUM: bool = get_conf('output_params.total_force_vector_sum', True, cast=bool)
 
-OUT_ENERGY_FORMAT = "{:.4f}"
-OUT_DELIMITER = " "
-COMMENT_TOKEN = "#"
+OUT_ENERGY_FORMAT = get_conf('output_params.out_energy_format', "{:.4f}", cast=str)         # as python f-string format
+OUT_DELIMITER = get_conf('output_params.out_delimiter', " ", cast=str)
+COMMENT_TOKEN = get_conf('output_params.comment_token', "#", cast=str)
 
 # --------------------------------------------------------------------
 # FRAME LOADING and PERFORMANCE
 # --------------------------------------------------------------------
-RAM_DISK_PATH = "/tmp/openmm_energy"        # ram disk path to use
-RAM_DISK_MAX_USAGE_FACTOR: float = 0.75     # [0.1, 0.95] RAM disk max usage allowed (as fraction). KEEP BELOW 0.8
+RAM_DISK_PATH = get_conf('frame_loading.ram_disk_path', "/tmp/openmm_energy", cast=str)             # ram disk path to use
+RAM_DISK_MAX_USAGE_FACTOR: float = get_conf('frame_loading.ram_disk_max_usage_factor', 0.75, cast=float) # [0.1, 0.95] RAM disk max usage allowed (as fraction). KEEP BELOW 0.8
 
-QUEUE_FRAME_COUNT = 50                # Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
+QUEUE_FRAME_COUNT = get_conf('frame_loading.queue_frame_count', 50, cast=int)                # Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
 
 ## RAM CHUNK MODE (requires cpptraj/catdcd in PATH)
-RAM_CHUNK_DYNAMIC: bool = True        # Automatically shrink chunk if RAM is constrained
-RAM_CHUNK_FRAMES: int = 10000         # Max frames per chunk
-RAM_CHUNK_MIN_FRAMES: int = 2000      # Fallback to disk streaming if chunks cannot meet this size
-RAM_CHUNK_MAX_COUNT: int = 3          # Max num of chunks that may be loaded to RAM at once
+RAM_CHUNK_DYNAMIC: bool = get_conf('frame_loading.ram_chunk_dynamic', True, cast=bool)        # Automatically shrink chunk if RAM is constrained
+RAM_CHUNK_FRAMES: int = get_conf('frame_loading.ram_chunk_frames', 10000, cast=int)           # Max frames per chunk
+RAM_CHUNK_MIN_FRAMES: int = get_conf('frame_loading.ram_chunk_min_frames', 2000, cast=int)    # Fallback to disk streaming if chunks cannot meet this size
+RAM_CHUNK_MAX_COUNT: int = get_conf('frame_loading.ram_chunk_max_count', 3, cast=int)         # Max num of chunks that may be loaded to RAM at once
 
 ## Thread controls
 # 0 = Smart Auto-Allocation, >0 = Override
-MDA_THREADS_PER_READER = 0            # Threads per MDAnalysis reader instance (OpenMP)
-OPENMM_THREADS_PER_CONTEXT = 0        # Compute threads for each OpenMM context (applies only if running on CPU)
+MDA_THREADS_PER_READER = get_conf('frame_loading.mda_threads_per_reader', 0, cast=int)            # Threads per MDAnalysis reader instance (OpenMP)
+OPENMM_THREADS_PER_CONTEXT = get_conf('frame_loading.openmm_threads_per_context', 0, cast=int)    # Compute threads for each OpenMM context (applies only if running on CPU)
 
 
 # -----------------------------------
 # EXtra Options
 # -----------------------------------
-RAM_READER_MIN_FRAMES = 50     # Minimum frames a RAM reader must have to read, otherwise dynamically lower reader count
-RAM_CHUNK_PREFER_CATDCD: bool = True            # Prefer catdcd over cpptraj for chunking DCD files
+RAM_READER_MIN_FRAMES = get_conf('extra_options.ram_reader_min_frames', 50, cast=int)     # Minimum frames a RAM reader must have to read, otherwise dynamically lower reader count
+RAM_CHUNK_PREFER_CATDCD: bool = get_conf('extra_options.ram_chunk_prefer_catdcd', True, cast=bool) # Prefer catdcd over cpptraj for chunking DCD files
 
-PROGRESS_REPORT_INTERVAL_FRAMES: int = 1000      # num frames
+PROGRESS_REPORT_INTERVAL_FRAMES: int = get_conf('extra_options.progress_report_interval_frames', 1000, cast=int)      # num frames
 
-INDEX_STREAM_BUFFER_CHUNK_SIZE: int = 2000       # num of frames to hold the computed energy data in RAM
-INDEX_STREAM_BUFFER_ALWAYS_OPEN: bool = True     # keep output file open
+INDEX_STREAM_BUFFER_CHUNK_SIZE: int = get_conf('extra_options.index_stream_buffer_chunk_size', 2000, cast=int)       # num of frames to hold the computed energy data in RAM
+INDEX_STREAM_BUFFER_ALWAYS_OPEN: bool = get_conf('extra_options.index_stream_buffer_always_open', False, cast=bool)     # keep output file open
 
 # Optimize Memory: Force masking for large interaction pair count to avoid OOM crashes
-MAX_INTERACTION_PAIRS_IN_RAM = 250_000_000      # consumes 4-8 bytes per interaction pair
-INTERACTION_PAIR_MEMORY_MB = 8.0 / (1024 ** 2)  # memory (MiB) per interaction pair
+MAX_INTERACTION_PAIRS_IN_RAM = get_conf('extra_options.max_interaction_pairs_in_ram', 250_000_000, cast=int)      # consumes 4-8 bytes per interaction pair
+INTERACTION_PAIR_MEMORY_MB = get_conf('extra_options.interaction_pair_memory_mb', 8.0 / (1024 ** 2), cast=float)  # memory (MiB) per interaction pair
 
-MANUAL_GC_ENABLED: bool = True                  # Manual GC (DYNAMIC MODE ONLY)
-MANUAL_GC_INTERVAL_FRAMES: int = 5000           # num frames
+MANUAL_GC_ENABLED: bool = get_conf('extra_options.manual_gc_enabled', True, cast=bool)                  # Manual GC (DYNAMIC MODE ONLY)
+MANUAL_GC_INTERVAL_FRAMES: int = get_conf('extra_options.manual_gc_interval_frames', 5000, cast=int)           # num frames
 
 ## Experimental Features -----------
 ## experimental flag to tun off erfc(ewald_beta * r) factor in short range direct electrostatics
 # if true: multiplies short range raw coulomb energy with erfc(ewald_beta * r) (very fast decaying factor)
 # else: uses raw coulomb energy expression for short range electrostatics with sharp discontinuity at the cutoff
-PME_SHORT_RANGE_USE_EWALD_BETA: bool = True
-PME_TOLERANCE: float = 1e-6                      # NAMD default PME error tolerance (unitless factor)
+PME_SHORT_RANGE_USE_EWALD_BETA: bool = get_conf('experimental.pme_short_range_use_ewald_beta', True, cast=bool)
+PME_TOLERANCE: float = get_conf('experimental.pme_tolerance', 1e-6, cast=float)
 
 
+# ----------------------------------------------------------
+# TRAJ_FILES auto-find using find_files()
+if TRAJ_FILES is None or len(TRAJ_FILES) == 0 and 'find_traj_files' in CONFIG:
+    _ff = CONFIG['find_traj_files']
+    if 'prefix' in _ff or 'suffix' in _ff:
+        TRAJ_FILES = find_files(
+            dir_path=_ff.get('dir_path', '.'),
+            prefix=_ff.get('prefix', ''),
+            suffix=_ff.get('suffix', ''),
+            min_num=_ff.get('min_num', None),
+            max_num=_ff.get('max_num', None),
+            sort_natural=_ff.get('sort_natural', True),
+            return_abs_path=_ff.get('return_abs_path', False)
+        )
 
 
 # ==========================================================================
 # MAIN
 # ==========================================================================
-shutdown_event = None   ##type: mp.Event (PLACEHOLDER, will initialize later)
+shutdown_event = None           # mp.Event (PLACEHOLDER, will initialize later)
+shutdown_req_main_proc = None   # threading.Event (PLACEHOLDER, will initialize later)
 
 ## Logging ------------------------------
 NOCOL = "\033[0m"   # reset color
@@ -392,10 +468,10 @@ import subprocess
 import numpy as np
 import multiprocessing as mp
 try:
-    # Force 'fork' to prevent catastrophic script re-execution on macOS/Windows spawn defaults
+    # Fork is only supported on Linux/Macos. Defaults to 'spawn' on Windows with a RuntimeError
     mp.set_start_method('fork', force=True)
 except Exception:
-    pass
+    log_warn(f"OS does not support fork() in multiprocessing. Falling back to {mp.get_start_method()}")
 from multiprocessing import shared_memory
 
 # OpenMM main import
@@ -413,19 +489,6 @@ except (ImportError, ModuleNotFoundError) as e:
 import warnings
 warnings.filterwarnings("ignore", message=r".*DCDReader currently makes independent timesteps.*")
 
-
-
-# Helper functions and classes ------------------------------
-def boolify(value: str, default_val: bool = False, err_msg: str = "") -> bool:
-    value = value.strip().lower()
-    truthy = {"1", "true", "t", "yes", "y", "on"}
-    falsy = {"0", "false", "f", "no", "n", "off"}
-    if value in truthy: return True
-    if value in falsy: return False
-    if err_msg.strip():
-        log_error(f"{err_msg}: {value!r}", shutdown=False, _exit=False)
-        raise ValueError(f"{err_msg}: {value!r}")
-    return default_val
 
 
 # =======================================================
@@ -913,13 +976,16 @@ class IndexStreamBuffer:
 
 
 # ------------------------------------------------------------------------
-# GLOBAL VARIABLES
+# GLOBAL VARIABLES and CONSTANTS
 # ------------------------------------------------------------------------
-shutdown_event = mp.Event()       # MAIN SHUTDOWN EVENT. use .is_set() and .set()
-SHUTDOWN_REQUESTED = False       # Only for reporting purposes
-
-ACTIVE_RAM_FILES = set()
+ACTIVE_RAM_FILES: set | None = None         # will initialize later
 RAM_FILES_LOCK = threading.Lock()
+
+shutdown_event = mp.Event()             # MAIN SHUTDOWN EVENT. use .is_set() and .set()
+if __name__ == '__main__':
+    mp.freeze_support()
+    shutdown_req_main_proc = threading.Event()  # Only for reporting purposes (ON MAIN PROCESS)
+    ACTIVE_RAM_FILES = set()
 
 index_stream_buffer: IndexStreamBuffer = None    # will initialize later
 shm_buffer_main: SharedFrameBuffer = None        # will initialize later
@@ -935,7 +1001,6 @@ t_io_wait_total = 0.0
 ACTION_REGISTER_RAM_FILE = "register_ram_file"
 ACTION_UNREGISTER_RAM_FILE = "unregister_ram_file"
 ACTION_ADD_RAM_LOAD_TIME = "add_ram_load_time"
-
 
 # WORKER Meta data keys
 META_WORKER_ID ="wid"
@@ -976,12 +1041,14 @@ def is_ramdisk_free(bytes, return_avail_bytes: bool = False):
 # MUST ONLY BE CALLED FROM MAIN-PROCESS. USE ACTION QUEUE OTHERWISE
 # action_queue.put((ACTION_REGISTER_RAM_FILE, filepath))
 def __register_ram_file(filepath):
+    if ACTIVE_RAM_FILES is None: return
     with RAM_FILES_LOCK: ACTIVE_RAM_FILES.add(filepath)
 
 
 # MUST ONLY BE CALLED FROM MAIN-PROCESS. USE ACTION QUEUE OTHERWISE
 # action_queue.put((ACTION_UNREGISTER_RAM_FILE, filepath))
 def __unregister_ram_file(filepath):
+    if ACTIVE_RAM_FILES is None: return
     with RAM_FILES_LOCK:
         if filepath not in ACTIVE_RAM_FILES:
             return
@@ -990,6 +1057,7 @@ def __unregister_ram_file(filepath):
 
 
 def cleanup_ramdisk():
+    if ACTIVE_RAM_FILES is None: return
     with RAM_FILES_LOCK:
         if len(ACTIVE_RAM_FILES) == 0: return
 
@@ -1017,14 +1085,14 @@ def cleanup():
 # SIGNAL HANDLERS --------------------
 # called on exit
 def handle_exit():
-    global SHUTDOWN_REQUESTED
-
     # CRITICAL: Prevent child processes from executing parent cleanup routines!
     if mp.current_process().name != 'MainProcess':
         return
 
-    shutdown_event.set()
-    SHUTDOWN_REQUESTED = True
+    if shutdown_event is not None:
+        shutdown_event.set()
+    if shutdown_req_main_proc is not None:
+        shutdown_req_main_proc.set()
 
     print("")
     log_info(f"Exiting...")
@@ -1032,14 +1100,14 @@ def handle_exit():
     print("", flush=True)
 
 def handle_os_signal(signum, frame):
-    global SHUTDOWN_REQUESTED
-
     # CRITICAL: Prevent child processes from executing parent cleanup routines!
     if mp.current_process().name != 'MainProcess':
         return
 
-    shutdown_event.set()
-    SHUTDOWN_REQUESTED = True
+    if shutdown_event is not None:
+        shutdown_event.set()
+    if shutdown_req_main_proc is not None:
+        shutdown_req_main_proc.set()
 
     sig_name = signal.Signals(signum).name
     print("")
@@ -1047,6 +1115,7 @@ def handle_os_signal(signum, frame):
 
 
 if __name__ == '__main__':
+    mp.freeze_support()
     # Register Signal Handlers only in main process
     atexit.register(handle_exit)
     signal.signal(signal.SIGINT, handle_os_signal)
@@ -1059,14 +1128,16 @@ if __name__ == '__main__':
 # =============================================================================
 # VALIDATION AND PRECONDITIONS
 # =============================================================================
-log_info(f"Starting Pair Interaction Analysis ({LABEL})")
+if __name__ == '__main__':
+    mp.freeze_support()
+    log_info(f"Starting Pair Interaction Analysis ({LABEL})")
 
 
 def check_files(file_paths: str | list[str], display_name: str):
     if isinstance(file_paths, str):
         file_paths = [file_paths]
 
-    if len(file_paths) == 0:
+    if file_paths is None or len(file_paths) == 0:
         log_error(f"No {display_name} specified")
     else:
         for fp in file_paths:
@@ -1091,12 +1162,6 @@ check_files(TRAJ_FILES, "TRAJECTORY FILE")
 
 if not SELECTION1.strip():
     log_error("SELECTION1 cannot be empty. Please define a valid atom selection.")
-
-# Extracting boolean env vars
-UPDATE_SELECTION1: bool = boolify(UPDATE_SELECTION1,
-                                  err_msg="Invalid value of environment variable OPENMM_ENERGY_UPDATE_SELECTION1")
-UPDATE_SELECTION2: bool = boolify(UPDATE_SELECTION2,
-                                  err_msg="Invalid value of environment variable OPENMM_ENERGY_UPDATE_SELECTION2")
 
 if SELECTION2.strip():
     if SELECTION1 == SELECTION2:
@@ -1306,6 +1371,7 @@ if HAS_NBFIX:
 # SYSTEM INFORMATION LOG
 # ------------------------------------------------------------------------
 if __name__ == '__main__':
+    mp.freeze_support()
     print("\n------------------------------------------------------")
     log_info(" SYSTEM INFORMATION ")
     print("------------------------------------------------------")
@@ -2233,7 +2299,7 @@ def create_comments_str() -> str:
         f"OUTPUT Energies : {' '.join(OUT_ENERGIES)}",
         f"OUTPUT Force    : {'ON' if OUT_FORCE else 'OFF'}  (TOTAL_FORCE as VECTOR_SUM: {'ON' if TOTAL_FORCE_VECTOR_SUM else 'OFF'})",
         f"TIMESTEP First  : {TIMESTEP_FIRST} \t\t (only for book-keeping)",
-        f"FRAME Frequency : {FRAME_FREQ} steps \t (only for book-keeping)",
+        f"FRAME Frequency : {f'{FRAME_FREQ} steps' if FRAME_FREQ > 0 else 'N/A'} \t (only for book-keeping)",
         f"FRAME Skip      : {FRAME_SKIP} frames",
         "## Simulation Params---------",
         f"Cutoff      : {CUTOFF} Å",
@@ -2260,7 +2326,8 @@ def create_comments_str() -> str:
 def create_output_erg_header_line() -> str:
     # Target Column Format: FRAME TS BOND ANGL DIHE IMPR CONF ELECT VDW NONBOND POTENTIAL TOTAL ELECT_FORCE VDW_FORCE TOTAL_FORCE
 
-    headers = ["FRAME", "TS"]
+    headers = ["FRAME"]
+    if FRAME_FREQ > 0: headers.append("TS")
     if UPDATE_SELECTION1: headers.append("SEL1_ATOM_COUNT")
     if not is_self_interaction and UPDATE_SELECTION2: headers.append("SEL2_ATOM_COUNT")
 
@@ -2290,7 +2357,6 @@ def create_output_erg_header_line() -> str:
 
 def create_output_erg_line(erg_row) -> str:
     abs_f_idx, n1, n2, erg_raw, f_mags, f_comps = erg_row
-    ts_val = TIMESTEP_FIRST + (abs_f_idx * FRAME_FREQ)
 
     # energies
     e_vdw, e_elec, e_bond, e_angl, e_dihe, e_impr = erg_raw
@@ -2298,7 +2364,10 @@ def create_output_erg_line(erg_row) -> str:
     conf_eng = e_bond + e_angl + e_dihe + e_impr
     pote_eng = nonb_eng + conf_eng
 
-    out_row = [str(abs_f_idx), str(ts_val)]
+    out_row = [str(abs_f_idx)]
+    if FRAME_FREQ > 0:
+        ts_val = TIMESTEP_FIRST + (abs_f_idx * FRAME_FREQ)
+        out_row.append(str(ts_val))
     if UPDATE_SELECTION1: out_row.append(str(n1))
     if not is_self_interaction and UPDATE_SELECTION2: out_row.append(str(n2))
 
@@ -2754,6 +2823,8 @@ def handle_worker_meta_data(meta_q: mp.Queue) -> np.ndarray | None:
 
 
 if __name__ == '__main__':
+    mp.freeze_support()   # Crucial for frozen Windows executables
+
     # Output file configuration
     out_file_path = f"{OUT_FILE_PREFIX}.energy.csv"
     index_stream_buffer = IndexStreamBuffer(output_file_path=out_file_path,
@@ -2828,14 +2899,14 @@ if __name__ == '__main__':
             if alive_workers < active_omm_workers:
                 log_warn("One or more Compute Workers crashed unexpectedly. Initiating shutdown.")
                 shutdown_event.set()
-                SHUTDOWN_REQUESTED = True
+                shutdown_req_main_proc.set()
 
             # Safely catch Producer crashes
             # If producer exits normally, exitcode is 0. Anything else means it crashed.
             if not producer_process.is_alive() and producer_process.exitcode not in (0, None):
                 log_warn(f"Frame Producer crashed (Exit Code: {producer_process.exitcode}). Initiating shutdown.")
                 shutdown_event.set()
-                SHUTDOWN_REQUESTED = True
+                shutdown_req_main_proc.set()
             continue
 
         if msg is None:
@@ -2891,7 +2962,7 @@ if __name__ == '__main__':
     avg_fps_col = RED if avg_fps < 10 else YELLOW if avg_fps < 20 else GREEN
     io_wait_percent = t_io_wait_total / max(0.001, t_compute_total) * 100
     io_wait_col = RED if io_wait_percent >= 20 else YELLOW if io_wait_percent >= 10 else GREEN
-    status_str = (f"{RED}ABORTED (Early Exit)" if SHUTDOWN_REQUESTED else f"{GREEN}SUCCESS") + NOCOL
+    status_str = (f"{RED}ABORTED (Early Exit)" if shutdown_req_main_proc.is_set() else f"{GREEN}SUCCESS") + NOCOL
 
     print(f"\n{get_cur_datetime_formatted()}")
     print("=" * 60)
