@@ -4,7 +4,8 @@
 # OpenMM and MDAnalysis implementation of NAMD PairInteraction Energy
 # ========================================================================
 # OPTIMIZED FOR GPU's
-# Much faster than cpptraj lie and VMD's namd_energy plugin
+# -> Much faster than cpptraj lie and VMD's namd_energy plugin
+# -> Works best on LINUX
 
 # Requirements:
 # -----------------
@@ -486,7 +487,7 @@ os.environ["OMP_NUM_THREADS"] = str(assigned_mda_threads)
 
 # Logging
 if __name__ == '__main__':
-    print("-" * 60)
+    print("\n" + ("-" * 60))
     log_info(f"OPENMM CONFIGURATION (Compute Engine)")
     log_info(f" => Platform    : {OPENMM_PLATFORM_DISPLAY_NAME}")
     log_info(f" => Contexts    : {NUM_COMPUTE_WORKERS} (compute workers)")
@@ -496,8 +497,7 @@ if __name__ == '__main__':
     log_info(f" => RAM Loading : {f'ON  (Chunking: {RAM_CHUNK_MODE})' if RAM_LOAD_ENABLED else 'OFF'}")
     log_info(f" => Readers     : {f'{actual_ram_reader_count} (RAM cached mode) |' if RAM_LOAD_ENABLED else ''} 1 (DISK stream)")
     log_info(f" => CPU Threads : {assigned_mda_threads}/reader ({mda_alloc_mode})  [OMP_NUM_THREADS]")
-    print("-" * 60)
-    flush_stdout()
+    print(("-" * 60) + "\n", flush=True)
 # ---------------------------------------------------------------------
 
 # Imports (must be after thread allocation)
@@ -1061,6 +1061,40 @@ META_FRAMES_PROCESSED = "fp"
 # Cleanup Handlers
 # --------------------------------------------------------------------
 
+# High-Performance Interruptible File Copy (Kernel Zero-Copy)
+def copy_file(src: str, dest: str, cancel_event):
+    _COPY_CHUNK_SIZE = 64 * 1024 * 1024  # 64 MB chunks
+    with open(src, 'rb') as fsrc, open(dest, 'wb') as fdst:
+        try:
+            if hasattr(os, 'sendfile'):
+                # Linux/macOS fast path (Direct kernel-space copy)
+                in_fd = fsrc.fileno()
+                out_fd = fdst.fileno()
+                offset = 0
+                file_size = os.fstat(in_fd).st_size
+                while offset < file_size and not cancel_event.is_set():
+                    sent = os.sendfile(out_fd, in_fd, offset, _COPY_CHUNK_SIZE)
+                    if sent == 0: break
+                    offset += sent
+            else:
+                raise OSError("sendfile unavailable")
+        except Exception:
+            # Fallback to user-space read/write (Windows or incompatible filesystems)
+            fsrc.seek(0)
+            fdst.seek(0)
+            fdst.truncate()
+            while not cancel_event.is_set():
+                buf = fsrc.read(_COPY_CHUNK_SIZE)
+                if not buf: break
+                fdst.write(buf)
+
+    if cancel_event.is_set(): return
+
+    # Preserve metadata (like shutil.copy2)
+    try: shutil.copystat(src, dest)
+    except Exception: pass
+
+
 def try_delete_file_nothrow(filepath) -> bool:
     if not os.path.exists(filepath):
         return True
@@ -1070,14 +1104,6 @@ def try_delete_file_nothrow(filepath) -> bool:
     except Exception: pass
     return False
 
-def __remove_ram_file_internal(filepath):
-    if not os.path.exists(filepath): return
-    try:
-        os.remove(filepath)
-        log_debug(f"RAM DISK: REMOVED file '{filepath}'")
-    except Exception as e:
-        log_debug(f"RAM DISK: FAILED to remove file '{filepath}'. Error: {e}", e)
-
 
 def is_ramdisk_free(bytes, return_avail_bytes: bool = False):
     usage = shutil.disk_usage(RAM_DISK_PATH)
@@ -1086,6 +1112,20 @@ def is_ramdisk_free(bytes, return_avail_bytes: bool = False):
     if return_avail_bytes:
         return is_free, avail_bytes
     return is_free
+
+
+def __remove_ram_file_internal(filepath) -> bool:
+    """
+    :return: True if file no longer exists. False if still exists after delete attempt
+    """
+    if not os.path.exists(filepath): return True
+    try:
+        os.remove(filepath)
+        log_debug(f"RAM DISK: REMOVED file '{filepath}'")
+        return True
+    except Exception as e:
+        log_debug(f"RAM DISK: FAILED to remove file '{filepath}'. Error: {e}", e)
+        return not os.path.exists(filepath)
 
 
 # MUST ONLY BE CALLED FROM MAIN-PROCESS. USE ACTION QUEUE OTHERWISE
@@ -1102,20 +1142,25 @@ def __unregister_ram_file(filepath):
     with RAM_FILES_LOCK:
         if filepath not in ACTIVE_RAM_FILES:
             return
-        ACTIVE_RAM_FILES.discard(filepath)
-        __remove_ram_file_internal(filepath)
+        _deleted = __remove_ram_file_internal(filepath)
+        if _deleted:
+            ACTIVE_RAM_FILES.discard(filepath)
 
 
-def cleanup_ramdisk():
-    if ACTIVE_RAM_FILES is None: return
+def cleanup_ramdisk() -> bool:
+    if ACTIVE_RAM_FILES is None: return True
     with RAM_FILES_LOCK:
-        if len(ACTIVE_RAM_FILES) == 0: return
+        if len(ACTIVE_RAM_FILES) == 0: return True
 
         log_info(f"RAM DISK: Cleaning up RAM disk '{RAM_DISK_PATH}'")
         ram_files = ACTIVE_RAM_FILES.copy()
         for f in ram_files:
-            ACTIVE_RAM_FILES.discard(f)
-            __remove_ram_file_internal(f)
+            _deleted = __remove_ram_file_internal(f)
+            if _deleted:
+                ACTIVE_RAM_FILES.discard(f)
+
+        return len(ACTIVE_RAM_FILES) == 0
+
 
 
 def cleanup():
@@ -1129,7 +1174,11 @@ def cleanup():
         log_info("Closing output file...")
         idx_streamer.close()
 
-    cleanup_ramdisk()
+    _ramdisk_cleaned = cleanup_ramdisk()
+    if not _ramdisk_cleaned:
+        log_info("Waiting for RAM disk processes...")
+        time.sleep(1.0)
+        cleanup_ramdisk()
 
 
 # SIGNAL HANDLERS --------------------
@@ -1245,6 +1294,7 @@ if RAM_LOAD_ENABLED:
     # make sure ram disk exists
     try:
         os.makedirs(RAM_DISK_PATH, exist_ok=True)
+        log_info(f"RAM DISK: Using {CYAN}'{RAM_DISK_PATH}'{NOCOL} as RAM-Disk ...")
     except Exception as e:
         log_error(f"RAM DISK: Failed to create RAM-DISK directory {RAM_DISK_PATH}: {e}", e)
 
@@ -2222,7 +2272,8 @@ def master_producer_process(shm_buffer: SharedFrameBuffer, action_queue: mp.Queu
 
                     if shutdown_event.is_set(): break
                     action_queue.put((ACTION_REGISTER_RAM_FILE, temp_traj_file))      # Pre-register for safety
-                    shutil.copy2(traj_file, temp_traj_file)
+                    # shutil.copy2(traj_file, temp_traj_file)
+                    copy_file(traj_file, temp_traj_file, shutdown_event)            # High-performance kernel-level copy
                     if shutdown_event.is_set(): break
 
                     t_taken = time.perf_counter() - t0

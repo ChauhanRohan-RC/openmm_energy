@@ -2,7 +2,8 @@
 # OpenMM and MDAnalysis implementation of NAMD PairInteraction Energy
 # ------------------------------------------------------------------------
 # OPTIMIZED FOR GPU's
-# Much faster than cpptraj lie and VMD's namd_energy plugin
+# -> Much faster than cpptraj lie and VMD's namd_energy plugin
+# -> Works best on LINUX
 
 
 # Requirements:

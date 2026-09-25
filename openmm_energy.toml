@@ -15,7 +15,8 @@ debug = true                                 # ENV Override: OPENMM_ENERGY_DEBUG
 # --------------------------------------------------------------------
 [performance]
 use_gpu = true                               # Keep it true, auto-fallbacks to CPU
-num_compute_workers = 4                      # [GPU ONLY] TODO: OpenMM Contexts running in parallel (Consume RAM and VRAM). Scale up for DYNAMIC MODE
+num_compute_workers = 4                      # [GPU ONLY] TODO: OpenMM Contexts running in parallel (Consume RAM and VRAM).
+                                             # Scale up for DYNAMIC SELECTIONS based on your GPU
 
 ram_load_enabled = true                      # Loads trajectory files to RAM_DISK before processing, bypasses I/O bottlenecks
 ram_chunk_mode = true                        # Loads big traj files to RAM_DISK in chunks. REQUIRES CPPTRAJ/CATDCD in PATH
@@ -116,7 +117,7 @@ comment_token = "#"
 # FRAME LOADING
 # --------------------------------------------------------------------
 [frame_loading]
-ram_disk_path = "/tmp/openmm_energy"         # RAM disk path to use
+ram_disk_path = "/dev/shm/openmm_energy"     # TODO: RAM disk path to use
 ram_disk_max_usage_factor = 0.75             # [0.1, 0.95] RAM disk max usage allowed (as fraction). KEEP BELOW 0.8
 frame_queue_size = 50                        # Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
 
