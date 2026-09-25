@@ -4,3 +4,4 @@
 *.DCD
 *.bak
 *.old
+FFTW_NAMD*

@@ -3,10 +3,11 @@
 # ======================================================================
 # TEST Launcher script for openmm_energy.py
 # ======================================================================
-# OpenMM and MDAnalysis implementation of NAMD PairInteraction Energy
-# Optimized for GPUs
-# ------------------------------------
-# TODO: set env vars for each run
+# COnfig TOML + Launcher script automation of openmm_energy.py
+#
+# TODO 1: set constant parameters in TOML comfig file, and set OPENMM_ENERGY_CONFIG=<config.toml>
+# TODO 2: set ENV VARIABLE overrides for each run here
+# ----------------------------------------------------------------------
 
 
 # Exit on error
@@ -34,15 +35,15 @@ run_openmm_static() {
 }
 
 
-# TEST config.toml file
+# TODO: TEST config.toml file
 export OPENMM_ENERGY_CONFIG="test_openmm_energy.toml"
 
-# TEST
-OUT_FILE_PREFIX="amyl-beta/wb_eq/energy/"
+# TODO: TEST output prefix and suffix
+OUT_FILE_PREFIX="test-amyl-beta/wb_eq/energy/"
 OUT_FILE_SUFFIX="7"
 
 ## 2nd HYDRATION SHELL CUTOFF (from RDF vs r plot minima)
-# TODO: use mdanalysis selection syntax
+# TODO: use MDAnalysis selection syntax
 export selection_water_hydration="water and around 4.25 protein"
 export selection_water_bulk="water and not around 5.0 protein"
 

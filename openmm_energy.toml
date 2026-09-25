@@ -4,11 +4,9 @@
 # [Search for TODO]
 # RUN the program with -c <config_file> OR set ENV VAR: OPENMM_ENERGY_CONFIG=<config_file>
 # -------------------------------
-# CONFIGURATION PRIORITY ORDER:
-# 1. Environment Variables (Highest priority, acts as an override)
-# 2. TOML Configuration File (This file)
-# 3. Python Script Hardcoded Defaults (Lowest priority)
+# CONFIGURATION PRIORITY ORDER: ENV_VAR > This TOML config > python script defaults
 # ====================================================================
+
 [general]
 debug = true                                 # ENV Override: OPENMM_ENERGY_DEBUG
 
@@ -45,7 +43,7 @@ selection2 = ""                              # ENV Override: OPENMM_ENERGY_SELEC
 # TODO: Dynamic Selections (update every frame)
 update_selection1 = false                    # ENV Override: OPENMM_ENERGY_UPDATE_SELECTION1
 update_selection2 = false                    # ENV Override: OPENMM_ENERGY_UPDATE_SELECTION2
-fast_dynamic_selection = true                # Bypasses slow MDAnalysis 'updating=True' and manually update selection using FastDynamicSelector
+fast_dynamic_selection = true                # Bypasses slow MDAnalysis 'updating=True' with quick scipy.CKDTree. Disable if getting errors
 
 ## TODO: Trajectory files (.dcd, .nc etc)
 ## -> Provide a list explicitly, or use [find_traj_files] section below.

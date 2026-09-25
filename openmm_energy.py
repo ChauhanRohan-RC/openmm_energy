@@ -1,52 +1,98 @@
 #!/usr/bin/env python3
 
-# Requirements:
-# => pip packages      : numpy, scipy, mdanalysis, opnemm OR openmm[cuda]
-# => external (in PATH): cpptraj (OPTIONAL, for chunking trajectory files to RAM)
-#                        catdcd  (OPTIONAL, preferred for chunking DCD files to RAM)
-
 # ========================================================================
 # OpenMM and MDAnalysis implementation of NAMD PairInteraction Energy
-# ------------------------------------------------------------------------
-# OPTIMIZED FOR GPU.
-# ----------------------
+# ========================================================================
+# OPTIMIZED FOR GPU's
+# Much faster than cpptraj lie and VMD's namd_energy plugin
+
+# Requirements:
+# -----------------
+# 1. pip packages
+#    $ pip install numpy scipy mdanalysis opnemm     # OR openmm[cuda12] OR openmm[cuda13] depending on your GPU
+#
+# 2. external [OPTIONAL but RECOMMENDED] (should be in PATH variable)
+#    => cpptraj: for chunking trajectory files to RAM
+#    => catdcd : preferred for chunking DCD files to RAM
+
+# --------------------------------------------------
+# Features
+# --------------------------------------------------
+# => calculate interaction energy between 2 subdomains of a system from trajectory files
 # => Supports both CHARMM and AMBER topologies and trajectories
-# => calculate pairinteraction energies from simulation trajectories
 # => Mimics NAMD pairinteraction feature, with similar X-PLOR based non-bonded switching
-# => STATIC and DYNAMIC selections, self and cross-interactions
+#
+# => STATIC and DYNAMIC selections (update every frame, ex. hydration water)
+# => Self and Cross-Interaction energies
+#    -> SELECTION 1 is required
+#    -> CASE 1: SELECTION 2 non-specified
+#               -> calculate self-interaction energy of SELECTION 1.
+#               -> Bonded (bond, angle, dihedral, improper, cross) and Non-Bonded (Elec, Vdw) energies
+#
+#    -> CASE 2: SELECTION 2 specified (must be different than SELECTION 1)
+#               -> calculate cross-interaction energy between two selections.
+#               -> Only Non-Bonded Energies (Elec, Vdw)
+#
 # => PME for long range electrostatics (NAMD pairinteraction does not have this)
 #    Electrostatic energies with PME will be highly negative compared to NAMD pairinteraction
-# => Trajectory Disk Streaming/RAM loading/RAM chunking modes (chunking requires cpptraj/catdcd in PATH)
-# => RECOMMENDED MODE: GPU with RAM_LOAD and RAM_CHUNK_MODE enabled
-# ------------------------------------------------------------------------
 
 """
-## USAGE --------------------------------------------------
-# 0: First run normal simulation to obtain trajectories
-# 1. Copy script to working dir
-# 2. Configure config TOML. Use -c flag to specify config file (default: openmm_energy.toml)
-# ----------------------------------------------------------------------------
-# -> ALTERNATIVELY, SET ENVIRONMENT VARIABLES (used when variables are not set in script)
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+# => Template: openmm_energy.toml
+#
+# -> Specify parameters in this configuration file.
+# -> Read comments for what each parameter does
+#
+# -> Some core variables can be overriden by Environment Varibles for automation with bash scripts
 # -> PRIORITY ORDER: ENV_VAR > TOML config > default value in script
+#
+#     ENVIRONMENT VARIABLE                  VALUE             DESCRIPTION
 # ----------------------------------------------------------------------------
-#   -> OPENMM_ENERGY_CONFIG             =   config.toml file (defaults to openmm_energy.toml)
-#   -> OPENMM_ENERGY_TRAJ_FILES         =   traj_files  (paths delimited by colon ':')
-#	-> OPENMM_ENERGY_SELECTION1	        =	selection1
-#	-> OPENMM_ENERGY_SELECTION2	        =	selection2 		  (optional)
-#	-> OPENMM_ENERGY_UPDATE_SELECTION1	=	update_selection1
-#	-> OPENMM_ENERGY_UPDATE_SELECTION2	=	update_selection2
-#	-> OPENMM_ENERGY_OUT_ENERGIES	    = 	out_energies	  (optional)
-#	-> OPENMM_ENERGY_OUT_PREFIX	        =	out_file_prefix
-#	-> OPENMM_ENERGY_LABEL              =	label			  (optional)
-# ----------------------------------------------------------------------------
-# 3. run with "python3 openmm_energy.py"        # defaults to "openmm_energy.toml" if present
-#   OR
-# 3. run with config: "python3 openmm_energy.py -c openmm_energy.toml"
-# 	OR
-# 4. use openmm_energy.sh launcher script.
-#	-> First, unset selection1, selection2, out_energies, out_file_prefix in this script
-#	-> Set environment variables in openmm_energy.sh
-#   => run with "./openmm_energy.sh" 
+#   -> OPENMM_ENERGY_CONFIG             =   string            config TOML file path. defaults to openmm_energy.toml
+#   -> OPENMM_ENERGY_TRAJ_FILES         =   string            traj file paths separated by colon ':'
+#	-> OPENMM_ENERGY_SELECTION1	        =	string            MDAnalysis selection syntax
+#	-> OPENMM_ENERGY_SELECTION2	        =	string            MDAnalysis selection syntax  [OPTIONAL]
+#	-> OPENMM_ENERGY_UPDATE_SELECTION1	=	boolean           true/false
+#	-> OPENMM_ENERGY_UPDATE_SELECTION2	=	boolean           true/false
+#	-> OPENMM_ENERGY_OUT_ENERGIES	    = 	string            output energy codes separated by space ("-elec -vdw -all")
+#	-> OPENMM_ENERGY_OUT_PREFIX	        =	string            prefix of output file
+#	-> OPENMM_ENERGY_LABEL              =	string			  optional label for this calculation
+
+
+# --------------------------------------------------
+# USAGE
+# --------------------------------------------------
+# 1: First run normal simulation to obtain trajectories
+# 2. Copy openmm_energy.py and config TOML to working dir
+# 3. Configure config TOML
+# 4. [OPTIONAL] set ENVIRONMENT VARIABLES for overrides
+#    -> PRIORITY ORDER: ENV_VAR > TOML config > default value in py script
+#
+# => RUN directly:
+#    $ python3 openmm_energy.py      # defaults to "openmm_energy.toml" if present
+#
+# OR
+#
+# => RUN with CONFIG TOML file
+#    $ python3 openmm_energy.py -c config.toml
+#
+#      OR use ENV VAR
+#
+#    $ export OPENMM_ENERGY_CONFIG="config.toml"
+#    $ python3 openmm_energy.py
+#
+# OR
+#
+# => RUN with CONFIG + LAUNCHER script (RECOMMENDED for automating multiple runs)
+# -----------------------------------------------------------------------
+#   -> Template: openmm_energy.sh
+#	-> Unset selection1, selection2, out_energies, out_file_prefix in config TOML
+#	-> Set environment variables in the launcher script (openmm_energy.sh)
+#   => start runs
+#      $ chmod +x openmm_energy.sh
+#      $ ./openmm_energy.sh
 """
 
 import os
@@ -182,7 +228,7 @@ SELECTION2: str = get_conf('input.selection2', "", 'OPENMM_ENERGY_SELECTION2', s
 # Dynamic Selections (update every frame)
 UPDATE_SELECTION1: bool = get_conf('input.update_selection1', False, 'OPENMM_ENERGY_UPDATE_SELECTION1', bool)     # TODO
 UPDATE_SELECTION2: bool = get_conf('input.update_selection2', False, 'OPENMM_ENERGY_UPDATE_SELECTION2', bool)     # TODO
-FAST_DYNAMIC_SELECTION: bool = get_conf('input.fast_dynamic_selection', True, cast=bool)   # Bypasses slow MDAnalysis 'updating=True' and manually update selection using FastDynamicSelector
+FAST_DYNAMIC_SELECTION: bool = get_conf('input.fast_dynamic_selection', True, cast=bool)   # Bypasses slow MDAnalysis 'updating=True' with quick scipy.CKDTree. Disable if getting errors
 
 ## Output file names
 OUT_FILE_PREFIX: str = get_conf('output.file_prefix', "pair_interaction.energy", 'OPENMM_ENERGY_OUT_PREFIX', str)    # TODO: or set ENV VAR: OPENMM_ENERGY_OUT_PREFIX
