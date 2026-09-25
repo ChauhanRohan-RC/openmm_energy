@@ -52,18 +52,30 @@
 import os
 import sys
 import argparse
-try: import tomllib      # Try importing standard tomllib (Python 3.11+), fallback to tomli for older versions
-except (ImportError, ModuleNotFoundError):
-    try: import tomli as tomllib
-    except (ImportError, ModuleNotFoundError):
-        print("\033[91m[ERROR]\033[0m 'tomllib' or 'tomli' module is required to parse the TOML config.")
-        sys.exit(1)
+
+# Header
+if __name__ == '__main__':
+    import time
+    print("")
+    print("============================================================")
+    print("=============  OpenMM Pair-Interaction Energy  =============")
+    print("============================================================")
+    print(f"Started on {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("")
 
 # -------------------------------------------------------------------
 # CONFIGURATION LOADER
 ## Priority: ENV VAR > TOML (sys.argv > DEFAULT) > Default Value
 # -------------------------------------------------------------------
 DEFAULT_CONFIG_FILE_PATH = "openmm_energy.toml"
+
+# Try importing standard tomllib (Python 3.11+), fallback to tomli for older versions
+try: import tomllib
+except (ImportError, ModuleNotFoundError):
+    try: import tomli as tomllib
+    except (ImportError, ModuleNotFoundError):
+        print("\033[91m[ERROR]\033[0m 'tomllib' or 'tomli' module is required to parse the TOML config.")
+        sys.exit(1)
 
 # Parse sys.argv safely (ignoring unknown args to protect child processes)
 _parser = argparse.ArgumentParser(add_help=False)
@@ -347,14 +359,6 @@ def log_error(msg, exc=None, flush=True, shutdown: bool = True, _exit: bool = Tr
 # --------------------------------------------
 # HARDWARE INIT and CHECKS
 # --------------------------------------------
-# Header
-if __name__ == '__main__':
-    print("")
-    print("============================================================")
-    print("=============  OpenMM Pair-Interaction Energy  =============")
-    print("============================================================")
-    print(f"Started on {get_cur_datetime_formatted()}")
-    print("")
 
 # OpenMM Hardware Initialization (CUDA -> HIP -> OpenCL -> CPU)
 try:
@@ -1380,19 +1384,20 @@ if __name__ == '__main__':
         log_info(f"PARAM Files  : {len(CHARMM_PARAM_FILES)} {CHARMM_PARAM_FILES}")
     log_info(f"Topology     : {TOPOLOGY_FILE}")
     if HAS_NBFIX:
-        log_info(f"NBFix (vdw)  : ON  (params: {nbfix_param_names})")
+        log_info(f"NBFix (vdw)  : ON  |  Params: {nbfix_param_names}")
+    print("-----------------")
     log_info(f"TRAJ Files   : {len(TRAJ_FILES)} {TRAJ_FILES}")
     print("-----------------")
     log_info(f"TOTAL ATOM COUNT: {N_ATOMS}")
-    log_info(f"SELECTION-1  : \"{SELECTION1}\" (atom count at frame 0: {len(static_sel1_idx_set)})")
-    log_info(f"UPDATE SEL-1 : {'ON' if UPDATE_SELECTION1 else 'OFF'}")
+    log_info(f"SELECTION-1  : {CYAN}\"{SELECTION1}\"{NOCOL} (atom count at frame 0: {CYAN}{len(static_sel1_idx_set)}{NOCOL})")
+    log_info(f"UPDATE SEL-1 : {f'{CYAN}ON' if UPDATE_SELECTION1 else 'OFF'}{NOCOL}")
     if not is_self_interaction:
-        log_info(f"SELECTION-2  : \"{SELECTION2}\" (atom count at frame 0: {len(static_sel2_idx_set)})")
-        log_info(f"UPDATE SEL-2 : {'ON' if UPDATE_SELECTION2 else 'OFF'}")
+        log_info(f"SELECTION-2  : {CYAN}\"{SELECTION2}\"{NOCOL} (atom count at frame 0: {CYAN}{len(static_sel2_idx_set)}{NOCOL})")
+        log_info(f"UPDATE SEL-2 : {f'{CYAN}ON' if UPDATE_SELECTION2 else 'OFF'}{NOCOL}")
     log_info(f"PERIODIC     : {'ON' if PERIODIC else 'OFF'}  (PME: {'ON' if PME_ENABLED else 'OFF'})")
     log_info(f"SWITCHING    : {'ON' if HAS_SWITCHING else 'OFF'}")
     if FRAME_STEP > 1:
-        log_info(f"FRAME_STEP   : {FRAME_STEP}")
+        log_info(f"FRAME_STEP   : {CYAN}{FRAME_STEP}{NOCOL}")
     print("------------------------------------------------------\n")
     flush_stdout()
 
