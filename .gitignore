@@ -4,4 +4,5 @@
 *.DCD
 *.bak
 *.old
+*.conf
 FFTW_NAMD*
