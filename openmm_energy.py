@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
 # Requirements:
-# => pip packages : numpy, openmm[cuda], mdanalysis
-# => external : cpptraj (OPTIONAL, for chunking trajectory files to RAM)
-#               catdcd  (OPTIONAL, preferred for chunking DCD files to RAM)
+# => pip packages      : numpy, scipy, mdanalysis, opnemm OR openmm[cuda]
+# => external (in PATH): cpptraj (OPTIONAL, for chunking trajectory files to RAM)
+#                        catdcd  (OPTIONAL, preferred for chunking DCD files to RAM)
 
 # ========================================================================
 # OpenMM and MDAnalysis implementation of NAMD PairInteraction Energy
@@ -241,7 +241,7 @@ COMMENT_TOKEN = get_conf('output_params.comment_token', "#", cast=str)
 RAM_DISK_PATH = get_conf('frame_loading.ram_disk_path', "/tmp/openmm_energy", cast=str)             # ram disk path to use
 RAM_DISK_MAX_USAGE_FACTOR: float = get_conf('frame_loading.ram_disk_max_usage_factor', 0.75, cast=float) # [0.1, 0.95] RAM disk max usage allowed (as fraction). KEEP BELOW 0.8
 
-QUEUE_FRAME_COUNT = get_conf('frame_loading.queue_frame_count', 50, cast=int)                # Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
+FRAME_QUEUE_SIZE = get_conf('frame_loading.frame_queue_size', 50, cast=int)                # Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
 
 ## RAM CHUNK MODE (requires cpptraj/catdcd in PATH)
 RAM_CHUNK_DYNAMIC: bool = get_conf('frame_loading.ram_chunk_dynamic', True, cast=bool)        # Automatically shrink chunk if RAM is constrained
@@ -2842,11 +2842,11 @@ if __name__ == '__main__':
     # =============================================================================
     # MAIN ORCHESTRATOR & IPC CONSUMER LOOP
     # =============================================================================
-    log_info(f"Allocating Zero-Copy Shared Memory Ring Buffer ({QUEUE_FRAME_COUNT} slots)...")
+    log_info(f"Allocating Zero-Copy Shared Memory Ring Buffer ({FRAME_QUEUE_SIZE} slots)...")
 
     # Creator allocates the physical RAM. Forked children inherit handles instantly.
     shm_buffer_main = SharedFrameBuffer(
-        num_slots=QUEUE_FRAME_COUNT,
+        num_slots=FRAME_QUEUE_SIZE,
         n_atoms=N_ATOMS,
         has_dyn_sel1=UPDATE_SELECTION1,
         has_dyn_sel2=not is_self_interaction and UPDATE_SELECTION2,

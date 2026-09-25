@@ -1,5 +1,5 @@
 # ====================================================================
-# OpenMM PairInteraction Energy Configuration
+# TEST config for OpenMM PairInteraction Energy
 # ====================================================================
 # [Search for TODO]
 # RUN the program with -c <config_file> OR set ENV VAR: OPENMM_ENERGY_CONFIG=<config_file>
@@ -32,10 +32,10 @@ prmtop_file = ""                             # [AMBER MODE ONLY] AMBER .prmtop (
 
 # If amber_mode = false, charmm_param_files and psf_file are REQUIRED.
 charmm_param_files = [
-    "../../common/ff/par_all36m_prot.prm",
-    "../../common/ff/toppar_water_ions.prot.str"
+    "./amyl-beta/common/ff/par_all36m_prot.prm",
+    "./amyl-beta/common/ff/toppar_water_ions.prot.str"
 ]
-psf_file = "../../common/amyl_wb.psf"        # TODO: Input topology file
+psf_file = "./amyl-beta/common/amyl_wb.psf"        # TODO: Input topology file
 
 ## TODO: Selections (MDAnalysis selection syntax)
 # -> Example hydration shell: water and around 4.25 protein
@@ -54,7 +54,7 @@ fast_dynamic_selection = true                # Bypasses slow MDAnalysis 'updatin
 
 ## TODO: AUTO-FIND TRAJECTORY FILES (Used if traj_files is omitted above)
 [find_traj_files]
-dir_path = ".."
+dir_path = "./amyl-beta/wb_eq"
 prefix = "amyl_wb_eq"
 suffix = ".dcd"
 # min_num = 1                                # Optional: Minimum index (inclusive)
@@ -120,7 +120,7 @@ comment_token = "#"
 [frame_loading]
 ram_disk_path = "/tmp/openmm_energy"         # RAM disk path to use
 ram_disk_max_usage_factor = 0.75             # [0.1, 0.95] RAM disk max usage allowed (as fraction). KEEP BELOW 0.8
-queue_frame_count = 50                       # Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
+frame_queue_size = 50                        # Size of the Zero-Copy Shared Memory Ring Buffer (Reduce if using 1M+ atoms)
 
 # RAM CHUNK MODE (requires cpptraj/catdcd in PATH)
 ram_chunk_dynamic = true                     # Automatically shrink chunk if RAM is constrained
