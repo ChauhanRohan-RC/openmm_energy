@@ -29,6 +29,8 @@ run_openmm_static() {
 }
 
 
+#-----------------------------------------------------------------
+
 # TODO: config.toml file
 export OPENMM_ENERGY_CONFIG="openmm_energy.toml"
 
@@ -38,7 +40,8 @@ export selection_water_hydration="water and around 4.25 protein"
 export selection_water_bulk="water and not around 5.0 protein"
 
 
-# Run 1: Protein Self
+##-----------------------------------------------------------------
+## Run 1: Protein Self
 export OPENMM_ENERGY_LABEL="Protein Self-Interaction Energy"
 export OPENMM_ENERGY_SELECTION1="protein"
 export OPENMM_ENERGY_SELECTION2=""
@@ -84,6 +87,8 @@ export OPENMM_ENERGY_OUT_PREFIX="water_bulk_self"
 export OPENMM_ENERGY_OUT_ENERGIES="-nonb -pote"
 run_openmm
 
+#-----------------------------------------------------------------
+
 ## Run: Protein-Hydration Water
 export OPENMM_ENERGY_LABEL="Protein Hydration Water Cross-Interaction Energy"
 export OPENMM_ENERGY_SELECTION1="protein"
@@ -91,7 +96,7 @@ export OPENMM_ENERGY_SELECTION2="$selection_water_hydration"
 export OPENMM_ENERGY_UPDATE_SELECTION1=0
 export OPENMM_ENERGY_UPDATE_SELECTION2=1
 export OPENMM_ENERGY_OUT_PREFIX="prot_water_hydration"
-export OPENMM_ENERGY_OUT_ENERGIES="-all"
+export OPENMM_ENERGY_OUT_ENERGIES="-nonb -pote"
 run_openmm
 
 ## Run: Protein-Bulk Water
