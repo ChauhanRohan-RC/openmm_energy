@@ -411,7 +411,7 @@ def log_error(msg, exc=None, flush=True, shutdown: bool = True, _exit: bool = Tr
 try:
     from openmm import Platform
 except (ImportError, ModuleNotFoundError) as e:
-    log_error(f"OPENMM not found. Please install OpenMM in your environment with {CYAN}\"pip install openmm[cuda]\"{NOCOL}", e)
+    log_error(f"OPENMM not found. Please install OpenMM in your environment with {CYAN}'pip install openmm[cuda]'{NOCOL}", e)
 
 OPENMM_PLATFORM_NAME = "CPU"
 OPENMM_PLATFORM_DISPLAY_NAME = "CPU"
@@ -529,13 +529,13 @@ try:
     import openmm as mm
     from openmm import app, unit
 except (ImportError, ModuleNotFoundError) as e:
-    log_error(f"OPENMM not found. Please install OpenMM in your environment with {CYAN}\"pip install openmm[cuda]\"{NOCOL}", e)
+    log_error(f"OPENMM not found. Please install OpenMM in your environment with {CYAN}'pip install openmm[cuda]'{NOCOL}", e)
 
 # MDAnalysis import
 try:
     import MDAnalysis as mda
 except (ImportError, ModuleNotFoundError) as e:
-    log_error(f"MDAnalysis not found. Please install MDAnalysis in your environment with {CYAN}\"pip install mdanalysis\"{NOCOL}", e)
+    log_error(f"MDAnalysis not found. Please install MDAnalysis in your environment with {CYAN}'pip install mdanalysis'{NOCOL}", e)
 import warnings
 warnings.filterwarnings("ignore", message=r".*DCDReader currently makes independent timesteps.*")
 
@@ -1475,6 +1475,7 @@ if __name__ == '__main__':
     print("\n------------------------------------------------------")
     log_info(" SYSTEM INFORMATION ")
     print("------------------------------------------------------")
+    log_info(f"LABEL        : {LABEL}")
     log_info(f"MODE         : {'AMBER' if AMBER_MODE else 'CHARMM'}")
     if not AMBER_MODE:
         log_info(f"PARAM Files  : {len(CHARMM_PARAM_FILES)} {CHARMM_PARAM_FILES}")
@@ -1484,11 +1485,11 @@ if __name__ == '__main__':
     print("-----------------")
     log_info(f"TRAJ Files   : {len(TRAJ_FILES)} {TRAJ_FILES}")
     print("-----------------")
-    log_info(f"TOTAL ATOM COUNT: {N_ATOMS}")
-    log_info(f"SELECTION-1  : {CYAN}\"{SELECTION1}\"{NOCOL} (atom count at frame 0: {CYAN}{len(static_sel1_idx_set)}{NOCOL})")
+    log_info(f"TOTAL ATOMS  : {N_ATOMS}")
+    log_info(f"SELECTION-1  : {CYAN}'{SELECTION1}'{NOCOL} (atom count at frame 0: {CYAN}{len(static_sel1_idx_set)}{NOCOL})")
     log_info(f"UPDATE SEL-1 : {f'{CYAN}ON' if UPDATE_SELECTION1 else 'OFF'}{NOCOL}")
     if not is_self_interaction:
-        log_info(f"SELECTION-2  : {CYAN}\"{SELECTION2}\"{NOCOL} (atom count at frame 0: {CYAN}{len(static_sel2_idx_set)}{NOCOL})")
+        log_info(f"SELECTION-2  : {CYAN}'{SELECTION2}'{NOCOL} (atom count at frame 0: {CYAN}{len(static_sel2_idx_set)}{NOCOL})")
         log_info(f"UPDATE SEL-2 : {f'{CYAN}ON' if UPDATE_SELECTION2 else 'OFF'}{NOCOL}")
     log_info(f"PERIODIC     : {'ON' if PERIODIC else 'OFF'}  (PME: {'ON' if PME_ENABLED else 'OFF'})")
     log_info(f"SWITCHING    : {'ON' if HAS_SWITCHING else 'OFF'}")
