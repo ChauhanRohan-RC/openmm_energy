@@ -10,10 +10,10 @@ import shutil
 
 INPUT_FILES: list[str] = glob.glob('*.energy.csv')     # list of input data files
 
-ZERO_THRESHOLD: float = 0.0     # a value is considered 0 if abs(value) <= threshold.
+ZERO_THRESHOLD: float = 0.03      # a value is considered 0 if abs(value) <= threshold.
                                   # set exactly to 0.0 to only drop exact zeroes
 
-OVERWRITE = False
+OVERWRITE = True
 OUTPUT_SUFFIX = '.filtered'     # only when OVERWRITE is False
 
 COMMENT_TOKEN = '#'
@@ -41,14 +41,14 @@ def log_success(msg):
     print(f"{LogStyle.GREEN}{LogStyle.BOLD}[SUCCESS]{LogStyle.RESET} {msg}")
 
 def log_warn(msg):
-    print(f"{LogStyle.YELLOW}{LogStyle.BOLD}[SKIP]{LogStyle.RESET} {msg}")
+    print(f"{LogStyle.YELLOW}{LogStyle.BOLD}[WARN]{LogStyle.RESET} {msg}")
 
 def process_csv(in_path, out_path) -> bool:
     comments = []
     data = []
 
     if not os.path.exists(in_path):
-        log_warn(f"'{in_path}': Not Found")
+        log_warn(f"'{in_path}': File Not Found")
         return False
 
     # 1. Read file and separate comments from data
@@ -95,6 +95,11 @@ def process_csv(in_path, out_path) -> bool:
         if has_non_zero or not has_numeric:
             cols_to_keep.append(col_idx)
 
+    dropped = max_cols - len(cols_to_keep)
+    if dropped == 0:
+        log_warn(f"{LogStyle.YELLOW}'{in_path}': No columns dropped{LogStyle.RESET}")
+        return False
+
     # 3. Write out to new file
     with open(out_path, 'w') as f:
         # Write preserved comments
@@ -107,8 +112,7 @@ def process_csv(in_path, out_path) -> bool:
             f.write(OUTPUT_DELIMITER.join(filtered_row) + '\n')
 
     # Calculate stats for logging
-    dropped = max_cols - len(cols_to_keep)
-    drop_msg = f"{LogStyle.RED}Dropped {dropped}{LogStyle.RESET}" if dropped > 0 else f"{LogStyle.YELLOW}Dropped 0{LogStyle.RESET}"
+    drop_msg = f"{LogStyle.RED}Dropped {dropped}{LogStyle.RESET}"
 
     log_success(f"Processed {LogStyle.BOLD}'{in_path}'{LogStyle.RESET} "
                 f"-> Kept {len(cols_to_keep)}/{max_cols} cols ({drop_msg}) "

@@ -3,7 +3,7 @@
 # ======================================================================
 # Launcher script for openmm_energy.py
 # ======================================================================
-# COnfig TOML + Launcher script automation of openmm_energy.py
+# Config TOML + Launcher script automation of openmm_energy.py
 #
 # TODO 1: set constant parameters in TOML comfig file, and set OPENMM_ENERGY_CONFIG=<config.toml>
 # TODO 2: set ENV VARIABLE overrides for each run here
